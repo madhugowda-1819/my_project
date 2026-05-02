@@ -42,4 +42,6 @@ urlpatterns = [
     path('forgot-password/', views.forgot_password),
     path('reset-password/<uidb64>/<token>/', views.reset_password),
     path('change-password/', views.change_password),
+
+    path('ai/matches/', views.AiMatchView.as_view()),
 ]

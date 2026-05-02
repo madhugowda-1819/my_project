@@ -11,10 +11,22 @@ from .models import (
 # ------------------------------------------------------------------
 @admin.register(User)
 class CustomUserAdmin(UserAdmin):
-    list_display = ('email', 'username', 'phone', 'city', 'is_available', 'is_online')
+    list_display = ('email', 'username', 'phone', 'city', 'is_available', 'is_online', 'latitude', 'longitude')
     search_fields = ('email', 'username', 'phone')
     ordering = ('email',)
-
+    
+    # Add location fields to the edit form
+    fieldsets = UserAdmin.fieldsets + (
+        ('Location', {
+            'fields': ('latitude', 'longitude', 'city')
+        }),
+        ('Sports & Availability', {
+            'fields': ('sports', 'is_available', 'is_online')
+        }),
+        ('Profile', {
+            'fields': ('full_name', 'phone', 'avatar', 'bio')
+        }),
+    )
 
 # ------------------------------------------------------------------
 # SPORT

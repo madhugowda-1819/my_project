@@ -171,6 +171,7 @@ class SportListView(generics.ListAPIView):
     queryset = Sport.objects.filter(is_active=True)
     serializer_class = SportSerializer
     permission_classes = [AllowAny]
+    pagination_class = None  # ← add this line
 
 
 # ---------------- AI PLAYER MATCHING ----------------
@@ -401,3 +402,88 @@ class AvailabilityView(APIView):
             ])
 
         return Response(UserSerializer(user).data)
+    
+from rest_framework.views import APIView
+from rest_framework.response import Response
+from rest_framework.permissions import IsAuthenticated
+from django.db.models import Count
+from math import radians, sin, cos, sqrt, atan2
+
+from .models import Match, PlayerProfile
+
+
+class AiMatchView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        user = request.user
+
+        user_lat = user.latitude
+        user_lng = user.longitude
+
+        # fallback if no location
+        if not user_lat or not user_lng:
+            matches = Match.objects.all()[:10]
+            return Response(self.serialize(matches))
+
+        matches = Match.objects.annotate(
+            players_count=Count('players')
+        ).filter(
+            players_count__lt=10  # only not full matches
+        )
+
+        results = []
+
+        for match in matches:
+            if not match.ground:
+                continue
+
+            g = match.ground
+
+            if not g.latitude or not g.longitude:
+                continue
+
+            distance = self.calculate_distance(
+                user_lat, user_lng,
+                g.latitude, g.longitude
+            )
+
+            # filter nearby (within 10 km)
+            if distance <= 10:
+                results.append((match, distance))
+
+        # sort by nearest
+        results.sort(key=lambda x: x[1])
+
+        final_matches = [m[0] for m in results[:10]]
+
+        return Response(self.serialize(final_matches))
+
+    def calculate_distance(self, lat1, lon1, lat2, lon2):
+        R = 6371  # km
+
+        dlat = radians(lat2 - lat1)
+        dlon = radians(lon2 - lon1)
+
+        a = sin(dlat/2)**2 + cos(radians(lat1)) * cos(radians(lat2)) * sin(dlon/2)**2
+        c = 2 * atan2(sqrt(a), sqrt(1-a))
+
+        return R * c
+
+    def serialize(self, matches):
+        data = []
+
+        for m in matches:
+            data.append({
+                "id": m.id,
+                "sport": {
+                    "name": m.sport.name
+                } if m.sport else None,
+                "players_count": m.players.count(),
+                "ground": {
+                    "name": m.ground.name
+                } if m.ground else None,
+                "date": m.date
+            })
+
+        return data

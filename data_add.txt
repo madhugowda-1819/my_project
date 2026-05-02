@@ -1,0 +1,21 @@
+
+
+from my_app.models import Sport
+
+sports = [
+    {"name": "Cricket", "icon": "🏏", "category": "Outdoor"},
+    {"name": "Football", "icon": "⚽", "category": "Outdoor"},
+    {"name": "Chess", "icon": "♟️", "category": "Indoor"},
+    {"name": "Badminton", "icon": "🏸", "category": "Indoor"},
+    {"name": "Table Tennis", "icon": "🏓", "category": "Indoor"},
+    {"name": "Carrom", "icon": "🎯", "category": "Indoor"},
+    {"name": "Kabaddi", "icon": "🤼", "category": "Outdoor"},
+    {"name": "Kho Kho", "icon": "🏃", "category": "Outdoor"},
+    {"name": "Volleyball", "icon": "🏐", "category": "Outdoor"},
+    {"name": "Basketball", "icon": "🏀", "category": "Outdoor"},
+]
+
+for s in sports:
+    Sport.objects.get_or_create(**s)
+
+print("Sports added successfully!")

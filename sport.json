@@ -1,0 +1,12 @@
+[
+  {"model": "yourapp.sport", "fields": {"name": "Cricket", "icon": "🏏", "category": "Outdoor"}},
+  {"model": "yourapp.sport", "fields": {"name": "Football", "icon": "⚽", "category": "Outdoor"}},
+  {"model": "yourapp.sport", "fields": {"name": "Chess", "icon": "♟️", "category": "Indoor"}},
+  {"model": "yourapp.sport", "fields": {"name": "Badminton", "icon": "🏸", "category": "Indoor"}},
+  {"model": "yourapp.sport", "fields": {"name": "Table Tennis", "icon": "🏓", "category": "Indoor"}},
+  {"model": "yourapp.sport", "fields": {"name": "Carrom", "icon": "🎯", "category": "Indoor"}},
+  {"model": "yourapp.sport", "fields": {"name": "Kabaddi", "icon": "🤼", "category": "Outdoor"}},
+  {"model": "yourapp.sport", "fields": {"name": "Kho Kho", "icon": "🏃", "category": "Outdoor"}},
+  {"model": "yourapp.sport", "fields": {"name": "Volleyball", "icon": "🏐", "category": "Outdoor"}},
+  {"model": "yourapp.sport", "fields": {"name": "Basketball", "icon": "🏀", "category": "Outdoor"}}
+]

@@ -157,8 +157,8 @@ class CourtBookingCreateSerializer(serializers.Serializer):
 
 
 class BookingCreateSerializer(serializers.Serializer):
-    venue_id = serializers.IntegerField(min_value=1)
-    court_id = serializers.IntegerField(min_value=1)
+    venue_id = serializers.UUIDField()
+    court_id = serializers.UUIDField()
     booking_date = serializers.DateField()
     start_time = serializers.TimeField()
     end_time = serializers.TimeField()

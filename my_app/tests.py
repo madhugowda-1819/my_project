@@ -420,7 +420,7 @@ class VenueAvailabilityTests(APITestCase):
         self.assertEqual([slot['status'] for slot in slots], ['booked', 'booked', 'maintenance'])
         # An adjacent slot is permitted because it does not satisfy either overlap condition.
         booking = self.client.post('/api/v1/bookings/', {
-            'venue_id': self.venue.id, 'court_id': self.court.id, 'booking_date': self.date.isoformat(),
+            'venue_id': str(self.venue.public_id), 'court_id': str(self.court.public_id), 'booking_date': self.date.isoformat(),
             'start_time': '10:30', 'end_time': '11:00',
         }, format='json')
         self.assertEqual(booking.status_code, 201)
@@ -435,10 +435,10 @@ class VenueAvailabilityTests(APITestCase):
         self.venue.active = True
         self.venue.save()
         first = self.client.post('/api/v1/bookings/', {
-            'venue_id': self.venue.id, 'court_id': self.court.id, 'booking_date': self.date.isoformat(), 'start_time': '09:00', 'end_time': '10:00',
+            'venue_id': str(self.venue.public_id), 'court_id': str(self.court.public_id), 'booking_date': self.date.isoformat(), 'start_time': '09:00', 'end_time': '10:00',
         }, format='json')
         second = self.client.post('/api/v1/bookings/', {
-            'venue_id': self.venue.id, 'court_id': self.court.id, 'booking_date': self.date.isoformat(), 'start_time': '09:30', 'end_time': '10:30',
+            'venue_id': str(self.venue.public_id), 'court_id': str(self.court.public_id), 'booking_date': self.date.isoformat(), 'start_time': '09:30', 'end_time': '10:30',
         }, format='json')
         self.assertEqual(first.status_code, 201)
         self.assertEqual(second.status_code, 409)
@@ -459,7 +459,7 @@ class BookingEngineTests(APITestCase):
         self.client.force_authenticate(self.user)
 
     def payload(self, **overrides):
-        data = {'venue_id': self.venue.id, 'court_id': self.court.id, 'booking_date': self.date.isoformat(), 'start_time': '10:00', 'end_time': '11:00'}
+        data = {'venue_id': str(self.venue.public_id), 'court_id': str(self.court.public_id), 'booking_date': self.date.isoformat(), 'start_time': '10:00', 'end_time': '11:00'}
         data.update(overrides)
         return data
 
@@ -474,6 +474,13 @@ class BookingEngineTests(APITestCase):
         self.assertTrue(data['booking_reference'].startswith('SM-'))
         self.client.force_authenticate(self.other)
         self.assertEqual(self.client.get(f"/api/v1/bookings/{data['public_id']}/").status_code, 404)
+
+    def test_booking_quote_uses_public_uuids_and_server_price(self):
+        response = self.client.post('/api/v1/bookings/quote/', self.payload(final_amount='1'), format='json')
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data['venue_name'], 'Booking Arena')
+        self.assertEqual(response.data['court_name'], 'Booking Court')
+        self.assertEqual(str(response.data['final_amount']), '500.00')
 
     def test_conflict_overlap_cancellation_and_slot_reuse(self):
         first = self.create()
@@ -491,8 +498,8 @@ class BookingEngineTests(APITestCase):
         self.assertEqual(reuse.status_code, 201)
 
     def test_invalid_court_time_hours_past_date_and_completion(self):
-        self.assertEqual(self.create(court_id=999999).status_code, 404)
-        self.assertEqual(self.create(court_id=self.other_court.id).status_code, 400)
+        self.assertEqual(self.create(court_id='00000000-0000-0000-0000-000000000000').status_code, 404)
+        self.assertEqual(self.create(court_id=str(self.other_court.public_id)).status_code, 400)
         self.assertEqual(self.create(start_time='11:00', end_time='10:00').status_code, 400)
         self.assertEqual(self.create(start_time='08:00', end_time='09:00').status_code, 400)
         self.assertEqual(self.create(booking_date=(timezone.localdate() - timedelta(days=1)).isoformat()).status_code, 400)

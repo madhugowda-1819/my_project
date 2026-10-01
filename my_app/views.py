@@ -1,5 +1,6 @@
 from django.contrib.auth import get_user_model
 from django.db.models import Q
+from django.http import JsonResponse
 from rest_framework import generics
 from rest_framework.decorators import api_view, permission_classes, throttle_classes
 from rest_framework.permissions import AllowAny
@@ -704,17 +705,19 @@ class AiMatchView(generics.GenericAPIView):
 
 
 def global_project_homepage(request):
-    return Response({
-        'status': 'online',
-        'project': 'SportMate Backend API Platform',
-        'message': 'Server initialized and actively handling traffic.',
-        'api_v1_root': '/api/v1/',
+    """Handles the main domain homepage root '/'."""
+    return JsonResponse({
+        "status": "online",
+        "project": "SportMate Backend API Platform",
+        "message": "Server initialized and actively handling traffic.",
+        "api_v1_root": "/api/v1/",
     })
 
 
 def api_root_landing(request):
-    return Response({
-        'status': 'online',
-        'message': 'SportMate REST API Backend is running successfully!',
-        'version': 'v1',
+    """Handles the API index root '/api/'."""
+    return JsonResponse({
+        "status": "online",
+        "message": "SportMate REST API Backend is running successfully!",
+        "version": "v1",
     })

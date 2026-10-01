@@ -701,3 +701,20 @@ class AiMatchView(generics.GenericAPIView):
         if page is not None:
             return self.get_paginated_response(MatchSerializer(page, many=True).data)
         return Response(MatchSerializer(matches, many=True).data)
+
+
+def global_project_homepage(request):
+    return Response({
+        'status': 'online',
+        'project': 'SportMate Backend API Platform',
+        'message': 'Server initialized and actively handling traffic.',
+        'api_v1_root': '/api/v1/',
+    })
+
+
+def api_root_landing(request):
+    return Response({
+        'status': 'online',
+        'message': 'SportMate REST API Backend is running successfully!',
+        'version': 'v1',
+    })

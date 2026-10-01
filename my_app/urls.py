@@ -40,6 +40,7 @@ urlpatterns = [
     path('venues/reviews/', views.VenueReviewView.as_view()),
     path('venues/reviews/<uuid:public_id>/', views.VenueReviewDetailView.as_view()),
     path('bookings/', views.BookingListCreateView.as_view()),
+    path('bookings/quote/', views.BookingQuoteView.as_view()),
     path('bookings/<uuid:public_id>/', views.BookingDetailView.as_view()),
     path('bookings/<uuid:public_id>/cancel/', views.BookingCancelView.as_view()),
     path('recommendations/players/', views.PlayerRecommendationView.as_view()),

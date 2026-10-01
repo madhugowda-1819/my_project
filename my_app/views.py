@@ -492,6 +492,24 @@ class BookingListCreateView(generics.ListCreateAPIView):
         return Response({'success': True, 'data': BookingSerializer(booking).data}, status=201)
 
 
+class BookingQuoteView(APIView):
+    permission_classes = [IsActiveAccount]
+
+    def post(self, request):
+        serializer = BookingCreateSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        venue, court, prices = BookingService.quote(**serializer.validated_data)
+        return Response({
+            'success': True,
+            'venue_name': venue.name,
+            'court_name': court.name,
+            'booking_date': serializer.validated_data['booking_date'],
+            'start_time': serializer.validated_data['start_time'],
+            'end_time': serializer.validated_data['end_time'],
+            **prices,
+        })
+
+
 class BookingDetailView(generics.RetrieveAPIView):
     permission_classes = [IsActiveAccount]
     serializer_class = BookingSerializer

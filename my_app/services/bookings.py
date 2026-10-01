@@ -20,7 +20,7 @@ class BookingError(APIException):
 class BookingConflict(BookingError):
     status_code = 409
     default_code = 'SLOT_UNAVAILABLE'
-    default_detail = 'The selected court is not available for this time.'
+    default_detail = 'This slot is no longer available. Please choose another slot.'
 
 
 class BookingPricingService:
@@ -105,18 +105,9 @@ class BookingService:
         return local_start.astimezone(datetime_timezone.utc), local_end.astimezone(datetime_timezone.utc)
 
     @classmethod
-    @transaction.atomic
-    def create(cls, *, user, venue_id, court_id, booking_date, start_time, end_time):
-        try:
-            venue = Venue.objects.select_for_update().get(pk=venue_id)
-        except Venue.DoesNotExist as exc:
-            raise NotFound('Venue not found.') from exc
+    def _validate_request(cls, *, venue, court, booking_date, start_time, end_time, lock_bookings=False):
         if not venue.active:
             raise BookingError('Venue is inactive.')
-        try:
-            court = Court.objects.select_for_update().get(pk=court_id)
-        except Court.DoesNotExist as exc:
-            raise NotFound('Court not found.') from exc
         if court.venue_id != venue.id:
             raise BookingError('Court does not belong to the selected venue.')
         if not court.active:
@@ -129,11 +120,47 @@ class BookingService:
             raise ValidationError({'end_time': [f'Duration must be one of {ALLOWED_SLOT_DURATIONS} minutes.']})
         if CourtBlockedPeriod.objects.filter(court=court, starts_at__lt=ends_at, ends_at__gt=starts_at).exists():
             raise BookingConflict('The court is blocked or under maintenance.')
-        if CourtBooking.objects.select_for_update().filter(
+        conflicts = CourtBooking.objects.filter(
             court=court, status__in=BOOKING_BLOCKING_STATUSES,
             starts_at__lt=ends_at, ends_at__gt=starts_at,
-        ).exists():
+        )
+        if lock_bookings:
+            conflicts = conflicts.select_for_update()
+        if conflicts.exists():
             raise BookingConflict()
+        return starts_at, ends_at
+
+    @classmethod
+    def quote(cls, *, venue_id, court_id, booking_date, start_time, end_time):
+        try:
+            venue = Venue.objects.get(public_id=venue_id)
+        except Venue.DoesNotExist as exc:
+            raise NotFound('Venue not found.') from exc
+        try:
+            court = Court.objects.select_related('venue').get(public_id=court_id)
+        except Court.DoesNotExist as exc:
+            raise NotFound('Court not found.') from exc
+        starts_at, ends_at = cls._validate_request(
+            venue=venue, court=court, booking_date=booking_date, start_time=start_time, end_time=end_time,
+        )
+        prices = BookingPricingService.calculate(court=court, starts_at=starts_at, ends_at=ends_at)
+        return venue, court, prices
+
+    @classmethod
+    @transaction.atomic
+    def create(cls, *, user, venue_id, court_id, booking_date, start_time, end_time):
+        try:
+            venue = Venue.objects.select_for_update().get(public_id=venue_id)
+        except Venue.DoesNotExist as exc:
+            raise NotFound('Venue not found.') from exc
+        try:
+            court = Court.objects.select_for_update().get(public_id=court_id)
+        except Court.DoesNotExist as exc:
+            raise NotFound('Court not found.') from exc
+        starts_at, ends_at = cls._validate_request(
+            venue=venue, court=court, booking_date=booking_date, start_time=start_time, end_time=end_time,
+            lock_bookings=True,
+        )
         prices = BookingPricingService.calculate(court=court, starts_at=starts_at, ends_at=ends_at)
         for _ in range(5):
             try:

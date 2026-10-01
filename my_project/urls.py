@@ -5,6 +5,9 @@ from django.conf.urls.static import static
 
 urlpatterns = [
     path('admin/', admin.site.urls),
+    # Versioned API for all new integrations.
+    path('api/v1/', include('my_app.urls')),
+    # Legacy route retained while mobile clients migrate to v1.
     path('api/', include('my_app.urls')),
 ]
 

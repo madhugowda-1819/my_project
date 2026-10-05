@@ -344,7 +344,13 @@ class VenueReview(TimestampedPublicModel):
 # ---------------------------------------------------------------------------
 # 🔥 NEW: GROUNDS (IMPORTANT FOR YOUR UI)
 # ---------------------------------------------------------------------------
-class Ground(TimestampedPublicModel):
+class Ground(models.Model):
+    SIZE_CHOICES = [
+        ('small', 'Small'),
+        ('medium', 'Medium'),
+        ('big', 'Big'),
+    ]
+
     name = models.CharField(max_length=200)
     city = models.CharField(max_length=100)
     address = models.CharField(max_length=255, blank=True)
@@ -354,7 +360,11 @@ class Ground(TimestampedPublicModel):
 
     price_per_hour = models.FloatField(default=0)
     pitch_type = models.CharField(max_length=50, blank=True)
+    size = models.CharField(max_length=10, choices=SIZE_CHOICES, default='medium')
     sports = models.ManyToManyField(Sport, related_name='grounds', blank=True)
+    address = models.CharField(max_length=255, blank=True)
+    maps_place_id = models.CharField(max_length=255, blank=True, unique=True, null=True)
+    source = models.CharField(max_length=30, default='manual')
 
     def __str__(self):
         return self.name
@@ -486,5 +496,4 @@ class Notification(TimestampedPublicModel):
 
     data = models.JSONField(default=dict, blank=True)
 
-    class Meta:
-        indexes = [models.Index(fields=['user', 'is_read', 'created_at'], name='notification_user_read_idx')]
+    created_at = models.DateTimeField(auto_now_add=True)

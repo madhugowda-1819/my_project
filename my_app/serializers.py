@@ -48,7 +48,11 @@ class GroundSerializer(serializers.ModelSerializer):
             'address',
             'price_per_hour',
             'pitch_type',
+            'size',
             'sports',
+            'address',
+            'maps_place_id',
+            'source',
             'distanceKm'
         ]
 

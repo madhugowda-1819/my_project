@@ -32,19 +32,7 @@ urlpatterns = [
 
     # ---------------- GROUNDS ----------------
     path('grounds/', views.GroundListView.as_view()),
-    path('venues/nearby/', views.NearbyVenueView.as_view()),
-    path('venues/nearby/', views.VenueNearbyView.as_view()),
-    path('venues/', views.VenueListView.as_view()),
-    path('venues/search/', views.VenueSearchView.as_view()),
-    path('venues/<uuid:public_id>/', views.VenueDetailView.as_view()),
-    path('venues/<uuid:public_id>/availability/', views.VenueAvailabilityView.as_view()),
-    path('venues/reviews/', views.VenueReviewView.as_view()),
-    path('venues/reviews/<uuid:public_id>/', views.VenueReviewDetailView.as_view()),
-    path('bookings/', views.BookingListCreateView.as_view()),
-    path('bookings/quote/', views.BookingQuoteView.as_view()),
-    path('bookings/<uuid:public_id>/', views.BookingDetailView.as_view()),
-    path('bookings/<uuid:public_id>/cancel/', views.BookingCancelView.as_view()),
-    path('recommendations/players/', views.PlayerRecommendationView.as_view()),
+    path('grounds/live/', views.LiveGroundListView.as_view()),
 
     # ---------------- MATCHES ----------------
     path('matches/', views.MatchListView.as_view()),

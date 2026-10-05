@@ -1,5 +1,6 @@
 from django.contrib.auth import get_user_model
-from django.db.models import Q
+from django.db.models import Q, Count, F
+from django.utils import timezone
 from django.http import JsonResponse
 from rest_framework import generics
 from rest_framework.decorators import api_view, permission_classes, throttle_classes
@@ -15,8 +16,6 @@ from django.utils.http import urlsafe_base64_encode, urlsafe_base64_decode
 from django.utils.encoding import force_bytes, force_str
 from django.core.mail import send_mail
 from django.conf import settings
-from django.shortcuts import get_object_or_404
-from django.utils import timezone
 
 from .models import (
     Sport, AvailabilitySlot, Match, Message,
@@ -36,17 +35,7 @@ from .serializers import (
     NotificationSerializer, AvailabilityToggleSerializer,
     GroundSerializer, MatchCreateSerializer
 )
-from .services.matches import create_match, join_match
-from .services.recommendations import recommended_matches_for
-from .services.accounts import AuthenticationService, UserService
-from .services.players import PlayerService
-from .services.locations import nearby_queryset
-from .services.player_matching import PlayerMatchingService
-from .services.venues import VenueDiscoveryService, VenueReviewService
-from .services.availability import VenueAvailabilityService
-from .services.bookings import BookingService, BookingCancellationService
-from .models import Venue, CourtBooking, VenueReview
-from .permissions import IsActiveAccount
+from .maps import MapsProviderError, find_live_sports_grounds
 
 User = get_user_model()
 
@@ -73,10 +62,16 @@ class RegisterView(APIView):
 @permission_classes([AllowAny])
 @throttle_classes([ScopedRateThrottle])
 def login_view(request):
-    serializer = LoginRequestSerializer(data=request.data)
-    serializer.is_valid(raise_exception=True)
-    identifier = serializer.validated_data.get('identifier') or serializer.validated_data['email']
-    user = AuthenticationService.login(identifier=identifier, password=serializer.validated_data['password'])
+    # The client login form accepts either an email address or a username.
+    # Django's default authentication backend uses the USERNAME_FIELD, so pass
+    # the submitted identifier through as `username` regardless of its form.
+    identifier = (request.data.get('identifier') or request.data.get('email') or '').strip()
+    password = request.data.get('password')
+
+    user = authenticate(request, username=identifier, password=password)
+
+    if not user:
+        return Response({'detail': 'Invalid credentials'}, status=401)
 
     # ✅ mark user online
     return Response({
@@ -102,18 +97,18 @@ class LogoutView(APIView):
 @permission_classes([AllowAny])
 @throttle_classes([ScopedRateThrottle])
 def forgot_password(request):
-    email = request.data.get('email')
+    email = (request.data.get('email') or '').strip().lower()
 
     try:
         user = User.objects.get(email__iexact=(email or '').strip())
     except User.DoesNotExist:
-        # Do not reveal whether an account exists for a supplied email address.
-        return Response({"message": "If an account exists, a reset link has been sent."})
+        # Do not reveal which email addresses have accounts.
+        return Response({"msg": "If that email is registered, a reset link has been sent."})
 
     uid = urlsafe_base64_encode(force_bytes(user.pk))
     token = PasswordResetTokenGenerator().make_token(user)
 
-    reset_link = f"{settings.PASSWORD_RESET_FRONTEND_URL}/{uid}/{token}"
+    reset_link = f"{settings.PASSWORD_RESET_URL}?uid={uid}&token={token}"
 
     send_mail(
         subject="Reset Password - SportMate",
@@ -122,19 +117,15 @@ def forgot_password(request):
         recipient_list=[email],
     )
 
-    return Response({"message": "If an account exists, a reset link has been sent."})
-
-
-forgot_password.throttle_scope = 'password_reset'
-forgot_password.cls.throttle_scope = 'password_reset'
+    return Response({"msg": "If that email is registered, a reset link has been sent."})
 
 
 @api_view(['POST'])
 @permission_classes([AllowAny])
 def reset_password(request, uidb64=None, token=None):
     new_password = request.data.get('password')
-    uidb64 = uidb64 or request.data.get('uid')
-    token = token or request.data.get('token')
+    if not new_password or len(new_password) < 8:
+        return Response({"error": "Password must be at least 8 characters."}, status=400)
 
     try:
         uid = force_str(urlsafe_base64_decode(uidb64))
@@ -177,8 +168,8 @@ def change_password(request):
 
 # ---------------- USER ----------------
 class MeView(generics.RetrieveUpdateAPIView):
-    serializer_class = CurrentUserSerializer
-    permission_classes = [IsActiveAccount]
+    serializer_class = UserSerializer
+    permission_classes = [IsAuthenticated]
 
     def get_object(self):
         return self.request.user
@@ -534,15 +525,32 @@ class GroundListView(APIView):
     permission_classes = [AllowAny]
 
     def get(self, request):
-        lat = float(request.GET.get('lat'))
-        lng = float(request.GET.get('lng'))
+        try:
+            lat = float(request.GET['lat'])
+            lng = float(request.GET['lng'])
+        except (KeyError, TypeError, ValueError):
+            return Response({'detail': 'Valid lat and lng query parameters are required.'}, status=400)
 
-        grounds = Ground.objects.all()
+        grounds = Ground.objects.prefetch_related('sports').all()
+        sport = request.GET.get('sport', '').strip()
+        size = request.GET.get('size', '').strip().lower()
+        try:
+            radius = float(request.GET.get('radius', 10))
+        except ValueError:
+            return Response({'detail': 'radius must be a number.'}, status=400)
+        if radius <= 0 or radius > 100:
+            return Response({'detail': 'radius must be between 0 and 100 km.'}, status=400)
+        if sport:
+            grounds = grounds.filter(sports__name__iexact=sport)
+        if size:
+            if size not in dict(Ground.SIZE_CHOICES):
+                return Response({'detail': 'size must be small, medium, or big.'}, status=400)
+            grounds = grounds.filter(size=size)
         results = []
 
         for g in grounds:
             d = g.distance_to(lat, lng)
-            if d <= 10:
+            if d <= radius:
                 g.distance_km = round(d, 2)
                 results.append(g)
 
@@ -551,9 +559,34 @@ class GroundListView(APIView):
         return Response(GroundSerializer(results, many=True).data)
 
 
+class LiveGroundListView(APIView):
+    """Returns current Google Maps results; it never reads Ground rows."""
+    permission_classes = [AllowAny]
+
+    def get(self, request):
+        try:
+            latitude = float(request.GET['lat'])
+            longitude = float(request.GET['lng'])
+            radius = float(request.GET.get('radius', 10))
+        except (KeyError, TypeError, ValueError):
+            return Response({'detail': 'Valid lat and lng query parameters are required.'}, status=400)
+        if not 0 < radius <= 50:
+            return Response({'detail': 'radius must be between 0 and 50 km.'}, status=400)
+        try:
+            places = find_live_sports_grounds(
+                latitude=latitude,
+                longitude=longitude,
+                sport=request.GET.get('sport', '').strip() or None,
+                radius_km=radius,
+            )
+        except MapsProviderError as error:
+            return Response({'detail': str(error)}, status=503)
+        return Response(places)
+
+
 # ---------------- MATCHES ----------------
 class MatchListView(generics.ListAPIView):
-    queryset = Match.objects.all()
+    queryset = Match.objects.select_related('sport', 'ground', 'organizer').prefetch_related('joined_players')
     serializer_class = MatchSerializer
     permission_classes = [IsActiveAccount]
 
@@ -562,15 +595,21 @@ class CreateMatchView(APIView):
     permission_classes = [IsActiveAccount]
 
     def post(self, request):
-        serializer = MatchCreateSerializer(data=request.data)
-        serializer.is_valid(raise_exception=True)
-        match = create_match(organizer=request.user, validated_data=serializer.validated_data)
-
-        return Response({
-            "success": True,
-            "message": "Match created",
-            "match": MatchSerializer(match).data,
-        }, status=201)
+        required = ('sport', 'ground', 'date_time', 'total_players')
+        missing = [field for field in required if not request.data.get(field)]
+        if missing:
+            return Response({'detail': f"Missing required fields: {', '.join(missing)}."}, status=400)
+        try:
+            match = Match.objects.create(
+                sport_id=request.data['sport'], organizer=request.user,
+                ground_id=request.data['ground'], date_time=request.data['date_time'],
+                total_players=int(request.data['total_players'])
+            )
+        except (Sport.DoesNotExist, Ground.DoesNotExist):
+            return Response({'detail': 'Selected sport or ground does not exist.'}, status=400)
+        except (TypeError, ValueError):
+            return Response({'detail': 'Player capacity must be a valid number.'}, status=400)
+        return Response({'match': MatchSerializer(match).data}, status=201)
 
 
 class JoinMatchView(APIView):
@@ -693,31 +732,67 @@ class AvailabilityView(APIView):
             ])
 
         return Response(UserSerializer(user).data)
-class AiMatchView(generics.GenericAPIView):
-    permission_classes = [IsActiveAccount]
+    
+from rest_framework.views import APIView
+from rest_framework.response import Response
+from rest_framework.permissions import IsAuthenticated
+from math import radians, sin, cos, sqrt, atan2
+
+from .models import Match, PlayerProfile
+
+
+class AiMatchView(APIView):
+    permission_classes = [IsAuthenticated]
 
     def get(self, request):
-        matches = recommended_matches_for(request.user)
-        page = self.paginate_queryset(matches)
-        if page is not None:
-            return self.get_paginated_response(MatchSerializer(page, many=True).data)
-        return Response(MatchSerializer(matches, many=True).data)
+        user = request.user
 
+        user_lat = user.latitude
+        user_lng = user.longitude
 
-def global_project_homepage(request):
-    """Handles the main domain homepage root '/'."""
-    return JsonResponse({
-        "status": "online",
-        "project": "SportMate Backend API Platform",
-        "message": "Server initialized and actively handling traffic.",
-        "api_v1_root": "/api/v1/",
-    })
+        # fallback if no location
+        matches = Match.objects.select_related('sport', 'ground', 'organizer').prefetch_related('joined_players').filter(
+            status='upcoming', date_time__gte=timezone.now()
+        ).annotate(players_count=Count('joined_players'))
 
+        if user_lat is None or user_lng is None:
+            return Response(MatchSerializer(matches.filter(players_count__lt=F('total_players'))[:10], many=True).data)
 
-def api_root_landing(request):
-    """Handles the API index root '/api/'."""
-    return JsonResponse({
-        "status": "online",
-        "message": "SportMate REST API Backend is running successfully!",
-        "version": "v1",
-    })
+        matches = matches.filter(players_count__lt=F('total_players'))
+
+        results = []
+
+        for match in matches:
+            if not match.ground:
+                continue
+
+            g = match.ground
+
+            if not g.latitude or not g.longitude:
+                continue
+
+            distance = self.calculate_distance(
+                user_lat, user_lng,
+                g.latitude, g.longitude
+            )
+
+            # filter nearby (within 10 km)
+            if distance <= 10:
+                results.append((match, distance))
+
+        # sort by nearest
+        results.sort(key=lambda x: x[1])
+
+        return Response(MatchSerializer([m[0] for m in results[:10]], many=True).data)
+
+    def calculate_distance(self, lat1, lon1, lat2, lon2):
+        R = 6371  # km
+
+        dlat = radians(lat2 - lat1)
+        dlon = radians(lon2 - lon1)
+
+        a = sin(dlat/2)**2 + cos(radians(lat1)) * cos(radians(lat2)) * sin(dlon/2)**2
+        c = 2 * atan2(sqrt(a), sqrt(1-a))
+
+        return R * c
+

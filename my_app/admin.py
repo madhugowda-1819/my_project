@@ -58,8 +58,10 @@ class AvailabilityAdmin(admin.ModelAdmin):
 # ------------------------------------------------------------------
 @admin.register(Ground)
 class GroundAdmin(admin.ModelAdmin):
-    list_display = ('name', 'city', 'price_per_hour', 'pitch_type')
-    search_fields = ('name', 'city')
+    list_display = ('name', 'city', 'size', 'price_per_hour', 'pitch_type', 'source')
+    list_filter = ('size', 'sports', 'source')
+    search_fields = ('name', 'city', 'address', 'maps_place_id')
+    filter_horizontal = ('sports',)
 
 
 # ------------------------------------------------------------------

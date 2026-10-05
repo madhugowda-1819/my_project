@@ -12,11 +12,6 @@ class Migration(migrations.Migration):
     operations = [
         migrations.AddField(
             model_name='ground',
-            name='address',
-            field=models.CharField(blank=True, max_length=255),
-        ),
-        migrations.AddField(
-            model_name='ground',
             name='maps_place_id',
             field=models.CharField(blank=True, max_length=255, null=True, unique=True),
         ),
@@ -29,10 +24,5 @@ class Migration(migrations.Migration):
             model_name='ground',
             name='source',
             field=models.CharField(default='manual', max_length=30),
-        ),
-        migrations.AddField(
-            model_name='ground',
-            name='sports',
-            field=models.ManyToManyField(blank=True, related_name='grounds', to='my_app.sport'),
         ),
     ]

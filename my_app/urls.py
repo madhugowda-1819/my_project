@@ -16,9 +16,8 @@ urlpatterns = [
     path('users/me/player-profile/', views.MyPlayerProfileView.as_view()),
     path('me/', views.MeView.as_view()),  # legacy
 
-    # Legacy aliases now use database-backed nearby search.
-    path('players/', views.NearbyPlayerView.as_view()),
-    path('grounds/', views.NearbyVenueView.as_view()),
+    # Legacy alias for venue discovery. Keep `/grounds/` reserved for the
+    # dedicated ground endpoint below, which accepts `lat` and `lng`.
     path('venues/nearby/', views.VenueNearbyView.as_view()),
 
     # ---------------- PLAYERS ----------------

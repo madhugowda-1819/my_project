@@ -8,6 +8,15 @@ from urllib.request import Request, urlopen
 from django.conf import settings
 
 
+# Only these sport facilities are part of SportMate's discovery catalogue.
+# Keeping this list here also prevents generic gyms from appearing as grounds.
+SUPPORTED_SPORTS = (
+    'cricket', 'football', 'badminton', 'basketball', 'carrom', 'chess',
+    'kabaddi', 'kho kho', 'pickleball', 'swimming', 'table tennis',
+    'tennis', 'volleyball',
+)
+
+
 class MapsProviderError(Exception):
     pass
 
@@ -18,7 +27,9 @@ def find_live_sports_grounds(*, latitude, longitude, sport=None, radius_km=10):
         return _find_openstreetmap_sports_grounds(
             latitude=latitude, longitude=longitude, sport=sport, radius_km=radius_km,
         )
-    query = f'{sport} ground' if sport else 'sports ground'
+    # A generic "sports ground" query also returns gyms. Request only the
+    # supported activities when no sport filter has been selected.
+    query = f'{sport} ground' if sport else f"{' '.join(SUPPORTED_SPORTS)} sports ground"
     body = {'textQuery': query, 'maxResultCount': 20, 'locationBias': {'circle': {'center': {'latitude': latitude, 'longitude': longitude}, 'radius': min(radius_km * 1000, 50000)}}, 'languageCode': 'en'}
     request = Request('https://places.googleapis.com/v1/places:searchText', data=json.dumps(body).encode('utf-8'), headers={'Content-Type': 'application/json', 'X-Goog-Api-Key': api_key, 'X-Goog-FieldMask': 'places.id,places.displayName,places.formattedAddress,places.location,places.types,places.googleMapsUri'}, method='POST')
     try:
@@ -35,15 +46,13 @@ def _find_openstreetmap_sports_grounds(*, latitude, longitude, sport=None, radiu
     """No-key fallback using OpenStreetMap's public Overpass API."""
     radius_meters = int(min(radius_km * 1000, 50000))
     around = f'(around:{radius_meters},{latitude},{longitude})'
-    # OSM has inconsistent sport tagging, so include recognised facilities and
-    # sport-tagged objects. A sport filter also matches a facility's name.
-    facility_query = f'nwr{around}["leisure"~"^(pitch|sports_centre|stadium)$"];'
     if sport:
         safe_sport = re.escape(sport.strip().lower())
         sport_query = f'nwr{around}["sport"~"{safe_sport}",i]; nwr{around}["name"~"{safe_sport}",i];'
     else:
-        sport_query = f'nwr{around}["sport"];'
-    query = f'[out:json][timeout:15];({facility_query}{sport_query});out center tags;'
+        allowed = '|'.join(re.escape(value).replace(r'\ ', r'\\s*') for value in SUPPORTED_SPORTS)
+        sport_query = f'nwr{around}["sport"~"^({allowed})$",i];'
+    query = f'[out:json][timeout:15];({sport_query});out center tags;'
     request = Request(
         settings.OVERPASS_API_URL,
         data=urlencode({'data': query}).encode('utf-8'),

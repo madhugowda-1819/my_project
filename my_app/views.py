@@ -1,7 +1,7 @@
 from django.contrib.auth import get_user_model
 from django.db.models import Q, Count, F
 from django.utils import timezone
-from django.http import JsonResponse
+from django.http import HttpResponse, HttpResponseBadRequest, JsonResponse
 from rest_framework import generics
 from rest_framework.decorators import api_view, permission_classes, throttle_classes
 from rest_framework.permissions import AllowAny, IsAuthenticated
@@ -16,6 +16,8 @@ from django.utils.http import urlsafe_base64_encode, urlsafe_base64_decode
 from django.utils.encoding import force_bytes, force_str
 from django.core.mail import send_mail
 from django.conf import settings
+from urllib.parse import urlencode
+import json
 
 from .models import (
     Sport, AvailabilitySlot, Match, Message,
@@ -37,7 +39,7 @@ from .serializers import (
 )
 from .maps import MapsProviderError, find_live_sports_grounds
 from .permissions import IsActiveAccount
-from .services.accounts import AuthenticationService
+from .services.accounts import AuthenticationService, UserService
 
 User = get_user_model()
 
@@ -48,6 +50,17 @@ def global_project_homepage(request):
 
 def api_root_landing(request):
     return JsonResponse({'name': 'SportMate API', 'version': 'v1', 'status': 'ok'})
+
+
+def password_reset_page(request):
+    """Browser fallback for reset links opened outside the mobile app."""
+    uid = request.GET.get('uid', '')
+    token = request.GET.get('token', '')
+    if not uid or not token:
+        return HttpResponseBadRequest('This password-reset link is incomplete.')
+    endpoint = f'/api/reset-password/{uid}/{token}/'
+    endpoint_json = json.dumps(endpoint)
+    return HttpResponse(f'''<!doctype html><html><head><meta name="viewport" content="width=device-width, initial-scale=1"><title>Reset password | SportMate</title><style>body{{font-family:Arial,sans-serif;background:#f5f7fb;margin:0;color:#102040}}main{{max-width:420px;margin:10vh auto;padding:28px;background:#fff;border-radius:16px;box-shadow:0 8px 30px #10204018}}input,button{{box-sizing:border-box;width:100%;padding:13px;margin-top:12px;border-radius:8px;font-size:16px}}input{{border:1px solid #ccd4e0}}button{{border:0;background:#175cd3;color:#fff;font-weight:700}}#message{{min-height:24px;margin-top:14px}}</style></head><body><main><h1>Choose a new password</h1><p>Enter and confirm your new SportMate password.</p><form id="reset-form"><input id="password" type="password" minlength="8" placeholder="New password" required><input id="confirmation" type="password" minlength="8" placeholder="Confirm new password" required><button type="submit">Reset password</button></form><p id="message" role="alert"></p></main><script>const endpoint={endpoint_json};document.getElementById('reset-form').addEventListener('submit',async event=>{{event.preventDefault();const password=document.getElementById('password').value;const confirmation=document.getElementById('confirmation').value;const message=document.getElementById('message');if(password!==confirmation){{message.textContent='Passwords do not match.';return;}}const response=await fetch(endpoint,{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{password}})}});const data=await response.json().catch(()=>({{}}));message.textContent=response.ok?'Password reset. Return to SportMate and sign in.':(data.error?.message||data.error||'Could not reset the password.');}});</script></body></html>''')
 
 
 # ---------------- AUTH ----------------
@@ -115,7 +128,8 @@ def forgot_password(request):
     uid = urlsafe_base64_encode(force_bytes(user.pk))
     token = PasswordResetTokenGenerator().make_token(user)
 
-    reset_link = f"{settings.PASSWORD_RESET_URL}?uid={uid}&token={token}"
+    separator = '&' if '?' in settings.PASSWORD_RESET_URL else '?'
+    reset_link = f"{settings.PASSWORD_RESET_URL}{separator}{urlencode({'uid': uid, 'token': token})}"
 
     send_mail(
         subject="Reset Password - SportMate",
@@ -176,7 +190,7 @@ def change_password(request):
 # ---------------- USER ----------------
 class MeView(generics.RetrieveUpdateAPIView):
     serializer_class = UserSerializer
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsActiveAccount]
 
     def get_object(self):
         return self.request.user

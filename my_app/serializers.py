@@ -312,6 +312,12 @@ class RegistrationRequestSerializer(serializers.Serializer):
     email = serializers.EmailField()
     phone = serializers.CharField(max_length=20, required=False, allow_blank=True, validators=[phone_validator])
     password = serializers.CharField(write_only=True, trim_whitespace=False, min_length=8)
+    sport_ids = serializers.PrimaryKeyRelatedField(
+        source='sports',
+        many=True,
+        queryset=Sport.objects.filter(is_active=True),
+        required=False,
+    )
 
 
 class LoginRequestSerializer(serializers.Serializer):
@@ -329,6 +335,8 @@ class LoginRequestSerializer(serializers.Serializer):
 # USER
 # ------------------------------------------------------------------
 class UserSerializer(serializers.ModelSerializer):
+    # Mobile clients use `name`, while the database field remains `full_name`.
+    name = serializers.CharField(source='full_name', required=False)
     sports = SportSerializer(many=True, read_only=True)
     profile = PlayerProfileSerializer(read_only=True)
     availability_slots = AvailabilitySlotSerializer(many=True, read_only=True)
@@ -339,7 +347,7 @@ class UserSerializer(serializers.ModelSerializer):
     class Meta:
         model = User
         fields = [
-            'id', 'public_id', 'full_name', 'email', 'username', 'phone', 'avatar', 'bio',
+            'id', 'public_id', 'name', 'full_name', 'email', 'username', 'phone', 'avatar', 'bio',
             'city', 'latitude', 'longitude', 'is_available',
             'sports', 'profile', 'availability_slots',
             'distanceKm', 'isOnline'

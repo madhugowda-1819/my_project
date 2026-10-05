@@ -4,7 +4,7 @@ from django.utils import timezone
 from django.http import JsonResponse
 from rest_framework import generics
 from rest_framework.decorators import api_view, permission_classes, throttle_classes
-from rest_framework.permissions import AllowAny
+from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 from rest_framework.throttling import ScopedRateThrottle
@@ -36,8 +36,18 @@ from .serializers import (
     GroundSerializer, MatchCreateSerializer
 )
 from .maps import MapsProviderError, find_live_sports_grounds
+from .permissions import IsActiveAccount
+from .services.accounts import AuthenticationService
 
 User = get_user_model()
+
+
+def global_project_homepage(request):
+    return JsonResponse({'name': 'SportMate API', 'status': 'ok', 'api': '/api/v1/'})
+
+
+def api_root_landing(request):
+    return JsonResponse({'name': 'SportMate API', 'version': 'v1', 'status': 'ok'})
 
 
 # ---------------- AUTH ----------------
@@ -68,10 +78,7 @@ def login_view(request):
     identifier = (request.data.get('identifier') or request.data.get('email') or '').strip()
     password = request.data.get('password')
 
-    user = authenticate(request, username=identifier, password=password)
-
-    if not user:
-        return Response({'detail': 'Invalid credentials'}, status=401)
+    user = AuthenticationService.login(identifier=identifier, password=password)
 
     # ✅ mark user online
     return Response({

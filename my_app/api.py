@@ -31,7 +31,20 @@ def sportmate_exception_handler(exc, context):
 
     details = response.data
     if isinstance(details, dict):
-        message = details.get('detail') or 'Request could not be completed.'
+        message = details.get('detail')
+        if not message:
+            # Keep the JSON details for clients while exposing one useful,
+            # non-sensitive validation message instead of a generic 400 text.
+            for field, field_errors in details.items():
+                if isinstance(field_errors, (list, tuple)) and field_errors:
+                    label = str(field).replace('_', ' ').capitalize()
+                    message = f'{label}: {field_errors[0]}'
+                    break
+                if isinstance(field_errors, str):
+                    label = str(field).replace('_', ' ').capitalize()
+                    message = f'{label}: {field_errors}'
+                    break
+        message = message or 'Request could not be completed.'
     elif isinstance(details, list) and details:
         message = details[0]
     else:

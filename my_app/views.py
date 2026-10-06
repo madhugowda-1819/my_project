@@ -262,7 +262,7 @@ class MeView(generics.RetrieveUpdateAPIView):
         serializer = self.get_serializer(self.get_object(), data=request.data, partial=True)
         serializer.is_valid(raise_exception=True)
         user = UserService.update_profile(user=request.user, validated_data=serializer.validated_data)
-        return Response(CurrentUserSerializer(user).data)
+        return Response(CurrentUserSerializer(user, context={'request': request}).data)
 
 
 class AccountTokenRefreshView(TokenRefreshView):

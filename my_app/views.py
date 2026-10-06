@@ -1,5 +1,7 @@
 from django.contrib.auth import get_user_model
 from django.db.models import Q, Count, F
+from django.db import connection
+from django.shortcuts import get_object_or_404
 from django.utils import timezone
 from django.http import HttpResponse, HttpResponseBadRequest, JsonResponse
 from rest_framework import generics
@@ -10,7 +12,7 @@ from rest_framework.views import APIView
 from rest_framework.throttling import ScopedRateThrottle
 from rest_framework_simplejwt.views import TokenRefreshView
 from rest_framework_simplejwt.tokens import RefreshToken
-from rest_framework.exceptions import AuthenticationFailed
+from rest_framework.exceptions import AuthenticationFailed, PermissionDenied, ValidationError
 from django.contrib.auth.tokens import PasswordResetTokenGenerator
 from django.utils.http import urlsafe_base64_encode, urlsafe_base64_decode
 from django.utils.encoding import force_bytes, force_str
@@ -20,8 +22,10 @@ from urllib.parse import urlencode
 import json
 
 from .models import (
-    Sport, AvailabilitySlot, Match, Message,
-    Notification, Ground
+    Sport, AvailabilitySlot, Match, Message, Notification, Ground,
+    Venue, Court, VenueReview, CourtBooking, Game, GamePlayer, Conversation, ConversationMember,
+    Community, CommunityMember, CommunityPost, CommunityComment, CommunityPostLike,
+    Event, EventParticipant, Tournament, TournamentTeam, TournamentMatch, NotificationPreference, UserDevice, PlayerRating, Achievement, UserAchievement, Report, ModerationAction,
 )
 
 from .serializers import (
@@ -35,11 +39,44 @@ from .serializers import (
     BookingCreateSerializer, BookingSerializer,
     MatchSerializer, MessageSerializer,
     NotificationSerializer, AvailabilityToggleSerializer,
-    GroundSerializer, MatchCreateSerializer
+    GroundSerializer, MatchCreateSerializer,
+    GameCreateSerializer, GameUpdateSerializer, GameQuerySerializer, GameRecommendationQuerySerializer,
+    GameSerializer, GamePlayerSerializer, ConversationCreateSerializer,
+    ConversationMessageCreateSerializer, ConversationMessageSerializer,
+    CommunityCreateSerializer, CommunityUpdateSerializer, CommunitySerializer, CommunityMemberSerializer,
+    CommunityPostCreateSerializer, CommunityContentSerializer, CommunityPostSerializer, CommunityCommentSerializer,
+    EventCreateSerializer, EventSerializer, EventParticipantSerializer, TournamentCreateSerializer, TournamentSerializer, TournamentTeamSerializer, TournamentMatchSerializer,
+    NotificationPreferenceSerializer, UserDeviceSerializer, UserDeviceCreateSerializer,
+    PlayerRatingSerializer, PlayerRatingCreateSerializer,
+    AchievementSerializer, UserAchievementSerializer,
+    ReportCreateSerializer, ReportSerializer, ReportUpdateSerializer, ModerationActionSerializer, AdminUserSerializer,
 )
 from .maps import MapsProviderError, find_live_sports_grounds
-from .permissions import IsActiveAccount
+from .permissions import IsActiveAccount, IsPlatformAdmin, IsPlatformModerator, has_platform_role, MODERATOR_GROUPS
 from .services.accounts import AuthenticationService, UserService
+from .services.availability import VenueAvailabilityService
+from .services.bookings import BookingCancellationService, BookingService
+from .services.games import ACTIVE_GAME_STATUSES, GameLifecycleService, GameService
+from .services.game_matching import GameMatchingService
+from .services.chat import (
+    ChatPermissionService, ConversationService, MessageService, UnreadMessageService,
+)
+from .services.communities import (
+    CommunityCommentService, CommunityDiscoveryService, CommunityMembershipService,
+    CommunityModerationService, CommunityPostService, CommunityService,
+)
+from .services.events import EventService, EventRegistrationService, EventCapacityService, TournamentService, TournamentBracketService, TournamentMatchService, TournamentStandingsService
+from .services.notifications import NotificationService, DeviceService
+from .services.moderation import ModerationService
+from .services.statistics import RatingService, PlayerStatisticsService, LeaderboardService
+from .services.achievements import AchievementEvaluationService, AchievementService
+from .services.search import GlobalSearchService, VALID_TYPES
+from .services.recommendation_engine import RecommendationProfileService, RecommendationService
+from .services.locations import nearby_queryset
+from .services.player_matching import PlayerMatchingService
+from .services.players import PlayerService
+from .services.venues import VenueDiscoveryService, VenueReviewService
+from .services.matches import join_match
 
 User = get_user_model()
 
@@ -50,6 +87,17 @@ def global_project_homepage(request):
 
 def api_root_landing(request):
     return JsonResponse({'name': 'SportMate API', 'version': 'v1', 'status': 'ok'})
+
+
+@api_view(['GET'])
+@permission_classes([AllowAny])
+def health_check(request):
+    """Non-sensitive liveness/readiness endpoint for deployment monitoring."""
+    try:
+        connection.ensure_connection()
+    except Exception:
+        return Response({'status': 'unavailable'}, status=503)
+    return Response({'status': 'ok'})
 
 
 def password_reset_page(request):
@@ -476,6 +524,8 @@ class CourtBookingCreateView(APIView):
 
 class BookingListCreateView(generics.ListCreateAPIView):
     permission_classes = [IsActiveAccount]
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = 'booking'
     serializer_class = BookingSerializer
 
     def get_queryset(self):
@@ -507,6 +557,8 @@ class BookingListCreateView(generics.ListCreateAPIView):
 
 class BookingQuoteView(APIView):
     permission_classes = [IsActiveAccount]
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = 'booking'
 
     def post(self, request):
         serializer = BookingCreateSerializer(data=request.data)
@@ -645,8 +697,658 @@ class JoinMatchView(APIView):
         })
 
 
-# ---------------- CHAT ----------------
-# ---------------- CHAT ----------------
+# ---------------- COURT-BACKED GAMES ----------------
+class GameListCreateView(generics.ListCreateAPIView):
+    permission_classes = [IsActiveAccount]
+
+    def get_serializer_class(self):
+        return GameCreateSerializer if self.request.method == 'POST' else GameSerializer
+
+    def get_queryset(self):
+        query = GameQuerySerializer(data=self.request.query_params)
+        query.is_valid(raise_exception=True)
+        data = query.validated_data
+        visible_to_requester = (
+            Q(visibility=Game.Visibility.PUBLIC)
+            | Q(host=self.request.user)
+            | Q(game_players__user=self.request.user, game_players__status=GamePlayer.Status.CONFIRMED)
+        )
+        queryset = Game.objects.filter(visible_to_requester).select_related(
+            'sport', 'venue', 'court__sport', 'host',
+        ).prefetch_related('game_players__user__user_sports__sport').distinct()
+        if data.get('sport'):
+            queryset = queryset.filter(sport_id=data['sport'])
+        if data.get('venue'):
+            queryset = queryset.filter(venue__public_id=data['venue'])
+        if data.get('city'):
+            queryset = queryset.filter(venue__city__iexact=data['city'])
+        if data.get('date'):
+            queryset = queryset.filter(game_date=data['date'])
+        if data.get('skill_level'):
+            queryset = queryset.filter(skill_level=data['skill_level'])
+        if data.get('status'):
+            queryset = queryset.filter(status=data['status'])
+        elif data.get('upcoming', True):
+            queryset = queryset.filter(status__in=ACTIVE_GAME_STATUSES, ends_at__gt=timezone.now())
+        if 'latitude' in data:
+            queryset = nearby_queryset(
+                queryset, latitude=data['latitude'], longitude=data['longitude'], radius=data['radius'],
+                latitude_field='venue__latitude', longitude_field='venue__longitude',
+            )
+        else:
+            queryset = queryset.order_by('starts_at')
+        return queryset
+
+    def list(self, request, *args, **kwargs):
+        # Refresh the lifecycle for records that will be presented. This keeps
+        # time/capacity state authoritative without a client-side transition.
+        queryset = self.filter_queryset(self.get_queryset())
+        for game in queryset[:100]:
+            GameLifecycleService.refresh(game)
+        self.get_queryset = lambda: queryset
+        return super().list(request, *args, **kwargs)
+
+    def create(self, request, *args, **kwargs):
+        serializer = GameCreateSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+        game = GameService.create(
+            host=request.user, sport_id=data['sport'].id, venue_id=data['venue_id'], court_id=data['court_id'],
+            game_date=data['game_date'], start_time=data['start_time'], end_time=data['end_time'],
+            min_players=data['min_players'], max_players=data['max_players'], skill_level=data['skill_level'],
+            description=data['description'], visibility=data['visibility'],
+        )
+        game = Game.objects.select_related('sport', 'venue', 'court__sport', 'host').prefetch_related(
+            'game_players__user__user_sports__sport',
+        ).get(pk=game.pk)
+        return Response({'success': True, 'data': GameSerializer(game, context={'request': request}).data}, status=201)
+
+
+class GameDetailView(generics.RetrieveUpdateDestroyAPIView):
+    permission_classes = [IsActiveAccount]
+    serializer_class = GameSerializer
+    lookup_field = 'public_id'
+
+    def get_queryset(self):
+        visible_to_requester = (
+            Q(visibility=Game.Visibility.PUBLIC)
+            | Q(host=self.request.user)
+            | Q(game_players__user=self.request.user, game_players__status=GamePlayer.Status.CONFIRMED)
+        )
+        return Game.objects.filter(visible_to_requester).select_related(
+            'sport', 'venue', 'court__sport', 'host',
+        ).prefetch_related('game_players__user__user_sports__sport').distinct()
+
+    def retrieve(self, request, *args, **kwargs):
+        game = self.get_object()
+        GameLifecycleService.refresh(game)
+        return Response({'success': True, 'data': GameSerializer(game, context={'request': request}).data})
+
+    def partial_update(self, request, *args, **kwargs):
+        serializer = GameUpdateSerializer(data=request.data, partial=True)
+        serializer.is_valid(raise_exception=True)
+        game = GameService.update(game_id=kwargs['public_id'], actor=request.user, **serializer.validated_data)
+        game = self.get_queryset().get(pk=game.pk)
+        return Response({'success': True, 'data': GameSerializer(game, context={'request': request}).data})
+
+    def destroy(self, request, *args, **kwargs):
+        GameService.cancel(game_id=kwargs['public_id'], actor=request.user)
+        return Response(status=204)
+
+
+class GameJoinView(APIView):
+    permission_classes = [IsActiveAccount]
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = 'game_join'
+
+    def post(self, request, public_id):
+        game, joined = GameService.join(game_id=public_id, user=request.user)
+        game = Game.objects.select_related('sport', 'venue', 'court__sport', 'host').prefetch_related(
+            'game_players__user__user_sports__sport',
+        ).get(pk=game.pk)
+        return Response({
+            'success': True,
+            'message': 'Joined game.' if joined else 'You have already joined this game.',
+            'data': GameSerializer(game, context={'request': request}).data,
+        })
+
+
+class GameLeaveView(APIView):
+    permission_classes = [IsActiveAccount]
+
+    def post(self, request, public_id):
+        game, action = GameService.leave(game_id=public_id, user=request.user)
+        return Response({'success': True, 'message': 'Game cancelled by host.' if action == 'cancelled' else 'Left game.', 'status': game.status})
+
+
+class GamePlayersView(APIView):
+    permission_classes = [IsActiveAccount]
+
+    def get(self, request, public_id):
+        visible_to_requester = (
+            Q(visibility=Game.Visibility.PUBLIC)
+            | Q(host=request.user)
+            | Q(game_players__user=request.user, game_players__status=GamePlayer.Status.CONFIRMED)
+        )
+        game = get_object_or_404(Game.objects.filter(visible_to_requester).distinct(), public_id=public_id)
+        players = GamePlayer.objects.filter(game=game, status=GamePlayer.Status.CONFIRMED).select_related('user').prefetch_related('user__user_sports__sport')
+        return Response({'success': True, 'results': GamePlayerSerializer(players, many=True, context={'request': request}).data})
+
+
+class GameRecommendationView(APIView):
+    """Deterministic recommendations; all scoring lives in GameMatchingService."""
+    permission_classes = [IsActiveAccount]
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = 'recommendations'
+
+    def get(self, request):
+        query = GameRecommendationQuerySerializer(data=request.query_params)
+        query.is_valid(raise_exception=True)
+        data = query.validated_data
+        latitude = data.get('latitude', request.user.latitude)
+        longitude = data.get('longitude', request.user.longitude)
+        # A saved location is optional. Without it the service still returns
+        # compatible upcoming games, without distance scoring/filtering.
+        if latitude is None or longitude is None:
+            latitude = longitude = None
+        results = GameMatchingService.get_recommendations(
+            user=request.user, sport=data.get('sport'), latitude=latitude,
+            longitude=longitude, radius=data['radius'], date=data.get('date'),
+            skill_level=data.get('skill_level'), limit=data['limit'],
+        )
+        return Response({
+            'success': True,
+            'data': [
+                {
+                    'game': GameSerializer(item['game'], context={'request': request}).data,
+                    'match_score': item['match_score'],
+                    'distance_km': item['distance_km'],
+                    'reasons': item['reasons'],
+                }
+                for item in results
+            ],
+        })
+
+
+class RecommendationBaseView(APIView):
+    """Read-only deterministic recommendations; category scoring stays in services."""
+    permission_classes = [IsActiveAccount]
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = 'recommendations'
+
+    @staticmethod
+    def _limit(request):
+        try:
+            return min(50, max(1, int(request.query_params.get('limit', 10))))
+        except ValueError as exc:
+            raise ValidationError({'limit': ['Must be an integer between 1 and 50.']}) from exc
+
+    @staticmethod
+    def _venue(item):
+        venue = item['venue']
+        return {'type': 'venue', 'id': str(venue.public_id), 'title': venue.name,
+                'description': venue.description, 'score': item['score'],
+                'distance_km': item.get('distance_km'), 'reasons': item['reasons'],
+                'metadata': {'city': venue.city, 'rating': str(venue.rating)}}
+
+    @staticmethod
+    def _community(item):
+        community = item['community']
+        return {'type': 'community', 'id': str(community.public_id), 'title': community.name,
+                'description': community.description, 'score': item['score'],
+                'reasons': item['reasons'], 'metadata': {'sport': community.sport.name if community.sport_id else None}}
+
+    @staticmethod
+    def _event(item):
+        event = item['event']
+        return {'type': 'event', 'id': str(event.public_id), 'title': event.title,
+                'description': event.description, 'score': item['score'], 'reasons': item['reasons'],
+                'metadata': {'sport': event.sport.name, 'starts_at': event.starts_at.isoformat(), 'venue': event.venue.name}}
+
+    @staticmethod
+    def _tournament(item):
+        tournament = item['tournament']
+        return {'type': 'tournament', 'id': str(tournament.public_id), 'title': tournament.name,
+                'description': '', 'score': item['score'], 'reasons': item['reasons'],
+                'metadata': {'sport': tournament.sport.name, 'start_date': tournament.start_date.isoformat(), 'venue': tournament.venue.name}}
+
+
+class RecommendationOverviewView(RecommendationBaseView):
+    def get(self, request):
+        limit = self._limit(request)
+        profile = RecommendationProfileService.profile(request.user)
+        return Response({'success': True, 'algorithm': 'deterministic_hybrid_v1', 'data': {
+            'profile': profile.preferences,
+            'venues': [self._venue(item) for item in RecommendationService.venues(request.user, limit)],
+            'communities': [self._community(item) for item in RecommendationService.communities(request.user, limit)],
+            'events': [self._event(item) for item in RecommendationService.events(request.user, limit)],
+            'tournaments': [self._tournament(item) for item in RecommendationService.tournaments(request.user, limit)],
+        }})
+
+
+class VenueRecommendationView(RecommendationBaseView):
+    def get(self, request):
+        RecommendationProfileService.profile(request.user)
+        return Response({'success': True, 'data': [self._venue(item) for item in RecommendationService.venues(request.user, self._limit(request))]})
+
+
+class CommunityRecommendationView(RecommendationBaseView):
+    def get(self, request):
+        RecommendationProfileService.profile(request.user)
+        return Response({'success': True, 'data': [self._community(item) for item in RecommendationService.communities(request.user, self._limit(request))]})
+
+
+class EventRecommendationView(RecommendationBaseView):
+    def get(self, request):
+        RecommendationProfileService.profile(request.user)
+        return Response({'success': True, 'data': [self._event(item) for item in RecommendationService.events(request.user, self._limit(request))]})
+
+
+class TournamentRecommendationView(RecommendationBaseView):
+    def get(self, request):
+        RecommendationProfileService.profile(request.user)
+        return Response({'success': True, 'data': [self._tournament(item) for item in RecommendationService.tournaments(request.user, self._limit(request))]})
+
+# ---------------- EVENTS & TOURNAMENTS ----------------
+class EventListCreateView(generics.ListCreateAPIView):
+ permission_classes=[IsActiveAccount]; serializer_class=EventSerializer
+ def get_queryset(self): return Event.objects.filter(status__in=[Event.Status.OPEN,Event.Status.FULL]).select_related('sport','venue','court','community').order_by('starts_at')
+ def create(self,request,*args,**kwargs):
+  s=EventCreateSerializer(data=request.data);s.is_valid(raise_exception=True);d=s.validated_data
+  d['venue']=get_object_or_404(Venue,public_id=d.pop('venue_id')); d['court']=get_object_or_404(Court,public_id=d.pop('court_id')) if d.get('court_id') else None; d.pop('court_id',None)
+  d['community']=get_object_or_404(Community,public_id=d.pop('community_id')) if d.get('community_id') else None; d.pop('community_id',None); d['game']=get_object_or_404(Game,public_id=d.pop('game_id')) if d.get('game_id') else None; d.pop('game_id',None)
+  event=EventService.create(organizer=request.user,**d); return Response({'success':True,'data':EventSerializer(event).data},status=201)
+class EventDetailView(generics.RetrieveUpdateDestroyAPIView):
+ permission_classes=[IsActiveAccount];serializer_class=EventSerializer;lookup_field='public_id'
+ def get_queryset(self): return Event.objects.select_related('sport','venue','court','community')
+ def destroy(self,request,*args,**kwargs):
+  e=self.get_object()
+  if e.organizer_id!=request.user.id and not request.user.is_staff: raise PermissionDenied('Only organizer can cancel.')
+  e.status=Event.Status.CANCELLED;e.save(update_fields=['status','updated_at']);e.participants.filter(status__in=['registered','waitlisted']).update(status=EventParticipant.Status.CANCELLED,left_at=timezone.now());return Response(status=204)
+class EventRegistrationView(APIView):
+ permission_classes=[IsActiveAccount]
+ throttle_classes=[ScopedRateThrottle]
+ throttle_scope='event_registration'
+ def post(self,request,public_id):
+  p,_=EventRegistrationService.register(event=get_object_or_404(Event,public_id=public_id),user=request.user);return Response({'success':True,'data':EventParticipantSerializer(p).data})
+class EventLeaveView(APIView):
+ permission_classes=[IsActiveAccount]
+ def post(self,request,public_id): EventRegistrationService.leave(event=get_object_or_404(Event,public_id=public_id),user=request.user);return Response({'success':True})
+class EventCancelView(APIView):
+ permission_classes=[IsActiveAccount]
+ def post(self,request,public_id):
+  e=get_object_or_404(Event,public_id=public_id)
+  if e.organizer_id!=request.user.id and not request.user.is_staff: raise PermissionDenied('Only organizer can cancel.')
+  e.status=Event.Status.CANCELLED;e.save(update_fields=['status','updated_at']);e.participants.filter(status__in=['registered','waitlisted']).update(status=EventParticipant.Status.CANCELLED,left_at=timezone.now());return Response({'success':True,'data':EventSerializer(e).data})
+class EventParticipantsView(generics.ListAPIView):
+ permission_classes=[IsActiveAccount];serializer_class=EventParticipantSerializer
+ def get_queryset(self): return EventParticipant.objects.filter(event__public_id=self.kwargs['public_id']).select_related('user').order_by('joined_at')
+class EventParticipantRemoveView(APIView):
+ permission_classes=[IsActiveAccount]
+ def post(self,request,public_id,user_id):
+  e=get_object_or_404(Event,public_id=public_id)
+  if e.organizer_id!=request.user.id and not request.user.is_staff: raise PermissionDenied('Only organizer can remove participants.')
+  return Response({'success':True,'data':EventParticipantSerializer(EventRegistrationService.leave(event=e,user=get_object_or_404(User,pk=user_id),removed=True)).data})
+class TournamentListCreateView(generics.ListCreateAPIView):
+ permission_classes=[IsActiveAccount];serializer_class=TournamentSerializer
+ def get_queryset(self): return Tournament.objects.select_related('sport','venue').order_by('start_date')
+ def create(self,request,*args,**kwargs):
+  s=TournamentCreateSerializer(data=request.data);s.is_valid(raise_exception=True);d=s.validated_data;d['venue']=get_object_or_404(Venue,public_id=d.pop('venue_id'))
+  t=Tournament.objects.create(tournament_reference=EventService.ref('TR'),organizer=request.user,**d);return Response({'success':True,'data':TournamentSerializer(t).data},status=201)
+class TournamentDetailView(generics.RetrieveUpdateAPIView):
+ permission_classes=[IsActiveAccount];serializer_class=TournamentSerializer;lookup_field='public_id';queryset=Tournament.objects.select_related('sport','venue')
+class TournamentCancelView(APIView):
+ permission_classes=[IsActiveAccount]
+ def post(self,request,public_id):
+  t=get_object_or_404(Tournament,public_id=public_id)
+  if t.organizer_id!=request.user.id and not request.user.is_staff: raise PermissionDenied('Only organizer can cancel.')
+  if t.status==Tournament.Status.COMPLETED: raise ValidationError('Completed tournaments cannot be cancelled.')
+  t.status=Tournament.Status.CANCELLED;t.save(update_fields=['status','updated_at']);return Response({'success':True,'data':TournamentSerializer(t).data})
+class TournamentTeamsView(generics.ListCreateAPIView):
+ permission_classes=[IsActiveAccount];serializer_class=TournamentTeamSerializer
+ def get_queryset(self): return TournamentTeam.objects.filter(tournament__public_id=self.kwargs['public_id']).select_related('captain')
+ def create(self,request,*args,**kwargs):
+  t=get_object_or_404(Tournament,public_id=self.kwargs['public_id']);name=(request.data.get('name') or '').strip()
+  if not name: raise ValidationError({'name':['Required.']})
+  return Response({'success':True,'data':TournamentTeamSerializer(TournamentService.create_team(tournament=t,creator=request.user,name=name)).data},status=201)
+class TournamentMatchesView(generics.ListAPIView):
+ permission_classes=[IsActiveAccount];serializer_class=TournamentMatchSerializer
+ def get_queryset(self): return TournamentMatch.objects.filter(tournament__public_id=self.kwargs['public_id']).order_by('round_number','match_number')
+class TournamentBracketView(APIView):
+ permission_classes=[IsActiveAccount]
+ def post(self,request,public_id):
+  matches=TournamentBracketService.generate(tournament=get_object_or_404(Tournament,public_id=public_id),actor=request.user);return Response({'success':True,'data':TournamentMatchSerializer(matches,many=True).data})
+class TournamentResultView(APIView):
+ permission_classes=[IsActiveAccount]
+ def post(self,request,public_id,match_id):
+  m=get_object_or_404(TournamentMatch,tournament__public_id=public_id,public_id=match_id);m=TournamentMatchService.result(match=m,actor=request.user,score_a=request.data.get('score_a'),score_b=request.data.get('score_b'));return Response({'success':True,'data':TournamentMatchSerializer(m).data})
+class TournamentStandingsView(APIView):
+ permission_classes=[IsActiveAccount]
+ def get(self,request,public_id):
+  return Response({'success':True,'data':[{'team':r['team'].name,'played':r['played'],'wins':r['wins'],'losses':r['losses'],'draws':r['draws'],'points':r['points'],'difference':r['difference']} for r in TournamentStandingsService.standings(get_object_or_404(Tournament,public_id=public_id))]})
+
+
+# ---------------- COMMUNITIES ----------------
+class CommunityListCreateView(generics.ListCreateAPIView):
+    permission_classes = [IsActiveAccount]
+
+    def get_serializer_class(self):
+        return CommunityCreateSerializer if self.request.method == 'POST' else CommunitySerializer
+
+    def get_queryset(self):
+        visible = Q(visibility=Community.Visibility.PUBLIC) | Q(owner=self.request.user) | Q(members__user=self.request.user, members__status=CommunityMember.Status.ACTIVE)
+        queryset = Community.objects.filter(visible, is_active=True).select_related('sport', 'owner').distinct()
+        sport = self.request.query_params.get('sport')
+        city = self.request.query_params.get('city')
+        if sport:
+            queryset = queryset.filter(sport_id=sport)
+        if city:
+            queryset = queryset.filter(city__iexact=city)
+        latitude = self.request.query_params.get('latitude', self.request.user.latitude)
+        longitude = self.request.query_params.get('longitude', self.request.user.longitude)
+        radius = self.request.query_params.get('radius', 20)
+        if latitude is not None and longitude is not None:
+            ranked = CommunityDiscoveryService.discover(user=self.request.user, queryset=queryset, latitude=latitude, longitude=longitude, radius=radius)
+            ids = [item.id for item in ranked]
+            # Preserve deterministic service order through a lightweight list.
+            return [next(item for item in ranked if item.id == pk) for pk in ids]
+        return CommunityDiscoveryService.discover(user=self.request.user, queryset=queryset)
+
+    def create(self, request, *args, **kwargs):
+        serializer = CommunityCreateSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        community = CommunityService.create(owner=request.user, **serializer.validated_data)
+        return Response({'success': True, 'data': CommunitySerializer(community).data}, status=201)
+
+
+class CommunityDetailView(APIView):
+    permission_classes = [IsActiveAccount]
+
+    def get_community(self, public_id):
+        community = get_object_or_404(Community, public_id=public_id, is_active=True)
+        if community.visibility == Community.Visibility.PRIVATE:
+            CommunityMembershipService.active_member(community=community, user=self.request.user)
+        return community
+
+    def get(self, request, public_id):
+        return Response({'success': True, 'data': CommunitySerializer(self.get_community(public_id)).data})
+
+    def patch(self, request, public_id):
+        community = self.get_community(public_id)
+        CommunityMembershipService.admin(community=community, user=request.user)
+        serializer = CommunityUpdateSerializer(data=request.data, partial=True)
+        serializer.is_valid(raise_exception=True)
+        for key, value in serializer.validated_data.items():
+            setattr(community, key, value)
+        community.save(update_fields=[*serializer.validated_data.keys(), 'updated_at'])
+        return Response({'success': True, 'data': CommunitySerializer(community).data})
+
+
+class CommunityJoinLeaveView(APIView):
+    permission_classes = [IsActiveAccount]
+
+    def post(self, request, public_id, action):
+        community = get_object_or_404(Community, public_id=public_id)
+        if action == 'join':
+            member, changed = CommunityService.join(community=community, user=request.user)
+            return Response({'success': True, 'joined': member.status == CommunityMember.Status.ACTIVE, 'pending': member.status == CommunityMember.Status.PENDING, 'changed': changed})
+        CommunityService.leave(community=community, user=request.user)
+        return Response({'success': True, 'message': 'Left community.'})
+
+
+class CommunityMembersView(generics.ListAPIView):
+    serializer_class = CommunityMemberSerializer
+    permission_classes = [IsActiveAccount]
+
+    def get_queryset(self):
+        community = get_object_or_404(Community, public_id=self.kwargs['public_id'], is_active=True)
+        if community.visibility == Community.Visibility.PRIVATE:
+            CommunityMembershipService.active_member(community=community, user=self.request.user)
+        return CommunityMember.objects.filter(community=community, status=CommunityMember.Status.ACTIVE).select_related('user').order_by('joined_at')
+
+
+class CommunityRequestsView(APIView):
+    permission_classes = [IsActiveAccount]
+
+    def get(self, request, public_id):
+        community = get_object_or_404(Community, public_id=public_id)
+        CommunityMembershipService.admin(community=community, user=request.user)
+        members = CommunityMember.objects.filter(community=community, status=CommunityMember.Status.PENDING).select_related('user')
+        return Response({'success': True, 'data': CommunityMemberSerializer(members, many=True).data})
+
+    def post(self, request, public_id, user_id, action):
+        community = get_object_or_404(Community, public_id=public_id)
+        member = CommunityService.decide_request(community=community, actor=request.user, user_id=user_id, approve=(action == 'approve'))
+        return Response({'success': True, 'data': CommunityMemberSerializer(member).data})
+
+
+class CommunityPostsView(generics.ListCreateAPIView):
+    serializer_class = CommunityPostSerializer
+    permission_classes = [IsActiveAccount]
+
+    def get_community(self):
+        community = get_object_or_404(Community, public_id=self.kwargs['public_id'], is_active=True)
+        if community.visibility == Community.Visibility.PRIVATE:
+            CommunityMembershipService.active_member(community=community, user=self.request.user)
+        return community
+
+    def get_queryset(self):
+        return CommunityPost.objects.filter(community=self.get_community()).select_related('author', 'game').annotate(like_count=Count('likes'), comment_count=Count('comments')).order_by('-created_at')
+
+    def create(self, request, *args, **kwargs):
+        serializer = CommunityPostCreateSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        post = CommunityPostService.create(community=self.get_community(), author=request.user, **serializer.validated_data)
+        return Response({'success': True, 'data': CommunityPostSerializer(post).data}, status=201)
+
+
+class CommunityPostDetailView(APIView):
+    permission_classes = [IsActiveAccount]
+
+    def get_post(self, public_id):
+        post = get_object_or_404(CommunityPost.objects.select_related('community', 'author'), public_id=public_id)
+        if post.community.visibility == Community.Visibility.PRIVATE:
+            CommunityMembershipService.active_member(community=post.community, user=self.request.user)
+        return post
+
+    def get(self, request, public_id):
+        return Response({'success': True, 'data': CommunityPostSerializer(self.get_post(public_id)).data})
+
+    def patch(self, request, public_id):
+        serializer = CommunityContentSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        post = CommunityPostService.edit(post=self.get_post(public_id), actor=request.user, content=serializer.validated_data['content'])
+        return Response({'success': True, 'data': CommunityPostSerializer(post).data})
+
+    def delete(self, request, public_id):
+        post = CommunityPostService.delete(post=self.get_post(public_id), actor=request.user)
+        return Response({'success': True, 'data': CommunityPostSerializer(post).data})
+
+
+class CommunityCommentsView(generics.ListCreateAPIView):
+    serializer_class = CommunityCommentSerializer
+    permission_classes = [IsActiveAccount]
+
+    def get_post(self):
+        return get_object_or_404(CommunityPost.objects.select_related('community'), public_id=self.kwargs['public_id'])
+
+    def get_queryset(self):
+        post = self.get_post()
+        if post.community.visibility == Community.Visibility.PRIVATE:
+            CommunityMembershipService.active_member(community=post.community, user=self.request.user)
+        return CommunityComment.objects.filter(post=post).select_related('author').order_by('created_at')
+
+    def create(self, request, *args, **kwargs):
+        serializer = CommunityContentSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        comment = CommunityCommentService.create(post=self.get_post(), author=request.user, content=serializer.validated_data['content'])
+        return Response({'success': True, 'data': CommunityCommentSerializer(comment).data}, status=201)
+
+
+class CommunityCommentDetailView(APIView):
+    permission_classes = [IsActiveAccount]
+
+    def patch(self, request, public_id):
+        serializer = CommunityContentSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        comment = get_object_or_404(CommunityComment.objects.select_related('post__community'), public_id=public_id)
+        return Response({'success': True, 'data': CommunityCommentSerializer(CommunityCommentService.change(comment=comment, actor=request.user, content=serializer.validated_data['content'])).data})
+
+    def delete(self, request, public_id):
+        comment = get_object_or_404(CommunityComment.objects.select_related('post__community'), public_id=public_id)
+        return Response({'success': True, 'data': CommunityCommentSerializer(CommunityCommentService.change(comment=comment, actor=request.user, delete=True)).data})
+
+
+class CommunityPostLikeView(APIView):
+    permission_classes = [IsActiveAccount]
+
+    def post(self, request, public_id):
+        post = get_object_or_404(CommunityPost.objects.select_related('community'), public_id=public_id, deleted_at__isnull=True)
+        CommunityMembershipService.active_member(community=post.community, user=request.user)
+        _, created = CommunityPostLike.objects.get_or_create(post=post, user=request.user)
+        return Response({'success': True, 'liked': True, 'created': created, 'like_count': post.likes.count()}, status=201 if created else 200)
+
+    def delete(self, request, public_id):
+        post = get_object_or_404(CommunityPost.objects.select_related('community'), public_id=public_id)
+        CommunityMembershipService.active_member(community=post.community, user=request.user)
+        CommunityPostLike.objects.filter(post=post, user=request.user).delete()
+        return Response({'success': True, 'liked': False, 'like_count': post.likes.count()})
+
+
+class CommunityModerationView(APIView):
+    permission_classes = [IsActiveAccount]
+
+    def post(self, request, public_id, user_id, action):
+        community = get_object_or_404(Community, public_id=public_id)
+        member = CommunityModerationService.member_action(community=community, actor=request.user, user_id=user_id, ban=(action == 'ban'))
+        return Response({'success': True, 'data': CommunityMemberSerializer(member).data})
+
+
+# ---------------- CONVERSATION CHAT ----------------
+class ConversationListCreateView(generics.GenericAPIView):
+    permission_classes = [IsActiveAccount]
+
+    def _summary(self, conversation, latest_messages):
+        member = next((item for item in conversation.members.all() if item.user_id == self.request.user.id), None)
+        other = None
+        if conversation.conversation_type == Conversation.Type.ONE_TO_ONE:
+            other = conversation.participant_two if conversation.participant_one_id == self.request.user.id else conversation.participant_one
+        latest = latest_messages.get(conversation.id)
+        return {
+            'public_id': str(conversation.public_id),
+            'type': conversation.conversation_type,
+            'active': conversation.active,
+            'other_user': ({'public_id': str(other.public_id), 'username': other.username, 'name': other.full_name} if other else None),
+            'game': ({'public_id': str(conversation.game.public_id), 'game_reference': conversation.game.game_reference} if conversation.game_id else None),
+            'latest_message': ConversationMessageSerializer(latest).data if latest else None,
+            'latest_message_at': latest.created_at if latest else conversation.updated_at,
+            'unread_count': getattr(conversation, 'unread_count', 0),
+        }
+
+    def get_queryset(self):
+        return Conversation.objects.filter(
+            active=True, members__user=self.request.user, members__is_active=True,
+        ).select_related('participant_one', 'participant_two', 'game').prefetch_related(
+            'members',
+        ).annotate(
+            unread_count=Count(
+                'messages',
+                filter=(
+                    (Q(messages__created_at__gt=F('members__last_read_at')) | Q(members__last_read_at__isnull=True))
+                    & ~Q(messages__sender=F('members__user'))
+                ),
+                distinct=True,
+            ),
+        ).distinct().order_by('-updated_at')
+
+    def get(self, request):
+        queryset = self.get_queryset()
+        page = self.paginate_queryset(queryset)
+        conversations = page if page is not None else list(queryset)
+        conversation_ids = [item.id for item in conversations]
+        latest = {}
+        for message in Message.objects.filter(conversation_id__in=conversation_ids).select_related('sender').order_by('conversation_id', '-created_at'):
+            latest.setdefault(message.conversation_id, message)
+        data = [self._summary(conversation, latest) for conversation in conversations]
+        return self.get_paginated_response(data) if page is not None else Response({'success': True, 'data': data})
+
+    def post(self, request):
+        serializer = ConversationCreateSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+        if data['type'] == Conversation.Type.ONE_TO_ONE:
+            conversation, created = ConversationService.one_to_one(
+                initiator=request.user, target_user_id=data['user_id'],
+            )
+        else:
+            conversation = ConversationService.game_for_user(game_id=data['game_id'], user=request.user)
+            created = False
+        conversation = self.get_queryset().get(pk=conversation.pk)
+        return Response({'success': True, 'created': created, 'data': self._summary(conversation, {})}, status=201 if created else 200)
+
+
+class ConversationDetailView(ConversationListCreateView):
+    def get(self, request, public_id):
+        conversation = get_object_or_404(self.get_queryset(), public_id=public_id)
+        latest = Message.objects.filter(conversation=conversation).select_related('sender').order_by('-created_at').first()
+        return Response({'success': True, 'data': self._summary(conversation, {conversation.id: latest} if latest else {})})
+
+
+class ConversationMessagesView(generics.ListCreateAPIView):
+    permission_classes = [IsActiveAccount]
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = 'messaging'
+    serializer_class = ConversationMessageSerializer
+
+    def get_conversation(self):
+        conversation = get_object_or_404(Conversation.objects.select_related('participant_one', 'participant_two', 'game'), public_id=self.kwargs['public_id'])
+        ChatPermissionService.active_member(conversation=conversation, user=self.request.user)
+        return conversation
+
+    def get_queryset(self):
+        conversation = self.get_conversation()
+        return Message.objects.filter(conversation=conversation).select_related('sender').order_by('created_at')
+
+    def create(self, request, *args, **kwargs):
+        serializer = ConversationMessageCreateSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        message = MessageService.send(
+            conversation=self.get_conversation(), sender=request.user,
+            content=serializer.validated_data['content'],
+        )
+        return Response({'success': True, 'data': ConversationMessageSerializer(message).data}, status=201)
+
+
+class ConversationReadView(APIView):
+    permission_classes = [IsActiveAccount]
+
+    def post(self, request, public_id):
+        conversation = get_object_or_404(Conversation.objects.filter(active=True), public_id=public_id)
+        UnreadMessageService.mark_read(conversation=conversation, user=request.user)
+        return Response({'success': True, 'message': 'Conversation marked as read.'})
+
+
+class ConversationMessageDetailView(APIView):
+    permission_classes = [IsActiveAccount]
+
+    def get_message(self, public_id):
+        message = get_object_or_404(Message.objects.select_related('conversation', 'sender'), public_id=public_id, conversation__isnull=False)
+        if not self.request.user.is_staff:
+            ChatPermissionService.active_member(conversation=message.conversation, user=self.request.user)
+        return message
+
+    def patch(self, request, public_id):
+        serializer = ConversationMessageCreateSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        message = MessageService.edit(message=self.get_message(public_id), actor=request.user, content=serializer.validated_data['content'])
+        return Response({'success': True, 'data': ConversationMessageSerializer(message).data})
+
+    def delete(self, request, public_id):
+        message = MessageService.delete(message=self.get_message(public_id), actor=request.user)
+        return Response({'success': True, 'data': ConversationMessageSerializer(message).data})
+
+
+# ---------------- LEGACY CHAT ----------------
 from .utils import create_notification   # 🔥 add this import
 
 
@@ -722,12 +1424,255 @@ class UnreadMessageCountView(APIView):
         return Response({"unread": count})
 
 # ---------------- NOTIFICATIONS ----------------
+class GlobalSearchView(APIView):
+    permission_classes=[IsActiveAccount]
+    throttle_classes=[ScopedRateThrottle]
+    throttle_scope='search'
+    def get(self,request):
+        q=(request.query_params.get('q') or '').strip()
+        if not q: raise ValidationError({'q':['A search query is required.']})
+        raw_types=request.query_params.get('type','').split(',') if request.query_params.get('type') else None
+        if raw_types and not set(raw_types)<=VALID_TYPES: raise ValidationError({'type':['Unsupported search type.']})
+        try: page=max(1,int(request.query_params.get('page',1)));page_size=min(100,max(1,int(request.query_params.get('page_size',20))))
+        except ValueError as exc: raise ValidationError('page and page_size must be integers.') from exc
+        latitude=request.query_params.get('latitude');longitude=request.query_params.get('longitude')
+        if (latitude is None)!=(longitude is None): raise ValidationError('latitude and longitude must be provided together.')
+        results=GlobalSearchService.search(user=request.user,q=q,types=raw_types,city=request.query_params.get('city'),latitude=latitude,longitude=longitude,radius=request.query_params.get('radius',20))
+        start=(page-1)*page_size
+        for result in results:result.pop('_score',None)
+        return Response({'success':True,'count':len(results),'next':page+1 if start+page_size<len(results) else None,'previous':page-1 if page>1 else None,'results':results[start:start+page_size]})
+class SearchSuggestionsView(APIView):
+    permission_classes=[IsActiveAccount]
+    throttle_classes=[ScopedRateThrottle]
+    throttle_scope='search'
+    def get(self,request):
+        q=(request.query_params.get('q') or '').strip()
+        if not q:return Response({'success':True,'data':[]})
+        results=GlobalSearchService.search(user=request.user,q=q,types={'sport','player','venue','community','event'},latitude=None,longitude=None)[:10]
+        for result in results:result.pop('_score',None)
+        return Response({'success':True,'data':results})
+
+class AchievementListView(generics.ListAPIView):
+    permission_classes=[IsActiveAccount];serializer_class=AchievementSerializer;queryset=Achievement.objects.filter(is_active=True)
+    lookup_field='public_id'
+class AchievementDetailView(generics.RetrieveAPIView):
+    permission_classes=[IsActiveAccount];serializer_class=AchievementSerializer;queryset=Achievement.objects.filter(is_active=True);lookup_field='public_id'
+class UserAchievementsView(generics.ListAPIView):
+    permission_classes=[IsActiveAccount];serializer_class=UserAchievementSerializer
+    def get_queryset(self):
+        user=request_user=self.request.user if self.kwargs.get('public_id') is None else get_object_or_404(User,public_id=self.kwargs['public_id'],is_active=True)
+        AchievementEvaluationService.evaluate(user=user)
+        return UserAchievement.objects.filter(user=user).select_related('achievement').order_by('achievement__category','achievement__name')
+class MyRewardsView(APIView):
+    permission_classes=[IsActiveAccount]
+    def get(self,request):
+        AchievementEvaluationService.evaluate(user=request.user);return Response({'success':True,'data':{'badges':UserAchievementSerializer(UserAchievement.objects.filter(user=request.user,unlocked=True).select_related('achievement'),many=True).data}})
+class MyLevelView(APIView):
+    permission_classes=[IsActiveAccount]
+    def get(self,request):return Response({'success':True,'data':AchievementService.level(user=request.user)})
+class MyProgressView(APIView):
+    permission_classes=[IsActiveAccount]
+    def get(self,request):AchievementEvaluationService.evaluate(user=request.user);return Response({'success':True,'data':UserAchievementSerializer(UserAchievement.objects.filter(user=request.user).select_related('achievement'),many=True).data})
+
+
+# ---------------- PLATFORM MODERATION ----------------
+class ReportListCreateView(APIView):
+    permission_classes = [IsActiveAccount]
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = 'reports'
+
+    def get(self, request):
+        queryset = Report.objects.select_related('reporter', 'assigned_moderator').order_by('-created_at')
+        if not has_platform_role(request.user, MODERATOR_GROUPS):
+            queryset = queryset.filter(reporter=request.user)
+        else:
+            if request.query_params.get('status'):
+                queryset = queryset.filter(status=request.query_params['status'])
+            if request.query_params.get('reason'):
+                queryset = queryset.filter(reason=request.query_params['reason'])
+            if request.query_params.get('target_type'):
+                queryset = queryset.filter(target_type=request.query_params['target_type'])
+            if request.query_params.get('moderator'):
+                queryset = queryset.filter(assigned_moderator__public_id=request.query_params['moderator'])
+            if request.query_params.get('created_after'):
+                queryset = queryset.filter(created_at__date__gte=request.query_params['created_after'])
+            if request.query_params.get('created_before'):
+                queryset = queryset.filter(created_at__date__lte=request.query_params['created_before'])
+        return Response({'success': True, 'data': ReportSerializer(queryset[:100], many=True).data})
+
+    def post(self, request):
+        serializer = ReportCreateSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        report, created = ModerationService.create_report(reporter=request.user, **serializer.validated_data)
+        return Response({'success': True, 'created': created, 'data': ReportSerializer(report).data}, status=201 if created else 200)
+
+
+class ReportDetailView(APIView):
+    permission_classes = [IsActiveAccount]
+
+    def get_object(self, request, public_id):
+        queryset = Report.objects.select_related('reporter', 'assigned_moderator')
+        if not has_platform_role(request.user, MODERATOR_GROUPS):
+            queryset = queryset.filter(reporter=request.user)
+        return get_object_or_404(queryset, public_id=public_id)
+
+    def get(self, request, public_id):
+        return Response({'success': True, 'data': ReportSerializer(self.get_object(request, public_id)).data})
+
+    def patch(self, request, public_id):
+        if not has_platform_role(request.user, MODERATOR_GROUPS):
+            raise PermissionDenied('Platform moderator permission is required.')
+        report = self.get_object(request, public_id)
+        serializer = ReportUpdateSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+        assigned = None
+        if 'assigned_moderator_id' in data:
+            assigned = get_object_or_404(User, public_id=data['assigned_moderator_id']) if data['assigned_moderator_id'] else None
+            if assigned and not has_platform_role(assigned, MODERATOR_GROUPS):
+                raise ValidationError({'assigned_moderator_id': ['Assignee must be a platform moderator.']})
+        if data.get('action'):
+            ModerationService.apply_action(
+                moderator=request.user, report=report, target_type=report.target_type,
+                target_public_id=report.target_public_id, action=data['action'],
+                reason=data.get('action_reason', data.get('resolution', '')), ends_at=data.get('ends_at'),
+            )
+        report = ModerationService.update_report(
+            report=report, moderator=request.user, status=data.get('status', report.status),
+            resolution=data.get('resolution', report.resolution), assigned_moderator=assigned,
+        )
+        return Response({'success': True, 'data': ReportSerializer(report).data})
+
+
+class AdminReportsView(ReportListCreateView):
+    """Dedicated queue endpoint; unlike /reports/, never falls back to own reports."""
+    permission_classes = [IsPlatformAdmin]
+
+
+class AdminDashboardView(APIView):
+    permission_classes = [IsPlatformAdmin]
+
+    def get(self, request):
+        return Response({'success': True, 'data': {
+            'active_users': User.objects.filter(is_active=True, account_status=User.AccountStatus.ACTIVE).count(),
+            'new_users': User.objects.filter(date_joined__date=timezone.localdate()).count(),
+            'games': Game.objects.count(), 'bookings': CourtBooking.objects.count(),
+            'communities': Community.objects.filter(is_active=True).count(), 'events': Event.objects.count(),
+            'reports_pending': Report.objects.filter(status=Report.Status.PENDING).count(),
+            'reports_under_review': Report.objects.filter(status=Report.Status.UNDER_REVIEW).count(),
+            'suspended_users': User.objects.filter(account_status__in=[User.AccountStatus.SUSPENDED, User.AccountStatus.DEACTIVATED]).count(),
+        }})
+
+
+class AdminUsersView(APIView):
+    permission_classes = [IsPlatformAdmin]
+
+    def get(self, request):
+        queryset = User.objects.all().order_by('-date_joined')
+        if request.query_params.get('status'):
+            queryset = queryset.filter(account_status=request.query_params['status'])
+        if request.query_params.get('q'):
+            query = request.query_params['q']
+            queryset = queryset.filter(Q(username__icontains=query) | Q(email__icontains=query) | Q(full_name__icontains=query))
+        if request.query_params.get('joined_after'):
+            queryset = queryset.filter(date_joined__date__gte=request.query_params['joined_after'])
+        return Response({'success': True, 'data': AdminUserSerializer(queryset[:100], many=True).data})
+
+
+class AdminModerationActionsView(APIView):
+    permission_classes = [IsPlatformAdmin]
+
+    def get(self, request):
+        queryset = ModerationAction.objects.select_related('moderator', 'report').order_by('-created_at')
+        if request.query_params.get('target_type'):
+            queryset = queryset.filter(target_type=request.query_params['target_type'])
+        if request.query_params.get('moderator'):
+            queryset = queryset.filter(moderator__public_id=request.query_params['moderator'])
+        if request.query_params.get('action'):
+            queryset = queryset.filter(action=request.query_params['action'])
+        return Response({'success': True, 'data': ModerationActionSerializer(queryset[:100], many=True).data})
+
+
+class AdminStatisticsView(APIView):
+    permission_classes = [IsPlatformAdmin]
+
+    def get(self, request):
+        return Response({'success': True, 'data': {
+            'reports_by_status': {row['status']: row['total'] for row in Report.objects.values('status').annotate(total=Count('id'))},
+            'actions_by_type': {row['action']: row['total'] for row in ModerationAction.objects.values('action').annotate(total=Count('id'))},
+            'games_by_status': {row['status']: row['total'] for row in Game.objects.values('status').annotate(total=Count('id'))},
+        }})
+
+class PlayerRatingsView(generics.ListCreateAPIView):
+    permission_classes=[IsActiveAccount];serializer_class=PlayerRatingSerializer
+    throttle_classes=[ScopedRateThrottle]
+    throttle_scope='ratings'
+    def get_player(self): return get_object_or_404(User,public_id=self.kwargs['public_id'],is_active=True)
+    def get_queryset(self): return PlayerRating.objects.filter(player=self.get_player(),deleted_at__isnull=True).select_related('reviewer','game').order_by('-created_at')
+    def create(self,request,*args,**kwargs):
+        s=PlayerRatingCreateSerializer(data=request.data);s.is_valid(raise_exception=True);rating=RatingService.rate_player(reviewer=request.user,player=self.get_player(),game=get_object_or_404(Game,public_id=s.validated_data['game_id']),rating=s.validated_data['rating'],review=s.validated_data.get('review',''));return Response({'success':True,'data':PlayerRatingSerializer(rating).data},status=201)
+class PlayerStatisticsView(APIView):
+    permission_classes=[IsActiveAccount]
+    def get(self,request,public_id,sport_id=None):
+        user=get_object_or_404(User,public_id=public_id,is_active=True);sport=get_object_or_404(Sport,pk=sport_id) if sport_id else None
+        return Response({'success':True,'data':PlayerStatisticsService.statistics(user=user,sport=sport) if not sport else PlayerStatisticsService.sport_statistics(user=user,sport=sport)})
+class RatingDetailView(APIView):
+    permission_classes=[IsActiveAccount]
+    def patch(self,request,public_id):
+        rating=get_object_or_404(PlayerRating,public_id=public_id,deleted_at__isnull=True)
+        if rating.reviewer_id!=request.user.id: raise PermissionDenied('Only reviewer can edit.')
+        s=PlayerRatingCreateSerializer(data={**request.data,'game_id':str(rating.game.public_id)});s.is_valid(raise_exception=True);rating.rating=s.validated_data['rating'];rating.review=s.validated_data.get('review','');rating.save(update_fields=['rating','review','updated_at']);return Response({'success':True,'data':PlayerRatingSerializer(rating).data})
+    def delete(self,request,public_id):
+        rating=get_object_or_404(PlayerRating,public_id=public_id,deleted_at__isnull=True)
+        if rating.reviewer_id!=request.user.id and not request.user.is_staff: raise PermissionDenied('Not allowed.')
+        rating.deleted_at=timezone.now();rating.save(update_fields=['deleted_at','updated_at']);return Response(status=204)
+class LeaderboardView(APIView):
+    permission_classes=[IsActiveAccount]
+    def get(self,request):
+        sport=get_object_or_404(Sport,pk=request.query_params['sport']) if request.query_params.get('sport') else None;limit=min(int(request.query_params.get('limit',20)),100)
+        users=LeaderboardService.ratings(sport=sport,city=request.query_params.get('city'),limit=limit);return Response({'success':True,'data':[{'player_id':str(u.public_id),'username':u.username,'average_rating':round(float(u.avg_rating),2),'rating_count':u.rating_count} for u in users]})
+
 class NotificationListView(generics.ListAPIView):
     serializer_class = NotificationSerializer
     permission_classes = [IsActiveAccount]
 
     def get_queryset(self):
-        return Notification.objects.filter(user=self.request.user)
+        queryset = Notification.objects.filter(user=self.request.user, deleted_at__isnull=True).select_related('actor').order_by('-created_at')
+        if self.request.query_params.get('is_read') in ('true','false'): queryset=queryset.filter(is_read=self.request.query_params['is_read']=='true')
+        if self.request.query_params.get('notification_type'): queryset=queryset.filter(type=self.request.query_params['notification_type'])
+        if self.request.query_params.get('created_after'): queryset=queryset.filter(created_at__gte=self.request.query_params['created_after'])
+        if self.request.query_params.get('created_before'): queryset=queryset.filter(created_at__lte=self.request.query_params['created_before'])
+        return queryset
+
+class NotificationDetailView(generics.RetrieveDestroyAPIView):
+    permission_classes=[IsActiveAccount];serializer_class=NotificationSerializer;lookup_field='public_id'
+    def get_queryset(self): return Notification.objects.filter(user=self.request.user,deleted_at__isnull=True)
+    def perform_destroy(self,instance): NotificationService.delete_notification(notification=instance,user=self.request.user)
+class NotificationReadView(APIView):
+    permission_classes=[IsActiveAccount]
+    def post(self,request,public_id):
+        n=get_object_or_404(Notification,public_id=public_id,deleted_at__isnull=True);return Response({'success':True,'data':NotificationSerializer(NotificationService.mark_as_read(notification=n,user=request.user)).data})
+class NotificationReadAllView(APIView):
+    permission_classes=[IsActiveAccount]
+    def post(self,request): return Response({'success':True,'updated':NotificationService.mark_all_as_read(user=request.user)})
+class NotificationUnreadCountView(APIView):
+    permission_classes=[IsActiveAccount]
+    def get(self,request): return Response({'success':True,'unread_count':NotificationService.unread_count(user=request.user)})
+class NotificationPreferencesView(APIView):
+    permission_classes=[IsActiveAccount]
+    def get(self,request):
+        pref,_=NotificationPreference.objects.get_or_create(user=request.user);return Response({'success':True,'data':NotificationPreferenceSerializer(pref).data})
+    def patch(self,request):
+        pref,_=NotificationPreference.objects.get_or_create(user=request.user);s=NotificationPreferenceSerializer(pref,data=request.data,partial=True);s.is_valid(raise_exception=True);s.save();return Response({'success':True,'data':s.data})
+class NotificationDevicesView(APIView):
+    permission_classes=[IsActiveAccount]
+    def get(self,request): return Response({'success':True,'data':UserDeviceSerializer(UserDevice.objects.filter(user=request.user,is_active=True),many=True).data})
+    def post(self,request):
+        s=UserDeviceCreateSerializer(data=request.data);s.is_valid(raise_exception=True);device,created=DeviceService.register(user=request.user,**s.validated_data);return Response({'success':True,'created':created,'data':UserDeviceSerializer(device).data},status=201 if created else 200)
+class NotificationDeviceDetailView(APIView):
+    permission_classes=[IsActiveAccount]
+    def delete(self,request,public_id):
+        device=get_object_or_404(UserDevice,user=request.user,public_id=public_id);device.is_active=False;device.save(update_fields=['is_active','updated_at']);return Response(status=204)
 
 
 # ---------------- AVAILABILITY ----------------

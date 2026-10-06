@@ -99,9 +99,12 @@ class AuthenticationService:
 
 
 class UserService:
+    EDITABLE_PROFILE_FIELDS = {'full_name', 'phone', 'avatar', 'bio', 'city', 'latitude', 'longitude', 'is_available'}
+
     @staticmethod
     def update_profile(*, user, validated_data):
         for field, value in validated_data.items():
-            setattr(user, field, value)
-        user.save()
+            if field in UserService.EDITABLE_PROFILE_FIELDS:
+                setattr(user, field, value)
+        user.save(update_fields=[field for field in validated_data if field in UserService.EDITABLE_PROFILE_FIELDS] + ['updated_at'])
         return user

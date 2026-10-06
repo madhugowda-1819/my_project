@@ -1,4 +1,4 @@
-from .models import Notification
+from .services.notifications import NotificationService
 
 
 def create_notification(user, type, title, body, data=None, priority=1):
@@ -8,11 +8,4 @@ def create_notification(user, type, title, body, data=None, priority=1):
     if data is None:
         data = {}
 
-    return Notification.objects.create(
-        user=user,
-        type=type,
-        title=title,
-        body=body,
-        data=data,
-        priority=priority
-    )
+    return NotificationService.create_notification(user=user, type=type, title=title, body=body, data=data, priority=priority)

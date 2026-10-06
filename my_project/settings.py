@@ -134,21 +134,36 @@ REST_FRAMEWORK = {
     'PAGE_SIZE': 20,
     'EXCEPTION_HANDLER': 'my_app.api.sportmate_exception_handler',
     'DEFAULT_THROTTLE_CLASSES': (
+        'rest_framework.throttling.AnonRateThrottle',
+        'rest_framework.throttling.UserRateThrottle',
         'rest_framework.throttling.ScopedRateThrottle',
     ),
     'DEFAULT_THROTTLE_RATES': {
         'login': '5/minute',
         'registration': '3/hour',
         'password_reset': '3/hour',
+        'anon': '100/hour',
+        'user': '600/hour',
+        'search': '60/minute',
+        'messaging': '30/minute',
+        'booking': '20/minute',
+        'game_join': '20/minute',
+        'event_registration': '20/minute',
+        'ratings': '20/hour',
+        'reports': '10/hour',
+        'recommendations': '60/minute',
     },
 }
 
 SIMPLE_JWT = {
     'ACCESS_TOKEN_LIFETIME': timedelta(minutes=30),
-    'REFRESH_TOKEN_LIFETIME': timedelta(minutes=30),
+    'REFRESH_TOKEN_LIFETIME': timedelta(days=7),
     # Separate token signing key permits JWT rotation without changing every
     # Django cryptographic value. Defaults only for local development.
     'SIGNING_KEY': env('JWT_SIGNING_KEY', SECRET_KEY),
+    'ROTATE_REFRESH_TOKENS': True,
+    'BLACKLIST_AFTER_ROTATION': True,
+    'UPDATE_LAST_LOGIN': True,
 }
 
 CORS_ALLOW_ALL_ORIGINS = False
@@ -163,6 +178,25 @@ if not DEBUG:
     SECURE_REFERRER_POLICY = 'same-origin'
     SESSION_COOKIE_SECURE = True
     CSRF_COOKIE_SECURE = True
+    SECURE_SSL_REDIRECT = env_bool('DJANGO_SECURE_SSL_REDIRECT', False)
+    SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
+    SECURE_HSTS_SECONDS = int(env('DJANGO_HSTS_SECONDS', '0'))
+    SECURE_HSTS_INCLUDE_SUBDOMAINS = env_bool('DJANGO_HSTS_INCLUDE_SUBDOMAINS', False)
+    SECURE_HSTS_PRELOAD = env_bool('DJANGO_HSTS_PRELOAD', False)
+
+X_FRAME_OPTIONS = 'DENY'
+DATA_UPLOAD_MAX_MEMORY_SIZE = int(env('DATA_UPLOAD_MAX_MEMORY_SIZE', str(5 * 1024 * 1024)))
+FILE_UPLOAD_MAX_MEMORY_SIZE = int(env('FILE_UPLOAD_MAX_MEMORY_SIZE', str(5 * 1024 * 1024)))
+
+LOGGING = {
+    'version': 1,
+    'disable_existing_loggers': False,
+    'handlers': {'console': {'class': 'logging.StreamHandler'}},
+    'loggers': {
+        'django.security': {'handlers': ['console'], 'level': 'WARNING', 'propagate': False},
+        'my_app': {'handlers': ['console'], 'level': env('DJANGO_LOG_LEVEL', 'INFO'), 'propagate': False},
+    },
+}
 
 # Keep this secret out of source control. Enable Places API (New) for this key.
 GOOGLE_MAPS_PLACES_API_KEY = os.environ.get('GOOGLE_MAPS_PLACES_API_KEY', '')
@@ -178,3 +212,11 @@ EMAIL_USE_TLS = env_bool('EMAIL_USE_TLS', True)
 EMAIL_HOST_USER = env('EMAIL_HOST_USER', '')
 EMAIL_HOST_PASSWORD = env('EMAIL_HOST_PASSWORD', '')
 DEFAULT_FROM_EMAIL = env('DEFAULT_FROM_EMAIL', 'noreply@sportmate.com')
+
+# Court-backed game discovery/lifecycle tuning. These values are deliberately
+# environment-controlled so capacity policy can change without code changes.
+GAME_ALMOST_FULL_SLOTS_THRESHOLD = int(env('GAME_ALMOST_FULL_SLOTS_THRESHOLD', '1'))
+GAME_MAX_SKILL_LEVEL_DIFFERENCE = int(env('GAME_MAX_SKILL_LEVEL_DIFFERENCE', '1'))
+
+# Plain-text chat guardrail. Message content is never interpreted as HTML.
+CHAT_MESSAGE_MAX_LENGTH = int(env('CHAT_MESSAGE_MAX_LENGTH', '2000'))

@@ -6,7 +6,7 @@ from django.db import transaction
 from django.utils import timezone
 from rest_framework.exceptions import APIException, ValidationError
 
-from my_app.models import Court, CourtBlockedPeriod, CourtBooking, Venue
+from my_app.models import Court, CourtBlockedPeriod, CourtBooking, Game, Venue
 
 
 ALLOWED_SLOT_DURATIONS = (30, 60, 90, 120)
@@ -56,11 +56,20 @@ class VenueAvailabilityService:
             court__in=court_list, status__in=BOOKING_BLOCKING_STATUSES,
             starts_at__lt=utc_close, ends_at__gt=utc_open,
         )
+        games = Game.objects.filter(
+            court__in=court_list,
+            status__in=(Game.Status.OPEN, Game.Status.ALMOST_FULL, Game.Status.FULL, Game.Status.STARTED),
+            starts_at__lt=utc_close,
+            ends_at__gt=utc_open,
+        )
         periods = CourtBlockedPeriod.objects.filter(court__in=court_list, starts_at__lt=utc_close, ends_at__gt=utc_open)
         bookings_by_court = {court.pk: [] for court in court_list}
+        games_by_court = {court.pk: [] for court in court_list}
         periods_by_court = {court.pk: [] for court in court_list}
         for booking in bookings:
             bookings_by_court[booking.court_id].append(booking)
+        for game in games:
+            games_by_court[game.court_id].append(game)
         for period in periods:
             periods_by_court[period.court_id].append(period)
         output = []
@@ -71,6 +80,8 @@ class VenueAvailabilityService:
                 utc_start, utc_end = cursor.astimezone(datetime_timezone.utc), end.astimezone(datetime_timezone.utc)
                 status = 'available' if venue.active and court.active else 'closed'
                 if status == 'available' and any(cls.overlaps(utc_start, utc_end, booking.starts_at, booking.ends_at) for booking in bookings_by_court[court.pk]):
+                    status = 'booked'
+                if status == 'available' and any(cls.overlaps(utc_start, utc_end, game.starts_at, game.ends_at) for game in games_by_court[court.pk]):
                     status = 'booked'
                 if status == 'available':
                     matching_periods = [period for period in periods_by_court[court.pk] if cls.overlaps(utc_start, utc_end, period.starts_at, period.ends_at)]

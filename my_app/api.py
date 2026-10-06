@@ -2,6 +2,9 @@ from rest_framework.pagination import PageNumberPagination
 from rest_framework.response import Response
 from rest_framework.views import exception_handler
 from rest_framework.exceptions import ValidationError
+import logging
+
+logger = logging.getLogger('my_app')
 
 
 class SportMatePagination(PageNumberPagination):
@@ -22,7 +25,9 @@ class SportMatePagination(PageNumberPagination):
 def sportmate_exception_handler(exc, context):
     response = exception_handler(exc, context)
     if response is None:
-        return response
+        # Log server details only; API consumers always receive a safe JSON error.
+        logger.exception('Unhandled API exception', exc_info=exc)
+        return Response({'success': False, 'error': {'code': 'SERVER_ERROR', 'message': 'An unexpected server error occurred.', 'details': None}}, status=500)
 
     details = response.data
     if isinstance(details, dict):

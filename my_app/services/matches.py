@@ -1,7 +1,8 @@
 from django.db import transaction
 from rest_framework.exceptions import APIException, NotFound
 
-from my_app.models import Match, Notification
+from my_app.models import Match
+from my_app.utils import create_notification
 
 
 class MatchUnavailable(APIException):
@@ -30,7 +31,7 @@ def join_match(*, match_id, user):
         raise MatchUnavailable('This match is full.')
 
     match.joined_players.add(user)
-    Notification.objects.create(
+    create_notification(
         user=match.organizer,
         type='match_invite',
         title='Player joined',

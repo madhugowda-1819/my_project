@@ -7,7 +7,7 @@ from django.db import IntegrityError, transaction
 from django.utils import timezone
 from rest_framework.exceptions import APIException, NotFound, PermissionDenied, ValidationError
 
-from my_app.models import Court, CourtBlockedPeriod, CourtBooking, Venue
+from my_app.models import Court, CourtBlockedPeriod, CourtBooking, Game, Venue
 from my_app.services.availability import ALLOWED_SLOT_DURATIONS, BOOKING_BLOCKING_STATUSES, VenueAvailabilityService
 
 
@@ -128,6 +128,16 @@ class BookingService:
             conflicts = conflicts.select_for_update()
         if conflicts.exists():
             raise BookingConflict()
+        game_conflicts = Game.objects.filter(
+            court=court,
+            status__in=(Game.Status.OPEN, Game.Status.ALMOST_FULL, Game.Status.FULL, Game.Status.STARTED),
+            starts_at__lt=ends_at,
+            ends_at__gt=starts_at,
+        )
+        if lock_bookings:
+            game_conflicts = game_conflicts.select_for_update()
+        if game_conflicts.exists():
+            raise BookingConflict('The court is reserved for a game during this time.')
         return starts_at, ends_at
 
     @classmethod

@@ -204,6 +204,12 @@ class UserBlock(TimestampedPublicModel):
 
 
 class Venue(TimestampedPublicModel):
+    # A discovered Ground becomes playable only after staff/venue operators
+    # create this verified venue record, set operating hours, and add courts.
+    source_ground = models.OneToOneField(
+        'Ground', null=True, blank=True, on_delete=models.SET_NULL,
+        related_name='verified_venue',
+    )
     name = models.CharField(max_length=200)
     description = models.TextField(blank=True)
     address = models.CharField(max_length=255)
@@ -345,6 +351,7 @@ class VenueReview(TimestampedPublicModel):
 # 🔥 NEW: GROUNDS (IMPORTANT FOR YOUR UI)
 # ---------------------------------------------------------------------------
 class Ground(models.Model):
+    public_id = models.UUIDField(default=uuid.uuid4, unique=True, editable=False, db_index=True)
     SIZE_CHOICES = [
         ('small', 'Small'),
         ('medium', 'Medium'),

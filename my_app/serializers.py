@@ -138,6 +138,20 @@ class GroundSerializer(serializers.ModelSerializer):
         return round(distance, 2) if distance is not None else None
 
 
+class GroundDiscoverySerializer(serializers.Serializer):
+    latitude = serializers.FloatField(min_value=-90, max_value=90)
+    longitude = serializers.FloatField(min_value=-180, max_value=180)
+    radius = serializers.FloatField(min_value=0.1, max_value=50, default=10)
+    sport = serializers.CharField(required=False, allow_blank=False, max_length=60)
+
+
+class AutoGameCreateSerializer(serializers.Serializer):
+    sport_id = serializers.PrimaryKeyRelatedField(
+        source='sport', queryset=Sport.objects.filter(is_active=True), required=False,
+    )
+    radius = serializers.FloatField(min_value=0.1, max_value=100, required=False)
+
+
 class NearbySearchSerializer(serializers.Serializer):
     latitude = serializers.FloatField(min_value=-90, max_value=90)
     longitude = serializers.FloatField(min_value=-180, max_value=180)

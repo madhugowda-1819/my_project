@@ -39,7 +39,7 @@ from .serializers import (
     BookingCreateSerializer, BookingSerializer,
     MatchSerializer, MessageSerializer,
     NotificationSerializer, AvailabilityToggleSerializer,
-    GroundSerializer, MatchCreateSerializer,
+    GroundSerializer, GroundDiscoverySerializer, AutoGameCreateSerializer, MatchCreateSerializer,
     GameCreateSerializer, GameUpdateSerializer, GameQuerySerializer, GameRecommendationQuerySerializer,
     GameSerializer, GamePlayerSerializer, ConversationCreateSerializer,
     ConversationMessageCreateSerializer, ConversationMessageSerializer,
@@ -76,6 +76,8 @@ from .services.locations import nearby_queryset
 from .services.player_matching import PlayerMatchingService
 from .services.players import PlayerService
 from .services.venues import VenueDiscoveryService, VenueReviewService
+from .services.ground_ingestion import GroundIngestionService
+from .services.auto_games import AutoGameService
 from .services.matches import join_match
 
 User = get_user_model()
@@ -670,6 +672,40 @@ class LiveGroundListView(APIView):
         except MapsProviderError as error:
             return Response({'detail': str(error)}, status=503)
         return Response(places)
+
+
+class GroundDiscoveryView(APIView):
+    """Discover provider places and upsert them into the Ground catalogue."""
+    permission_classes = [IsActiveAccount]
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = 'search'
+
+    def post(self, request):
+        serializer = GroundDiscoverySerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+        try:
+            places = find_live_sports_grounds(
+                latitude=data['latitude'], longitude=data['longitude'],
+                sport=data.get('sport'), radius_km=data['radius'],
+            )
+        except MapsProviderError as error:
+            return Response({'success': False, 'error': {'code': 'GROUND_PROVIDER_UNAVAILABLE', 'message': str(error)}}, status=503)
+        grounds, created_count = GroundIngestionService.ingest(
+            places=places,
+            requested_sport=data.get('sport'),
+            fallback_city=request.user.city,
+        )
+        # This is a user-owned update; exact coordinates are never exposed by
+        # public player serializers.
+        request.user.latitude = data['latitude']
+        request.user.longitude = data['longitude']
+        request.user.save(update_fields=['latitude', 'longitude', 'updated_at'])
+        return Response({
+            'success': True,
+            'created_count': created_count,
+            'data': GroundSerializer(grounds, many=True).data,
+        })
 
 
 # ---------------- MATCHES ----------------
@@ -1433,12 +1469,30 @@ class UnreadMessageCountView(APIView):
     permission_classes = [IsActiveAccount]
 
     def get(self, request):
-        count = Message.objects.filter(
+        # Retain legacy direct-message unread state while also counting the
+        # conversation-based chat API used by current mobile clients.
+        legacy_count = Message.objects.filter(
             receiver=request.user,
             is_read=False
         ).count()
-
-        return Response({"unread": count})
+        members = list(ConversationMember.objects.filter(
+            user=request.user,
+            is_active=True,
+            conversation__active=True,
+        ).only('conversation_id', 'last_read_at'))
+        last_read_by_conversation = {
+            member.conversation_id: member.last_read_at for member in members
+        }
+        messages = Message.objects.filter(
+            conversation_id__in=last_read_by_conversation,
+            deleted_at__isnull=True,
+        ).exclude(sender=request.user).only('conversation_id', 'created_at')
+        conversation_count = sum(
+            1 for message in messages
+            if last_read_by_conversation[message.conversation_id] is None
+            or message.created_at > last_read_by_conversation[message.conversation_id]
+        )
+        return Response({'unread': legacy_count + conversation_count})
 
 # ---------------- NOTIFICATIONS ----------------
 class GlobalSearchView(APIView):
@@ -1778,4 +1832,33 @@ class AiMatchView(APIView):
         c = 2 * atan2(sqrt(a), sqrt(1-a))
 
         return R * c
+
+
+class AutoGameCreateView(APIView):
+    """Create one compatible public Game from verified free court inventory."""
+    permission_classes = [IsActiveAccount]
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = 'game_join'
+
+    def post(self, request):
+        serializer = AutoGameCreateSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+        radius = data.get('radius')
+        if radius is None:
+            radius = getattr(getattr(request.user, 'profile', None), 'preferred_distance', 15)
+        game, created = AutoGameService.create(
+            user=request.user,
+            sport=data.get('sport'),
+            radius=radius,
+        )
+        game = Game.objects.select_related('sport', 'venue', 'court__sport', 'host').prefetch_related(
+            'game_players__user__user_sports__sport',
+        ).get(pk=game.pk)
+        return Response({
+            'success': True,
+            'created': created,
+            'message': 'Game created from available court inventory.' if created else 'Your existing upcoming auto-created game is ready.',
+            'data': GameSerializer(game, context={'request': request}).data,
+        }, status=201 if created else 200)
 

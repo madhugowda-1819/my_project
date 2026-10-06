@@ -4,6 +4,7 @@ from django.contrib.auth.models import Group
 from django.utils import timezone
 from django.core.cache import cache
 from datetime import timedelta
+from unittest.mock import patch
 from rest_framework.test import APITestCase
 
 from .models import Ground, Match, PlayerProfile, Sport, UserSport, UserBlock, Venue, VenueSport, Court, VenueAmenity, CourtBooking, VenueReview, CourtBlockedPeriod, Game, GamePlayer, Conversation, ConversationMember, Message, Community, CommunityMember, CommunityPostLike, Event, EventParticipant, Tournament, Notification, UserDevice, RecommendationProfile, Report, ModerationAction
@@ -281,6 +282,59 @@ class NearbySearchApiTests(APITestCase):
         self.assertEqual(venues.data['results'][0]['name'], 'Near Venue')
         self.assertEqual(invalid.status_code, 400)
         self.assertEqual(missing.status_code, 400)
+
+
+class GroundIngestionAndAutoGameTests(APITestCase):
+    def setUp(self):
+        self.user = User.objects.create_user(
+            username='auto-game-user', email='auto-game@example.com',
+            password='StrongPass!123', latitude=12.9716, longitude=77.5946,
+        )
+        PlayerProfile.objects.create(user=self.user, preferred_play_times=['evening'])
+        self.sport = Sport.objects.get(name='Badminton')
+        UserSport.objects.create(user=self.user, sport=self.sport, skill_level='intermediate', preferred=True)
+        self.ground = Ground.objects.create(
+            name='Verified Discovery Ground', city='Bengaluru', latitude=12.972,
+            longitude=77.595, maps_place_id='openstreetmap_live:node/verified', source='openstreetmap_live',
+        )
+        self.venue = Venue.objects.create(
+            source_ground=self.ground, name='Verified Discovery Venue', address='1 Sports Road',
+            city='Bengaluru', latitude=12.972, longitude=77.595,
+            opening_time='06:00', closing_time='23:00', active=True,
+        )
+        self.court = Court.objects.create(
+            venue=self.venue, sport=self.sport, name='Court 1', capacity=4,
+            price_per_hour=500, active=True,
+        )
+        self.client.force_authenticate(self.user)
+
+    @patch('my_app.views.find_live_sports_grounds')
+    def test_discovery_upserts_provider_grounds_and_saves_user_location(self, provider):
+        provider.return_value = [{
+            'id': 'node/123', 'name': 'Nearby Badminton Court', 'address': '2 Court Road, Bengaluru, Karnataka',
+            'latitude': 12.973, 'longitude': 77.596, 'types': ['sports_centre', 'badminton'],
+            'source': 'openstreetmap_live',
+        }]
+        payload = {'latitude': 12.9717, 'longitude': 77.5947, 'sport': 'badminton'}
+        first = self.client.post('/api/v1/grounds/discover/', payload, format='json')
+        second = self.client.post('/api/v1/grounds/discover/', payload, format='json')
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(first.data['created_count'], 1)
+        self.assertEqual(second.data['created_count'], 0)
+        self.assertEqual(Ground.objects.filter(maps_place_id='openstreetmap_live:node/123').count(), 1)
+        self.user.refresh_from_db()
+        self.assertEqual(self.user.latitude, 12.9717)
+
+    def test_auto_game_uses_verified_court_and_is_idempotent(self):
+        first = self.client.post('/api/v1/ai/matches/auto-create/', {}, format='json')
+        second = self.client.post('/api/v1/ai/matches/auto-create/', {}, format='json')
+        self.assertEqual(first.status_code, 201)
+        self.assertTrue(first.data['created'])
+        self.assertEqual(first.data['data']['venue']['public_id'], str(self.venue.public_id))
+        self.assertEqual(first.data['data']['court']['public_id'], str(self.court.public_id))
+        self.assertEqual(second.status_code, 200)
+        self.assertFalse(second.data['created'])
+        self.assertEqual(Game.objects.filter(host=self.user).count(), 1)
 
 
 class PlayerMatchingServiceTests(APITestCase):
@@ -703,6 +757,21 @@ class ConversationChatTests(APITestCase):
         message = Message.objects.get(public_id=message_id)
         self.assertIsNotNone(message.deleted_at)
         self.assertEqual(message.content, '')
+
+    def test_conversation_messages_contribute_to_unread_count(self):
+        created = self.create_direct()
+        conversation_id = created.data['data']['public_id']
+        self.client.force_authenticate(self.other)
+        self.client.post(
+            f'/api/v1/conversations/{conversation_id}/messages/',
+            {'content': 'New conversation message'}, format='json',
+        )
+        self.client.force_authenticate(self.user)
+        unread = self.client.get('/api/v1/messages/unread/')
+        self.assertEqual(unread.status_code, 200)
+        self.assertEqual(unread.data['unread'], 1)
+        self.client.post(f'/api/v1/conversations/{conversation_id}/read/')
+        self.assertEqual(self.client.get('/api/v1/messages/unread/').data['unread'], 0)
 
     def test_permissions_validation_and_blocking(self):
         created = self.create_direct()

@@ -2,7 +2,7 @@ from django.contrib import admin
 from django.contrib.auth.admin import UserAdmin
 from .models import (
     User, Sport, PlayerProfile, AvailabilitySlot,
-    Match, Message, Notification, Ground, Report, ModerationAction, UserModeration
+    Match, Message, Notification, Ground, Venue, Court, VenueSport, Report, ModerationAction, UserModeration
 )
 
 
@@ -62,6 +62,26 @@ class GroundAdmin(admin.ModelAdmin):
     list_filter = ('size', 'sports', 'source')
     search_fields = ('name', 'city', 'address', 'maps_place_id')
     filter_horizontal = ('sports',)
+
+
+@admin.register(Venue)
+class VenueAdmin(admin.ModelAdmin):
+    list_display = ('name', 'city', 'opening_time', 'closing_time', 'active', 'source_ground')
+    list_filter = ('active', 'city')
+    search_fields = ('name', 'city', 'address', 'source_ground__name')
+    autocomplete_fields = ('source_ground',)
+
+
+@admin.register(Court)
+class CourtAdmin(admin.ModelAdmin):
+    list_display = ('name', 'venue', 'sport', 'capacity', 'price_per_hour', 'active')
+    list_filter = ('active', 'sport')
+    search_fields = ('name', 'venue__name')
+
+
+@admin.register(VenueSport)
+class VenueSportAdmin(admin.ModelAdmin):
+    list_display = ('venue', 'sport')
 
 
 # ------------------------------------------------------------------

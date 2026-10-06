@@ -55,6 +55,7 @@ urlpatterns = [
     path('achievements/<uuid:public_id>/', views.AchievementDetailView.as_view()),
 
     # ---------------- GROUNDS ----------------
+    path('grounds/discover/', views.GroundDiscoveryView.as_view()),
     path('grounds/', views.GroundListView.as_view()),
     path('grounds/live/', views.LiveGroundListView.as_view()),
 
@@ -141,4 +142,5 @@ urlpatterns = [
     path('change-password/', views.change_password),
 
     path('ai/matches/', views.AiMatchView.as_view()),
+    path('ai/matches/auto-create/', views.AutoGameCreateView.as_view()),
 ]

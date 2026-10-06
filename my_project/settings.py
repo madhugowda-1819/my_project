@@ -118,7 +118,9 @@ USE_I18N = True
 USE_TZ = True
 
 STATIC_URL = 'static/'
-MEDIA_URL = 'media/'
+# Keep media links rooted at the site, rather than relative to an /api/
+# endpoint that serialized the avatar field.
+MEDIA_URL = '/media/'
 MEDIA_ROOT = BASE_DIR / 'media'
 
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
@@ -185,7 +187,9 @@ if not DEBUG:
     SECURE_HSTS_PRELOAD = env_bool('DJANGO_HSTS_PRELOAD', False)
 
 X_FRAME_OPTIONS = 'DENY'
-DATA_UPLOAD_MAX_MEMORY_SIZE = int(env('DATA_UPLOAD_MAX_MEMORY_SIZE', str(5 * 1024 * 1024)))
+# SafeImageField limits an avatar itself to 5 MB. Multipart requests need a
+# small amount of additional space for boundaries and form fields.
+DATA_UPLOAD_MAX_MEMORY_SIZE = int(env('DATA_UPLOAD_MAX_MEMORY_SIZE', str(6 * 1024 * 1024)))
 FILE_UPLOAD_MAX_MEMORY_SIZE = int(env('FILE_UPLOAD_MAX_MEMORY_SIZE', str(5 * 1024 * 1024)))
 
 LOGGING = {

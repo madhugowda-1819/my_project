@@ -163,11 +163,12 @@ class AuthenticationApiTests(APITestCase):
         token_response = self.client.post('/api/v1/auth/token/refresh/', {'refresh': refresh}, format='json')
         self.assertEqual(token_response.status_code, 200)
         self.assertIn('access', token_response.data)
+        rotated_refresh = token_response.data.get('refresh', refresh)
 
         self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {login.data['tokens']['access']}")
         profile = self.client.get('/api/v1/users/me/')
         update = self.client.patch('/api/v1/users/me/', {'name': 'Asha Updated', 'city': 'Bengaluru', 'bio': 'Runner'}, format='json')
-        logout = self.client.post('/api/v1/auth/logout/', {'refresh': refresh}, format='json')
+        logout = self.client.post('/api/v1/auth/logout/', {'refresh': rotated_refresh}, format='json')
         self.assertEqual(profile.status_code, 200)
         self.assertEqual(update.status_code, 200)
         self.assertEqual(update.data['name'], 'Asha Updated')

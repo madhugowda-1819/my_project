@@ -60,6 +60,11 @@ class GroundIngestionService:
             'longitude': longitude,
             'source': str(place.get('source') or 'provider')[:30],
         }
+        # Box cricket facilities are compact cricket grounds.  Persist this
+        # useful size distinction without needing a provider-specific field.
+        searchable_text = f"{name} {place.get('address') or ''}".lower()
+        if 'box cricket' in searchable_text:
+            defaults['size'] = 'small'
         ground, created = Ground.objects.get_or_create(maps_place_id=key, defaults=defaults)
         if not created:
             # Provider data may refresh names/coordinates, but never overwrite

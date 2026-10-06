@@ -402,6 +402,9 @@ class RegistrationRequestSerializer(serializers.Serializer):
     username = serializers.CharField(max_length=150)
     email = serializers.EmailField()
     phone = serializers.CharField(max_length=20, required=False, allow_blank=True, validators=[phone_validator])
+    # Saved at sign-up so discovery results can be catalogued by the player's
+    # home city even before location permission is granted.
+    city = serializers.CharField(max_length=100, required=False, allow_blank=True)
     password = serializers.CharField(write_only=True, trim_whitespace=False, min_length=8)
     sport_ids = serializers.PrimaryKeyRelatedField(
         source='sports',

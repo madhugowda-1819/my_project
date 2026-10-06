@@ -612,8 +612,12 @@ class GroundListView(APIView):
 
     def get(self, request):
         try:
-            lat = float(request.GET['lat'])
-            lng = float(request.GET['lng'])
+            # Accept the established short names and the longer names used by
+            # older app builds, so a client update cannot make grounds vanish.
+            lat_value = request.GET.get('lat') or request.GET['latitude']
+            lng_value = request.GET.get('lng') or request.GET['longitude']
+            lat = float(lat_value)
+            lng = float(lng_value)
         except (KeyError, TypeError, ValueError):
             return Response({'detail': 'Valid lat and lng query parameters are required.'}, status=400)
 
@@ -628,21 +632,21 @@ class GroundListView(APIView):
             return Response({'detail': 'radius must be between 0 and 100 km.'}, status=400)
         if sport:
             grounds = grounds.filter(sports__name__iexact=sport)
+        city = request.GET.get('city', '').strip()
+        if city:
+            grounds = grounds.filter(city__iexact=city)
         if size:
             if size not in dict(Ground.SIZE_CHOICES):
                 return Response({'detail': 'size must be small, medium, or big.'}, status=400)
             grounds = grounds.filter(size=size)
-        results = []
-
-        for g in grounds:
-            d = g.distance_to(lat, lng)
-            if d <= radius:
-                g.distance_km = round(d, 2)
-                results.append(g)
-
-        results.sort(key=lambda x: x.distance_km)
-
-        return Response(GroundSerializer(results, many=True).data)
+        # Calculate and filter distance in SQL.  The previous Python loop read
+        # every Ground row before filtering, which degrades sharply as the
+        # catalogue grows.
+        grounds = nearby_queryset(grounds, latitude=lat, longitude=lng, radius=radius)
+        serialized = GroundSerializer(grounds, many=True).data
+        # Match the app's standard collection envelope; the Flutter client
+        # accepts both this and the legacy bare-list response.
+        return Response({'count': len(serialized), 'results': serialized})
 
 
 class LiveGroundListView(APIView):

@@ -38,6 +38,7 @@ class AuthenticationService:
                     username=username,
                     full_name=data['full_name'].strip(),
                     phone=data.get('phone', '').strip(),
+                    city=data.get('city', '').strip(),
                     password=data['password'],
                 )
                 PlayerProfile.objects.create(user=user)

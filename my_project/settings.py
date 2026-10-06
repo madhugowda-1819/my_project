@@ -207,6 +207,10 @@ GOOGLE_MAPS_PLACES_API_KEY = os.environ.get('GOOGLE_MAPS_PLACES_API_KEY', '')
 # Free, no-key fallback for nearby public sports facilities. This can be
 # changed to another Overpass instance if the default is busy.
 OVERPASS_API_URL = env('OVERPASS_API_URL', 'https://overpass-api.de/api/interpreter')
+# Keep an unavailable public map provider from blocking the app.  Deployments
+# with a reliable paid provider can raise this without changing code.
+MAPS_PROVIDER_TIMEOUT_SECONDS = float(env('MAPS_PROVIDER_TIMEOUT_SECONDS', '7'))
+GROUND_SEARCH_CACHE_SECONDS = int(env('GROUND_SEARCH_CACHE_SECONDS', '300'))
 
 PASSWORD_RESET_URL = env('PASSWORD_RESET_FRONTEND_URL', env('PASSWORD_RESET_URL', 'sportmate://reset-password'))
 EMAIL_BACKEND = env('EMAIL_BACKEND', 'django.core.mail.backends.console.EmailBackend')

@@ -9,6 +9,7 @@ from rest_framework.test import APITestCase
 
 from .models import Ground, Match, PlayerProfile, Sport, UserSport, UserBlock, Venue, VenueSport, Court, VenueAmenity, CourtBooking, VenueReview, CourtBlockedPeriod, Game, GamePlayer, Conversation, ConversationMember, Message, Community, CommunityMember, CommunityPostLike, Event, EventParticipant, Tournament, Notification, UserDevice, RecommendationProfile, Report, ModerationAction
 from .services.locations import nearby_queryset
+from .services.ground_ingestion import GroundIngestionService
 from .services.player_matching import PlayerMatchingService
 from .services.availability import VenueAvailabilityService
 from .services.bookings import BookingStatusService
@@ -114,12 +115,13 @@ class AuthenticationApiTests(APITestCase):
         return user
 
     def test_successful_registration_hashes_password_and_returns_tokens(self):
-        response = self.client.post(self.register_url, self.payload(), format='json')
+        response = self.client.post(self.register_url, self.payload(city='Bengaluru'), format='json')
         self.assertEqual(response.status_code, 201)
         user = User.objects.get(email='asha@example.com')
         self.assertTrue(user.check_password('StrongPass!123'))
         self.assertNotEqual(user.password, 'StrongPass!123')
         self.assertTrue(PlayerProfile.objects.filter(user=user).exists())
+        self.assertEqual(user.city, 'Bengaluru')
         self.assertIn('access', response.data['tokens'])
         self.assertNotIn('password', response.data['user'])
 
@@ -324,6 +326,17 @@ class GroundIngestionAndAutoGameTests(APITestCase):
         self.assertEqual(Ground.objects.filter(maps_place_id='openstreetmap_live:node/123').count(), 1)
         self.user.refresh_from_db()
         self.assertEqual(self.user.latitude, 12.9717)
+
+    def test_box_cricket_discovery_is_saved_as_a_small_cricket_ground(self):
+        grounds, created = GroundIngestionService.ingest(places=[{
+            'id': 'box-cricket-1', 'name': 'City Box Cricket Arena',
+            'address': 'Sports Road, Bengaluru', 'latitude': 12.973,
+            'longitude': 77.596, 'types': ['pitch', 'cricket'],
+            'source': 'openstreetmap_live',
+        }], fallback_city='Bengaluru')
+        self.assertEqual(created, 1)
+        self.assertEqual(grounds[0].city, 'Bengaluru')
+        self.assertEqual(grounds[0].size, 'small')
 
     def test_auto_game_uses_verified_court_and_is_idempotent(self):
         first = self.client.post('/api/v1/ai/matches/auto-create/', {}, format='json')

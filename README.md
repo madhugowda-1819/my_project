@@ -79,6 +79,84 @@ Prices are server-calculated: `base_price + additional_fees - discount`, never
 accepted from a client. Booking status transitions are backend controlled:
 `pending → confirmed/cancelled`, `confirmed → cancelled/completed`.
 
+## Court-backed games
+
+The legacy `/matches/` endpoints remain available for existing clients. New
+court-backed games use these protected endpoints:
+
+| Method | Endpoint | Description |
+|---|---|---|
+| GET / POST | `/api/v1/games/` | Discover games or create one. Filters: `sport`, `city`, `venue`, `date`, `skill_level`, `status`, `latitude`, `longitude`, `radius`, `upcoming`. |
+| GET / PATCH / DELETE | `/api/v1/games/{public_id}/` | Detail, host-only update, or host/admin cancellation. |
+| POST | `/api/v1/games/{public_id}/join/` | Join an eligible open game. |
+| POST | `/api/v1/games/{public_id}/leave/` | Leave a game; a host leave cancels it. |
+| GET | `/api/v1/games/{public_id}/players/` | Privacy-safe confirmed player list. |
+
+Games use public UUIDs, but sport input remains the existing sport database ID.
+Creation and joining are transactional. The service locks the court/game,
+validates venue-local hours and configured durations through the booking
+service, and rejects any overlap with a pending/confirmed booking or active
+game. The host is automatically the first confirmed participant.
+
+`available_slots = max_players - confirmed_players`. Status is backend-owned:
+`open`, `almost_full`, and `full` follow capacity (the almost-full threshold is
+`GAME_ALMOST_FULL_SLOTS_THRESHOLD`); time then moves a game to `started` and
+`completed`. A player needs the sport in their profile and must be within
+`GAME_MAX_SKILL_LEVEL_DIFFERENCE` when a skill level is configured. Private
+games are not joinable without a future invitation/access record.
+
+## Game recommendations
+
+`GET /api/v1/recommendations/games/` returns deterministic, backend-generated
+recommendations for the authenticated user. Optional filters are `sport`,
+`latitude`, `longitude`, `radius`, `date`, `skill_level`, and `limit` (1–50,
+default 20). If coordinates are omitted, the user's saved location is used; if
+no location exists, compatible games are still returned without distance scoring.
+
+The service first filters public, future, active, non-full games in SQL and
+excludes games the user hosts or has already joined. It then applies a 100-point
+rule-based score: sport (30), skill (20), distance (20), time (15), remaining
+capacity (10), and verified host history (5). Results are ordered by score,
+distance, start time, then availability. This is not machine learning.
+
+## Conversation chat
+
+New authenticated conversation endpoints are:
+
+| Method | Endpoint | Description |
+|---|---|---|
+| GET / POST | `/api/v1/conversations/` | List accessible conversations or create/reuse a direct/game conversation. |
+| GET | `/api/v1/conversations/{public_id}/` | Conversation summary and unread count. |
+| GET / POST | `/api/v1/conversations/{public_id}/messages/` | Paginated chronological messages or a new plain-text message. |
+| POST | `/api/v1/conversations/{public_id}/read/` | Set the caller's read cursor. |
+| PATCH / DELETE | `/api/v1/messages/{public_id}/` | Sender-only edit or soft delete. |
+
+Direct conversations are unique for a pair of users, and both directions of
+`UserBlock` are enforced before creation or sending. Game conversations are
+created/reused from confirmed `GamePlayer` records; joining activates chat
+membership and leaving deactivates it without deleting historical messages.
+The backend, not clients, assigns sender/type/timestamps. Messages are
+plain-text, trimmed, capped by `CHAT_MESSAGE_MAX_LENGTH`, and notifications use
+the existing notification service.
+
+## Communities
+
+Communities are authenticated, role-controlled groups with public/private
+visibility. Core endpoints are `/api/v1/communities/`,
+`/api/v1/communities/{public_id}/`, and nested `join`, `leave`, `members`,
+`join-requests`, and `posts` routes. Content uses public UUIDs:
+
+- `/api/v1/community-posts/{public_id}/` — retrieve, edit, or soft-delete.
+- `/api/v1/community-posts/{public_id}/comments/` — paginated comments/create.
+- `/api/v1/community-posts/{public_id}/like/` — idempotent like/unlike.
+- `/api/v1/community-comments/{public_id}/` — edit or soft-delete a comment.
+
+The backend derives member and like counts, creates the owner membership
+transactionally, routes private joins through pending approval, and enforces
+bans. Community discovery reuses the SQL Haversine location service and ranks
+communities deterministically by sport relevance, distance, backend activity,
+member relevance, and verified membership quality.
+
 ## Models (`my_app/models.py`)
 
 - **User** – custom user with email login, location, sports, availability

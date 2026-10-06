@@ -7,7 +7,7 @@ from rest_framework.exceptions import AuthenticationFailed, PermissionDenied, Va
 from rest_framework_simplejwt.exceptions import TokenError
 from rest_framework_simplejwt.tokens import RefreshToken
 
-from my_app.models import PlayerProfile, User
+from my_app.models import PlayerProfile, User, UserSport
 
 
 class AccountUnavailable(PermissionDenied):
@@ -41,6 +41,13 @@ class AuthenticationService:
                     password=data['password'],
                 )
                 PlayerProfile.objects.create(user=user)
+                sports = data.get('sports', [])
+                if sports:
+                    user.sports.set(sports)
+                    UserSport.objects.bulk_create([
+                        UserSport(user=user, sport=sport, preferred=index == 0)
+                        for index, sport in enumerate(sports)
+                    ])
                 return user
         except IntegrityError as exc:
             raise ValidationError({'email': ['An account with these details already exists.']}) from exc
@@ -51,8 +58,12 @@ class AuthenticationService:
         user = User.objects.filter(
             Q(email__iexact=normalized) | Q(username__iexact=normalized)
         ).first()
-        if user is None or not user.check_password(password):
-            raise AuthenticationFailed('Invalid email/username or password.')
+        if user is None:
+            if '@' in normalized:
+                raise AuthenticationFailed('No account exists with this email address.')
+            raise AuthenticationFailed('Username not found.')
+        if not user.check_password(password):
+            raise AuthenticationFailed('Incorrect password.')
         if not user.is_active or user.account_status != User.AccountStatus.ACTIVE:
             raise AccountUnavailable()
 
@@ -88,9 +99,12 @@ class AuthenticationService:
 
 
 class UserService:
+    EDITABLE_PROFILE_FIELDS = {'full_name', 'phone', 'avatar', 'bio', 'city', 'latitude', 'longitude', 'is_available'}
+
     @staticmethod
     def update_profile(*, user, validated_data):
         for field, value in validated_data.items():
-            setattr(user, field, value)
-        user.save()
+            if field in UserService.EDITABLE_PROFILE_FIELDS:
+                setattr(user, field, value)
+        user.save(update_fields=[field for field in validated_data if field in UserService.EDITABLE_PROFILE_FIELDS] + ['updated_at'])
         return user

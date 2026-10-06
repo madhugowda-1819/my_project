@@ -27,24 +27,26 @@ def validate_coordinates(latitude, longitude, radius):
     return latitude, longitude, radius
 
 
-def nearby_queryset(queryset, *, latitude, longitude, radius):
+def nearby_queryset(queryset, *, latitude, longitude, radius, latitude_field='latitude', longitude_field='longitude'):
     """Filter and sort in SQL; bounding box keeps the Haversine calculation small."""
     latitude, longitude, radius = validate_coordinates(latitude, longitude, radius)
     latitude_delta = radius / 111.32
     longitude_delta = radius / max(111.32 * cos(radians(latitude)), 0.000001)
     queryset = queryset.filter(
-        latitude__isnull=False,
-        longitude__isnull=False,
-        latitude__gte=latitude - latitude_delta,
-        latitude__lte=latitude + latitude_delta,
-        longitude__gte=longitude - longitude_delta,
-        longitude__lte=longitude + longitude_delta,
+        **{
+            f'{latitude_field}__isnull': False,
+            f'{longitude_field}__isnull': False,
+            f'{latitude_field}__gte': latitude - latitude_delta,
+            f'{latitude_field}__lte': latitude + latitude_delta,
+            f'{longitude_field}__gte': longitude - longitude_delta,
+            f'{longitude_field}__lte': longitude + longitude_delta,
+        },
     )
 
-    latitude_delta_rad = Radians(F('latitude') - Value(latitude))
-    longitude_delta_rad = Radians(F('longitude') - Value(longitude))
+    latitude_delta_rad = Radians(F(latitude_field) - Value(latitude))
+    longitude_delta_rad = Radians(F(longitude_field) - Value(longitude))
     origin_latitude_rad = Radians(Value(latitude))
-    candidate_latitude_rad = Radians(F('latitude'))
+    candidate_latitude_rad = Radians(F(latitude_field))
     haversine_a = (
         Power(Sin(latitude_delta_rad / Value(2.0)), Value(2.0))
         + Cos(origin_latitude_rad) * Cos(candidate_latitude_rad)

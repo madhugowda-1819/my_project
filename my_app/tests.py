@@ -1,15 +1,19 @@
 from django.test import TestCase
 from django.contrib.auth import get_user_model
+from django.contrib.auth.models import Group
 from django.utils import timezone
 from django.core.cache import cache
 from datetime import timedelta
 from rest_framework.test import APITestCase
 
-from .models import Ground, Match, PlayerProfile, Sport, UserSport, UserBlock, Venue, VenueSport, Court, VenueAmenity, CourtBooking, VenueReview, CourtBlockedPeriod
+from .models import Ground, Match, PlayerProfile, Sport, UserSport, UserBlock, Venue, VenueSport, Court, VenueAmenity, CourtBooking, VenueReview, CourtBlockedPeriod, Game, GamePlayer, Conversation, ConversationMember, Message, Community, CommunityMember, CommunityPostLike, Event, EventParticipant, Tournament, Notification, UserDevice, RecommendationProfile, Report, ModerationAction
 from .services.locations import nearby_queryset
 from .services.player_matching import PlayerMatchingService
 from .services.availability import VenueAvailabilityService
 from .services.bookings import BookingStatusService
+from .services.game_matching import GameMatchingService
+from .services.events import EventRegistrationService, TournamentBracketService, TournamentService
+from .services.recommendation_engine import RecommendationRankingService
 
 User = get_user_model()
 
@@ -511,3 +515,412 @@ class BookingEngineTests(APITestCase):
         self.assertEqual(BookingStatusService.complete_expired(), 1)
         booking.refresh_from_db()
         self.assertEqual(booking.status, CourtBooking.Status.COMPLETED)
+
+
+class GameApiTests(APITestCase):
+    def setUp(self):
+        self.host = User.objects.create_user(username='game-host', email='game-host@example.com', password='StrongPass!123')
+        self.player = User.objects.create_user(username='game-player', email='game-player@example.com', password='StrongPass!123')
+        self.other = User.objects.create_user(username='game-other', email='game-other@example.com', password='StrongPass!123')
+        for user in (self.host, self.player, self.other):
+            PlayerProfile.objects.create(user=user)
+        self.sport = Sport.objects.get(name='Badminton')
+        for user in (self.host, self.player, self.other):
+            UserSport.objects.create(user=user, sport=self.sport, skill_level='intermediate')
+        self.venue = Venue.objects.create(
+            name='Game Arena', address='5 Game Road', city='Bengaluru', latitude=12.9716, longitude=77.5946,
+            opening_time='09:00', closing_time='20:00', timezone='Asia/Kolkata',
+        )
+        self.court = Court.objects.create(venue=self.venue, sport=self.sport, name='Game Court', capacity=2, price_per_hour=500)
+        self.date = timezone.localdate() + timedelta(days=4)
+        self.client.force_authenticate(self.host)
+
+    def payload(self, **overrides):
+        data = {
+            'sport_id': self.sport.id, 'venue_id': str(self.venue.public_id), 'court_id': str(self.court.public_id),
+            'game_date': self.date.isoformat(), 'start_time': '10:00', 'end_time': '11:00',
+            'min_players': 2, 'max_players': 2, 'skill_level': 'intermediate', 'visibility': 'public',
+        }
+        data.update(overrides)
+        return data
+
+    def create_game(self, **overrides):
+        return self.client.post('/api/v1/games/', self.payload(**overrides), format='json')
+
+    def test_create_has_confirmed_host_and_prevents_court_conflicts(self):
+        created = self.create_game()
+        self.assertEqual(created.status_code, 201)
+        game = Game.objects.get(public_id=created.data['data']['public_id'])
+        self.assertEqual(game.game_players.filter(status='confirmed').count(), 1)
+        self.assertEqual(game.host, self.host)
+        overlapping = self.create_game(start_time='10:30', end_time='11:30')
+        self.assertEqual(overlapping.status_code, 409)
+
+    def test_join_capacity_leave_and_host_cancellation(self):
+        created = self.create_game()
+        game_id = created.data['data']['public_id']
+        self.client.force_authenticate(self.player)
+        joined = self.client.post(f'/api/v1/games/{game_id}/join/')
+        self.assertEqual(joined.status_code, 200)
+        self.assertEqual(joined.data['data']['status'], Game.Status.FULL)
+        self.client.force_authenticate(self.other)
+        full = self.client.post(f'/api/v1/games/{game_id}/join/')
+        self.assertEqual(full.status_code, 409)
+        self.client.force_authenticate(self.player)
+        left = self.client.post(f'/api/v1/games/{game_id}/leave/')
+        self.assertEqual(left.status_code, 200)
+        self.assertEqual(GamePlayer.objects.get(game__public_id=game_id, user=self.player).status, GamePlayer.Status.LEFT)
+        self.client.force_authenticate(self.host)
+        cancelled = self.client.post(f'/api/v1/games/{game_id}/leave/')
+        self.assertEqual(cancelled.status_code, 200)
+        self.assertEqual(cancelled.data['status'], Game.Status.CANCELLED)
+
+    def test_private_visibility_and_player_privacy(self):
+        created = self.create_game(visibility='private')
+        game_id = created.data['data']['public_id']
+        self.client.force_authenticate(self.player)
+        listing = self.client.get('/api/v1/games/')
+        self.assertEqual(listing.status_code, 200)
+        self.assertEqual(listing.data['count'], 0)
+        denied = self.client.post(f'/api/v1/games/{game_id}/join/')
+        self.assertEqual(denied.status_code, 403)
+        self.client.force_authenticate(self.host)
+        players = self.client.get(f'/api/v1/games/{game_id}/players/')
+        self.assertEqual(players.status_code, 200)
+        self.assertNotIn('email', players.data['results'][0]['player'])
+        self.assertNotIn('latitude', players.data['results'][0]['player'])
+
+
+class GameMatchingServiceTests(APITestCase):
+    def setUp(self):
+        self.user = User.objects.create_user(
+            username='game-recommender', email='game-recommender@example.com', password='StrongPass!123',
+            latitude=12.9716, longitude=77.5946,
+        )
+        PlayerProfile.objects.create(user=self.user, preferred_play_times=['evening'])
+        self.host = User.objects.create_user(username='recommend-host', email='recommend-host@example.com', password='StrongPass!123')
+        PlayerProfile.objects.create(user=self.host)
+        self.sport = Sport.objects.get(name='Badminton')
+        self.other_sport = Sport.objects.get(name='Tennis')
+        UserSport.objects.create(user=self.user, sport=self.sport, skill_level='intermediate', preferred=True)
+        UserSport.objects.create(user=self.host, sport=self.sport, skill_level='intermediate')
+        self.venue = Venue.objects.create(
+            name='Recommendation Arena', address='6 Game Road', city='Bengaluru', latitude=12.972, longitude=77.595,
+            opening_time='09:00', closing_time='22:00', timezone='Asia/Kolkata',
+        )
+        self.court = Court.objects.create(venue=self.venue, sport=self.sport, name='Recommendation Court', capacity=6, price_per_hour=500)
+        self.date = timezone.localdate() + timedelta(days=5)
+        self.client.force_authenticate(self.user)
+
+    def make_game(self, **overrides):
+        starts = timezone.now() + timedelta(days=5)
+        values = {
+            'game_reference': f'GM-TEST-{Game.objects.count() + 1}', 'host': self.host, 'sport': self.sport,
+            'venue': self.venue, 'court': self.court, 'game_date': self.date,
+            'start_time': '18:00', 'end_time': '19:00', 'starts_at': starts, 'ends_at': starts + timedelta(hours=1),
+            'min_players': 2, 'max_players': 4, 'skill_level': 'intermediate', 'visibility': 'public', 'status': 'open',
+        }
+        values.update(overrides)
+        game = Game.objects.create(**values)
+        GamePlayer.objects.create(game=game, user=self.host)
+        return game
+
+    def test_preferred_sport_scores_and_returns_reasons(self):
+        game = self.make_game()
+        results = GameMatchingService.get_recommendations(user=self.user, latitude=12.9716, longitude=77.5946, radius=10)
+        self.assertEqual(results[0]['game'], game)
+        self.assertGreater(results[0]['match_score'], 70)
+        self.assertIn('Matches your preferred sport', results[0]['reasons'])
+        self.assertIn('Skill level is a strong match', results[0]['reasons'])
+
+    def test_excludes_full_private_cancelled_and_already_joined_games(self):
+        available = self.make_game()
+        full = self.make_game(game_reference='GM-FULL', min_players=1, max_players=1)
+        private = self.make_game(game_reference='GM-PRIVATE', visibility='private')
+        cancelled = self.make_game(game_reference='GM-CANCELLED', status='cancelled')
+        joined = self.make_game(game_reference='GM-JOINED')
+        GamePlayer.objects.create(game=joined, user=self.user)
+        ids = [item['game'].id for item in GameMatchingService.get_recommendations(user=self.user, latitude=12.9716, longitude=77.5946, radius=10)]
+        self.assertIn(available.id, ids)
+        self.assertNotIn(full.id, ids)
+        self.assertNotIn(private.id, ids)
+        self.assertNotIn(cancelled.id, ids)
+        self.assertNotIn(joined.id, ids)
+
+    def test_endpoint_saved_location_limit_and_no_sport_returns_empty(self):
+        self.make_game()
+        response = self.client.get('/api/v1/recommendations/games/', {'limit': 1})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.data['data']), 1)
+        UserSport.objects.filter(user=self.user).delete()
+        empty = self.client.get('/api/v1/recommendations/games/')
+        self.assertEqual(empty.status_code, 200)
+        self.assertEqual(empty.data['data'], [])
+
+
+class ConversationChatTests(APITestCase):
+    def setUp(self):
+        self.user = User.objects.create_user(username='chat-user', email='chat-user@example.com', password='StrongPass!123')
+        self.other = User.objects.create_user(username='chat-other', email='chat-other@example.com', password='StrongPass!123')
+        self.outsider = User.objects.create_user(username='chat-outsider', email='chat-outsider@example.com', password='StrongPass!123')
+        for user in (self.user, self.other, self.outsider):
+            PlayerProfile.objects.create(user=user)
+        self.client.force_authenticate(self.user)
+
+    def create_direct(self):
+        return self.client.post('/api/v1/conversations/', {'type': 'ONE_TO_ONE', 'user_id': self.other.id}, format='json')
+
+    def test_create_reuse_send_read_edit_and_soft_delete(self):
+        created = self.create_direct()
+        reused = self.create_direct()
+        self.assertEqual(created.status_code, 201)
+        self.assertEqual(reused.status_code, 200)
+        conversation_id = created.data['data']['public_id']
+        self.assertEqual(Conversation.objects.count(), 1)
+        sent = self.client.post(f'/api/v1/conversations/{conversation_id}/messages/', {'content': '  Ready for badminton?  '}, format='json')
+        self.assertEqual(sent.status_code, 201)
+        message_id = sent.data['data']['public_id']
+        self.client.force_authenticate(self.other)
+        listed = self.client.get(f'/api/v1/conversations/{conversation_id}/messages/')
+        self.assertEqual(listed.status_code, 200)
+        self.assertEqual(listed.data['count'], 1)
+        self.assertEqual(self.client.post(f'/api/v1/conversations/{conversation_id}/read/').status_code, 200)
+        self.client.force_authenticate(self.user)
+        edited = self.client.patch(f'/api/v1/messages/{message_id}/', {'content': 'Updated plan'}, format='json')
+        self.assertEqual(edited.status_code, 200)
+        self.assertTrue(edited.data['data']['is_edited'])
+        deleted = self.client.delete(f'/api/v1/messages/{message_id}/')
+        self.assertEqual(deleted.status_code, 200)
+        message = Message.objects.get(public_id=message_id)
+        self.assertIsNotNone(message.deleted_at)
+        self.assertEqual(message.content, '')
+
+    def test_permissions_validation_and_blocking(self):
+        created = self.create_direct()
+        conversation_id = created.data['data']['public_id']
+        empty = self.client.post(f'/api/v1/conversations/{conversation_id}/messages/', {'content': '   '}, format='json')
+        self.assertEqual(empty.status_code, 400)
+        self.client.force_authenticate(self.outsider)
+        forbidden = self.client.get(f'/api/v1/conversations/{conversation_id}/messages/')
+        self.assertEqual(forbidden.status_code, 403)
+        self.client.force_authenticate(self.user)
+        UserBlock.objects.create(user=self.user, blocked_user=self.other)
+        blocked = self.client.post('/api/v1/conversations/', {'type': 'ONE_TO_ONE', 'user_id': self.other.id}, format='json')
+        self.assertEqual(blocked.status_code, 403)
+
+    def test_game_conversation_only_allows_confirmed_players(self):
+        sport = Sport.objects.get(name='Badminton')
+        venue = Venue.objects.create(name='Chat Arena', address='7 Road', city='Bengaluru', latitude=12.97, longitude=77.59, opening_time='09:00', closing_time='20:00')
+        court = Court.objects.create(venue=venue, sport=sport, name='Chat Court', capacity=4, price_per_hour=500)
+        starts = timezone.now() + timedelta(days=2)
+        game = Game.objects.create(game_reference='GM-CHAT', host=self.user, sport=sport, venue=venue, court=court, game_date=timezone.localdate() + timedelta(days=2), start_time='10:00', end_time='11:00', starts_at=starts, ends_at=starts + timedelta(hours=1), min_players=2, max_players=4)
+        GamePlayer.objects.create(game=game, user=self.user)
+        GamePlayer.objects.create(game=game, user=self.other)
+        group = self.client.post('/api/v1/conversations/', {'type': 'GAME_GROUP', 'game_id': str(game.public_id)}, format='json')
+        self.assertEqual(group.status_code, 200)
+        conversation_id = group.data['data']['public_id']
+        self.client.force_authenticate(self.outsider)
+        self.assertEqual(self.client.get(f'/api/v1/conversations/{conversation_id}/').status_code, 404)
+        self.client.force_authenticate(self.other)
+        sent = self.client.post(f'/api/v1/conversations/{conversation_id}/messages/', {'content': 'I will be there.'}, format='json')
+        self.assertEqual(sent.status_code, 201)
+
+
+class CommunityApiTests(APITestCase):
+    def setUp(self):
+        self.owner = User.objects.create_user(username='community-owner', email='community-owner@example.com', password='StrongPass!123', city='Bengaluru', latitude=12.9716, longitude=77.5946)
+        self.member = User.objects.create_user(username='community-member', email='community-member@example.com', password='StrongPass!123')
+        self.other = User.objects.create_user(username='community-other', email='community-other@example.com', password='StrongPass!123')
+        for user in (self.owner, self.member, self.other):
+            PlayerProfile.objects.create(user=user)
+        self.sport = Sport.objects.get(name='Badminton')
+        UserSport.objects.create(user=self.owner, sport=self.sport, preferred=True)
+        self.client.force_authenticate(self.owner)
+
+    def create(self, **changes):
+        payload = {'name': 'Bengaluru Badminton Club', 'sport_id': self.sport.id, 'city': 'Bengaluru', 'latitude': 12.972, 'longitude': 77.595, 'visibility': 'public'}
+        payload.update(changes)
+        return self.client.post('/api/v1/communities/', payload, format='json')
+
+    def test_create_owner_membership_join_post_comment_and_like(self):
+        created = self.create()
+        self.assertEqual(created.status_code, 201)
+        community_id = created.data['data']['public_id']
+        community = Community.objects.get(public_id=community_id)
+        self.assertEqual(community.member_count, 1)
+        self.assertEqual(community.members.get(user=self.owner).role, CommunityMember.Role.OWNER)
+        self.client.force_authenticate(self.member)
+        self.assertTrue(self.client.post(f'/api/v1/communities/{community_id}/join/').data['joined'])
+        post = self.client.post(f'/api/v1/communities/{community_id}/posts/', {'content': 'Looking for an evening game.'}, format='json')
+        self.assertEqual(post.status_code, 201)
+        post_id = post.data['data']['public_id']
+        comment = self.client.post(f'/api/v1/community-posts/{post_id}/comments/', {'content': 'I can join.'}, format='json')
+        self.assertEqual(comment.status_code, 201)
+        like = self.client.post(f'/api/v1/community-posts/{post_id}/like/')
+        duplicate = self.client.post(f'/api/v1/community-posts/{post_id}/like/')
+        self.assertEqual(like.status_code, 201)
+        self.assertEqual(duplicate.status_code, 200)
+        self.assertEqual(CommunityPostLike.objects.count(), 1)
+
+    def test_private_request_approval_and_ban(self):
+        created = self.create(name='Private Club', visibility='private')
+        community_id = created.data['data']['public_id']
+        self.client.force_authenticate(self.member)
+        requested = self.client.post(f'/api/v1/communities/{community_id}/join/')
+        self.assertTrue(requested.data['pending'])
+        duplicate = self.client.post(f'/api/v1/communities/{community_id}/join/')
+        self.assertFalse(duplicate.data['changed'])
+        self.client.force_authenticate(self.owner)
+        approved = self.client.post(f'/api/v1/communities/{community_id}/join-requests/{self.member.id}/approve/')
+        self.assertEqual(approved.status_code, 200)
+        banned = self.client.post(f'/api/v1/communities/{community_id}/members/{self.member.id}/ban/')
+        self.assertEqual(banned.status_code, 200)
+        self.client.force_authenticate(self.member)
+        self.assertEqual(self.client.post(f'/api/v1/communities/{community_id}/join/').status_code, 403)
+
+
+class EventTournamentTests(APITestCase):
+    def setUp(self):
+        self.organizer = User.objects.create_user(username='event-organizer', email='event-organizer@example.com', password='StrongPass!123')
+        self.first = User.objects.create_user(username='event-first', email='event-first@example.com', password='StrongPass!123')
+        self.second = User.objects.create_user(username='event-second', email='event-second@example.com', password='StrongPass!123')
+        self.sport = Sport.objects.get(name='Badminton')
+        for user in (self.organizer, self.first, self.second):
+            PlayerProfile.objects.create(user=user)
+            UserSport.objects.create(user=user, sport=self.sport, skill_level='intermediate')
+        self.venue = Venue.objects.create(name='Event Arena', address='8 Road', city='Bengaluru', latitude=12.97, longitude=77.59, opening_time='09:00', closing_time='20:00')
+        self.court = Court.objects.create(venue=self.venue, sport=self.sport, name='Event Court', capacity=8, price_per_hour=500)
+        self.client.force_authenticate(self.organizer)
+
+    def create_event(self):
+        date = timezone.localdate() + timedelta(days=7)
+        return self.client.post('/api/v1/events/', {
+            'title': 'Weekend Event', 'sport_id': self.sport.id, 'venue_id': str(self.venue.public_id),
+            'court_id': str(self.court.public_id), 'event_date': date.isoformat(), 'start_time': '10:00', 'end_time': '11:00',
+            'maximum_participants': 1, 'minimum_participants': 1,
+            'registration_deadline': (timezone.now() + timedelta(days=6)).isoformat(),
+        }, format='json')
+
+    def test_event_registration_waitlist_and_promotion(self):
+        created = self.create_event()
+        self.assertEqual(created.status_code, 201)
+        event = Event.objects.get(public_id=created.data['data']['public_id'])
+        self.client.force_authenticate(self.first)
+        self.assertEqual(self.client.post(f'/api/v1/events/{event.public_id}/register/').data['data']['status'], 'registered')
+        self.client.force_authenticate(self.second)
+        self.assertEqual(self.client.post(f'/api/v1/events/{event.public_id}/register/').data['data']['status'], 'waitlisted')
+        self.client.force_authenticate(self.first)
+        self.assertEqual(self.client.post(f'/api/v1/events/{event.public_id}/leave/').status_code, 200)
+        self.assertEqual(EventParticipant.objects.get(event=event, user=self.second).status, EventParticipant.Status.REGISTERED)
+
+    def test_tournament_team_and_bracket_generation(self):
+        start = timezone.localdate() + timedelta(days=10)
+        tournament = Tournament.objects.create(
+            tournament_reference='TR-TEST', name='Test Tournament', organizer=self.organizer, sport=self.sport,
+            venue=self.venue, start_date=start, end_date=start + timedelta(days=1),
+            registration_deadline=timezone.now() + timedelta(days=8), maximum_teams=4,
+        )
+        first = TournamentService.create_team(tournament=tournament, creator=self.organizer, name='Alpha')
+        # A staff organizer is not needed because the tournament owner creates both teams.
+        second = TournamentService.create_team(tournament=tournament, creator=self.organizer, name='Beta')
+        matches = TournamentBracketService.generate(tournament=tournament, actor=self.organizer)
+        self.assertEqual(len(matches), 1)
+        self.assertEqual({matches[0].team_a_id, matches[0].team_b_id}, {first.id, second.id})
+
+
+class NotificationApiTests(APITestCase):
+    def setUp(self):
+        self.user=User.objects.create_user(username='notify-user',email='notify-user@example.com',password='StrongPass!123')
+        self.other=User.objects.create_user(username='notify-other',email='notify-other@example.com',password='StrongPass!123')
+        self.notification=Notification.objects.create(user=self.user,type='message',title='Hello',body='World')
+        self.client.force_authenticate(self.user)
+    def test_read_count_preferences_and_device(self):
+        self.assertEqual(self.client.get('/api/v1/notifications/unread-count/').data['unread_count'],1)
+        self.assertEqual(self.client.post(f'/api/v1/notifications/{self.notification.public_id}/read/').status_code,200)
+        self.assertTrue(Notification.objects.get(pk=self.notification.pk).is_read)
+        self.assertEqual(self.client.patch('/api/v1/notifications/preferences/',{'chat_notifications':False},format='json').status_code,200)
+        registered=self.client.post('/api/v1/notifications/devices/',{'device_token':'test-device-token','platform':'android'},format='json')
+        self.assertEqual(registered.status_code,201)
+        self.assertEqual(self.client.delete(f"/api/v1/notifications/devices/{registered.data['data']['public_id']}/").status_code,204)
+    def test_notification_ownership(self):
+        self.client.force_authenticate(self.other)
+        self.assertEqual(self.client.get(f'/api/v1/notifications/{self.notification.public_id}/').status_code,404)
+
+
+class RecommendationEngineTests(APITestCase):
+    def setUp(self):
+        self.user = User.objects.create_user(username='recommend-user', email='recommend-user@example.com', password='StrongPass!123')
+        PlayerProfile.objects.create(user=self.user, preferred_play_times=['evening'])
+        self.client.force_authenticate(self.user)
+
+    def test_cold_start_dashboard_is_safe_and_server_derived(self):
+        response = self.client.get('/api/v1/recommendations/')
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data['algorithm'], 'deterministic_hybrid_v1')
+        self.assertEqual(response.data['data']['profile']['preferred_play_times'], ['evening'])
+        self.assertTrue(RecommendationProfile.objects.filter(user=self.user).exists())
+
+    def test_ranking_is_deterministic_and_bounded(self):
+        self.assertEqual(RecommendationRankingService.venue_score(supports_sport=True, rating=5, distance_km=1), 100)
+        self.assertEqual(RecommendationRankingService.venue_score(supports_sport=False, rating=0, distance_km=100), 0)
+
+
+class ModerationApiTests(APITestCase):
+    def setUp(self):
+        self.reporter = User.objects.create_user(username='reporter', email='reporter@example.com', password='StrongPass!123')
+        self.target = User.objects.create_user(username='target', email='target@example.com', password='StrongPass!123')
+        self.moderator = User.objects.create_user(username='moderator', email='moderator@example.com', password='StrongPass!123')
+        self.moderator.groups.add(Group.objects.create(name='SportMate Moderators'))
+        self.admin = User.objects.create_user(username='platform-admin', email='platform-admin@example.com', password='StrongPass!123')
+        self.admin.groups.add(Group.objects.create(name='SportMate Admins'))
+
+    def create_report(self):
+        self.client.force_authenticate(self.reporter)
+        return self.client.post('/api/v1/reports/', {
+            'target_type': 'user', 'target_public_id': str(self.target.public_id),
+            'reason': 'abuse', 'description': 'Repeated abusive conduct.',
+        }, format='json')
+
+    def test_report_ownership_moderation_and_restore(self):
+        created = self.create_report()
+        self.assertEqual(created.status_code, 201)
+        report_id = created.data['data']['public_id']
+        self.assertEqual(self.client.get('/api/v1/admin/dashboard/').status_code, 403)
+        self.client.force_authenticate(self.moderator)
+        suspended = self.client.patch(f'/api/v1/reports/{report_id}/', {'action': 'suspend', 'action_reason': 'Policy violation.'}, format='json')
+        self.assertEqual(suspended.status_code, 200)
+        self.target.refresh_from_db()
+        self.assertEqual(self.target.account_status, User.AccountStatus.SUSPENDED)
+        self.assertEqual(ModerationAction.objects.filter(action='suspend').count(), 1)
+        restored = self.client.patch(f'/api/v1/reports/{report_id}/', {'action': 'restore', 'status': 'resolved', 'resolution': 'Restriction lifted.'}, format='json')
+        self.assertEqual(restored.status_code, 200)
+        self.target.refresh_from_db()
+        self.assertEqual(self.target.account_status, User.AccountStatus.ACTIVE)
+        self.client.force_authenticate(self.admin)
+        self.assertEqual(self.client.get('/api/v1/admin/dashboard/').status_code, 200)
+        self.assertEqual(self.client.get('/api/v1/admin/moderation/actions/').status_code, 200)
+
+    def test_normal_user_cannot_access_another_report(self):
+        created = self.create_report()
+        report_id = created.data['data']['public_id']
+        self.client.force_authenticate(self.target)
+        self.assertEqual(self.client.get(f'/api/v1/reports/{report_id}/').status_code, 404)
+
+
+class ProductionHardeningTests(APITestCase):
+    def test_health_endpoint_is_non_sensitive(self):
+        response = self.client.get('/api/v1/health/')
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data, {'status': 'ok'})
+
+    def test_profile_update_cannot_escalate_account_fields(self):
+        user = User.objects.create_user(username='harden-user', email='harden@example.com', password='StrongPass!123')
+        self.client.force_authenticate(user)
+        response = self.client.patch('/api/v1/users/me/', {
+            'full_name': 'Safe Name', 'is_staff': True, 'account_status': 'deactivated',
+        }, format='json')
+        self.assertEqual(response.status_code, 200)
+        user.refresh_from_db()
+        self.assertEqual(user.full_name, 'Safe Name')
+        self.assertFalse(user.is_staff)
+        self.assertEqual(user.account_status, User.AccountStatus.ACTIVE)

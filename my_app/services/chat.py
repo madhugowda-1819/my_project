@@ -60,13 +60,20 @@ class ConversationMemberService:
 class ConversationService:
     @classmethod
     @transaction.atomic
-    def one_to_one(cls, *, initiator, target_user_id):
+    def one_to_one(cls, *, initiator, target_user_id=None, target_user_public_id=None):
         try:
-            target = User.objects.get(pk=target_user_id, is_active=True, account_status=User.AccountStatus.ACTIVE)
+            queryset = User.objects.filter(
+                is_active=True,
+                account_status=User.AccountStatus.ACTIVE,
+            )
+            if target_user_public_id is not None:
+                target = queryset.get(public_id=target_user_public_id)
+            else:
+                target = queryset.get(pk=target_user_id)
         except User.DoesNotExist as exc:
             raise NotFound('Target user not found.') from exc
         if initiator.pk == target.pk:
-            raise ValidationError({'user_id': ['You cannot start a conversation with yourself.']})
+            raise ValidationError({'user_public_id': ['You cannot start a conversation with yourself.']})
         ChatPermissionService.ensure_not_blocked(user=initiator, other_user=target)
         first, second = sorted((initiator, target), key=lambda user: user.pk)
         conversation = Conversation.objects.select_for_update().filter(

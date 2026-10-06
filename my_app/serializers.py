@@ -634,6 +634,9 @@ class GameSerializer(serializers.ModelSerializer):
 # ------------------------------------------------------------------
 class ConversationCreateSerializer(serializers.Serializer):
     type = serializers.CharField(max_length=20)
+    # New clients use an opaque public identifier.  Keep user_id temporarily
+    # for older mobile builds that still send the internal primary key.
+    user_public_id = serializers.UUIDField(required=False)
     user_id = serializers.IntegerField(min_value=1, required=False)
     game_id = serializers.UUIDField(required=False)
 
@@ -643,9 +646,13 @@ class ConversationCreateSerializer(serializers.Serializer):
         if conversation_type not in aliases:
             raise serializers.ValidationError({'type': 'type must be ONE_TO_ONE or GAME_GROUP.'})
         attrs['type'] = aliases[conversation_type]
-        required = 'user_id' if attrs['type'] == Conversation.Type.ONE_TO_ONE else 'game_id'
-        if not attrs.get(required):
-            raise serializers.ValidationError({required: f'{required} is required for this conversation type.'})
+        if attrs['type'] == Conversation.Type.ONE_TO_ONE:
+            if not attrs.get('user_public_id') and not attrs.get('user_id'):
+                raise serializers.ValidationError({
+                    'user_public_id': 'A player public ID is required for a direct conversation.',
+                })
+        elif not attrs.get('game_id'):
+            raise serializers.ValidationError({'game_id': 'game_id is required for this conversation type.'})
         return attrs
 
 

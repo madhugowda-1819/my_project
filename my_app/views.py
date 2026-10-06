@@ -1293,7 +1293,9 @@ class ConversationListCreateView(generics.GenericAPIView):
         data = serializer.validated_data
         if data['type'] == Conversation.Type.ONE_TO_ONE:
             conversation, created = ConversationService.one_to_one(
-                initiator=request.user, target_user_id=data['user_id'],
+                initiator=request.user,
+                target_user_id=data.get('user_id'),
+                target_user_public_id=data.get('user_public_id'),
             )
         else:
             conversation = ConversationService.game_for_user(game_id=data['game_id'], user=request.user)

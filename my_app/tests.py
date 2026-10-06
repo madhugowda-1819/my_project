@@ -671,6 +671,14 @@ class ConversationChatTests(APITestCase):
     def create_direct(self):
         return self.client.post('/api/v1/conversations/', {'type': 'ONE_TO_ONE', 'user_id': self.other.id}, format='json')
 
+    def test_create_direct_conversation_with_public_user_id(self):
+        response = self.client.post('/api/v1/conversations/', {
+            'type': 'one_to_one',
+            'user_public_id': str(self.other.public_id),
+        }, format='json')
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(response.data['data']['other_user']['public_id'], str(self.other.public_id))
+
     def test_create_reuse_send_read_edit_and_soft_delete(self):
         created = self.create_direct()
         reused = self.create_direct()

@@ -18,11 +18,15 @@ from django.utils.http import urlsafe_base64_encode, urlsafe_base64_decode
 from django.utils.encoding import force_bytes, force_str
 from django.core.mail import send_mail
 from django.conf import settings
+from django.core.cache import cache
 from urllib.parse import urlencode
 import json
+import math
+
+import requests
 
 from .models import (
-    Sport, AvailabilitySlot, Match, Message, Notification, Ground,
+    Sport, AvailabilitySlot, Match, Message, Notification, Ground, SportsGround,
     Venue, Court, VenueReview, CourtBooking, Game, GamePlayer, Conversation, ConversationMember,
     Community, CommunityMember, CommunityPost, CommunityComment, CommunityPostLike,
     Event, EventParticipant, Tournament, TournamentTeam, TournamentMatch, NotificationPreference, UserDevice, PlayerRating, Achievement, UserAchievement, Report, ModerationAction,
@@ -79,6 +83,7 @@ from .services.venues import VenueDiscoveryService, VenueReviewService
 from .services.ground_ingestion import GroundIngestionService
 from .services.auto_games import AutoGameService
 from .services.matches import join_match
+from .utils.geo_utils import clean_google_maps_name, haversine_distance
 
 User = get_user_model()
 
@@ -604,6 +609,98 @@ class BookingCancelView(APIView):
         booking = get_object_or_404(CourtBooking.objects.select_related('venue'), public_id=public_id)
         booking = BookingCancellationService.cancel(actor=request.user, booking=booking, reason=request.data.get('reason', ''))
         return Response({'success': True, 'data': BookingSerializer(booking).data})
+
+
+# ---------------- OSM NEARBY GROUNDS ----------------
+class UniversalGroundsView(APIView):
+    """Return cached OSM sports features, refreshing a sparse local area once."""
+    permission_classes = [AllowAny]
+    radius_km = 20.0
+    cache_minimum = 3
+    refresh_cooldown_seconds = 900
+
+    def get(self, request):
+        try:
+            latitude = float(request.query_params.get('latitude'))
+            longitude = float(request.query_params.get('longitude'))
+        except (TypeError, ValueError):
+            return Response({'detail': 'Valid latitude and longitude query parameters are required.'}, status=400)
+        if not -90 <= latitude <= 90 or not -180 <= longitude <= 180:
+            return Response({'detail': 'Latitude must be between -90 and 90 and longitude between -180 and 180.'}, status=400)
+        grounds = self._nearby_cached(latitude, longitude)
+        # A sparse cache is normal in a new area. Only one request per nearby
+        # area may wait on Overpass during the cooldown; subsequent callers
+        # receive locally cached results immediately instead of queueing behind
+        # the same public API request.
+        refresh_key = self._refresh_cache_key(latitude, longitude)
+        should_refresh = len(grounds) < self.cache_minimum and cache.add(
+            refresh_key, True, timeout=self.refresh_cooldown_seconds,
+        )
+        if should_refresh:
+            try:
+                self._refresh_from_overpass(latitude, longitude)
+            except requests.RequestException:
+                pass  # Return the cache if the public provider is unavailable.
+            grounds = self._nearby_cached(latitude, longitude)
+        payload = [{'id': ground.id, 'name': ground.name, 'sport': ground.sport,
+                    'ground_type': ground.ground_type, 'latitude': ground.latitude,
+                    'longitude': ground.longitude, 'distance_km': round(distance, 2)}
+                   for ground, distance in grounds]
+        return Response({'count': len(payload), 'radius_km': self.radius_km, 'grounds': payload})
+
+    @staticmethod
+    def _refresh_cache_key(latitude, longitude):
+        # 0.2 degree cells are smaller than the search diameter while still
+        # absorbing normal GPS movement around the same user area.
+        return f'osm-ground-refresh:{latitude:.1f}:{longitude:.1f}'
+
+    def _nearby_cached(self, latitude, longitude):
+        lat_delta = self.radius_km / 111.0
+        lon_delta = self.radius_km / max(111.0 * math.cos(math.radians(latitude)), 0.000001)
+        candidates = SportsGround.objects.filter(
+            latitude__range=(latitude - lat_delta, latitude + lat_delta),
+            longitude__range=(longitude - lon_delta, longitude + lon_delta),
+        )
+        grounds = [(ground, haversine_distance(latitude, longitude, ground.latitude, ground.longitude))
+                   for ground in candidates]
+        return sorted((item for item in grounds if item[1] <= self.radius_km), key=lambda item: item[1])
+
+    def _refresh_from_overpass(self, latitude, longitude):
+        query = ('[out:json][timeout:30];('
+                 f'node["leisure"~"^(pitch|sports_centre|stadium)$"](around:20000,{latitude},{longitude});'
+                 f'way["leisure"~"^(pitch|sports_centre|stadium)$"](around:20000,{latitude},{longitude});'
+                 f'rel["leisure"~"^(pitch|sports_centre|stadium)$"](around:20000,{latitude},{longitude});'
+                 ');out center tags;')
+        response = requests.post(
+            settings.OVERPASS_API_URL,
+            data={'data': query},
+            timeout=(3, settings.MAPS_PROVIDER_TIMEOUT_SECONDS),
+        )
+        response.raise_for_status()
+        elements = response.json().get('elements', [])
+        if not isinstance(elements, list):
+            return
+        for element in elements:
+            if not isinstance(element, dict):
+                continue
+            center = element.get('center') or {}
+            try:
+                element_latitude = float(element.get('lat', center.get('lat')))
+                element_longitude = float(element.get('lon', center.get('lon')))
+            except (TypeError, ValueError):
+                continue
+            if haversine_distance(latitude, longitude, element_latitude, element_longitude) > self.radius_km:
+                continue
+            tags = element.get('tags') or {}
+            if not isinstance(tags, dict):
+                continue
+            SportsGround.objects.update_or_create(
+                osm_id=f"{element.get('type', 'feature')}/{element.get('id')}",
+                defaults={'name': clean_google_maps_name(str(tags.get('name') or tags.get('operator') or 'Unnamed Sports Ground')),
+                          'ground_type': str(tags.get('leisure') or 'sports_ground'),
+                          'sport': str(tags.get('sport') or tags.get('sport:1') or 'multi-sport'),
+                          'latitude': element_latitude, 'longitude': element_longitude},
+            )
 
 
 # ---------------- GROUNDS ----------------

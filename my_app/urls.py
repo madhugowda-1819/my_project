@@ -55,6 +55,7 @@ urlpatterns = [
     path('achievements/<uuid:public_id>/', views.AchievementDetailView.as_view()),
 
     # ---------------- GROUNDS ----------------
+    path('grounds/nearby/', views.UniversalGroundsView.as_view()),
     path('grounds/discover/', views.GroundDiscoveryView.as_view()),
     path('grounds/', views.GroundListView.as_view()),
     path('grounds/live/', views.LiveGroundListView.as_view()),

@@ -395,6 +395,27 @@ class Ground(models.Model):
         ]
 
 
+class SportsGround(models.Model):
+    """An OpenStreetMap sports feature cached for nearby-ground discovery."""
+
+    osm_id = models.CharField(max_length=64, unique=True, db_index=True)
+    name = models.CharField(max_length=255)
+    ground_type = models.CharField(max_length=100, db_index=True)
+    sport = models.CharField(max_length=100, db_index=True)
+    latitude = models.FloatField(db_index=True)
+    longitude = models.FloatField(db_index=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        indexes = [
+            models.Index(fields=['latitude', 'longitude'], name='sports_ground_coords_idx'),
+        ]
+
+    def __str__(self):
+        return self.name
+
+
 # ---------------------------------------------------------------------------
 # AVAILABILITY
 # ---------------------------------------------------------------------------

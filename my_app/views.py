@@ -285,6 +285,10 @@ class AccountTokenRefreshView(TokenRefreshView):
 class MySportsView(APIView):
     permission_classes = [IsActiveAccount]
 
+    # def get(self, request):
+    #     sports = request.user.user_sports.select_related('sport').order_by('sport__name')
+    #     return Response({'success': True, 'data': UserSportSerializer(sports, many=True).data})
+
     def patch(self, request):
         serializer = UserSportWriteSerializer(data=request.data.get('sports', []), many=True)
         serializer.is_valid(raise_exception=True)
@@ -1639,9 +1643,13 @@ class GlobalSearchView(APIView):
     throttle_scope='search'
     def get(self,request):
         q=(request.query_params.get('q') or '').strip()
-        if not q: raise ValidationError({'q':['A search query is required.']})
         raw_types=request.query_params.get('type','').split(',') if request.query_params.get('type') else None
         if raw_types and not set(raw_types)<=VALID_TYPES: raise ValidationError({'type':['Unsupported search type.']})
+        # A category may be browsed without a keyword (for example, all
+        # available players).  An unfiltered "All" request remains invalid,
+        # since it would unnecessarily query every public resource.
+        if not q and not raw_types:
+            raise ValidationError({'q':['Enter a search query or choose a category.']})
         try: page=max(1,int(request.query_params.get('page',1)));page_size=min(100,max(1,int(request.query_params.get('page_size',20))))
         except ValueError as exc: raise ValidationError('page and page_size must be integers.') from exc
         latitude=request.query_params.get('latitude');longitude=request.query_params.get('longitude')

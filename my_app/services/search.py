@@ -14,19 +14,18 @@ class GlobalSearchService:
  @classmethod
  def search(cls,*,user,q,types,city=None,latitude=None,longitude=None,radius=20):
   q=q.strip()
-  if not q:return []
   types=set(types or VALID_TYPES)&VALID_TYPES
   location=latitude is not None
   if location:latitude,longitude,radius=validate_coordinates(latitude,longitude,radius)
   results=[]
   def add(kind,items,title,description='',image='',popularity=lambda x:0):
    for obj in items:
-    distance=getattr(obj,'distance_km',None);score=cls.score(title(obj),description(obj),q,popularity(obj),distance)
-    if score:results.append({'type':kind,'id':str(obj.public_id),'title':title(obj),'description':description(obj),'image':str(getattr(obj,image,'')) if image else None,'metadata':({'distance_km':round(distance,2)} if distance is not None else {}),'_score':score})
-  text=Q(name__icontains=q)|Q(description__icontains=q)
-  if 'sport'in types:add('sport',Sport.objects.filter(Q(name__icontains=q)|Q(description__icontains=q),is_active=True)[:50],lambda x:x.name,lambda x:x.description)
-  if 'player'in types:add('player',User.objects.filter(Q(username__icontains=q)|Q(full_name__icontains=q),is_active=True,account_status='active')[:50],lambda x:x.full_name or x.username,lambda x:x.city)
-  venues=Venue.objects.filter(text,active=True)
+    distance=getattr(obj,'distance_km',None);score=cls.score(title(obj),description(obj),q,popularity(obj),distance) if q else popularity(obj)
+    # Browsing a category has no keyword score; include its permitted items.
+    if score or not q:results.append({'type':kind,'id':str(obj.public_id),'title':title(obj),'description':description(obj),'image':str(getattr(obj,image,'')) if image else None,'metadata':({'distance_km':round(distance,2)} if distance is not None else {}),'_score':score})
+  text=Q(name__icontains=q)|Q(description__icontains=q) if q else Q()
+  if 'sport'in types:add('sport',Sport.objects.filter((Q(name__icontains=q)|Q(description__icontains=q)) if q else Q(),is_active=True)[:50],lambda x:x.name,lambda x:x.description)
+  if 'player'in types:add('player',User.objects.filter((Q(username__icontains=q)|Q(full_name__icontains=q)) if q else Q(),is_active=True,account_status='active')[:50],lambda x:x.full_name or x.username,lambda x:x.city)
   if location:venues=nearby_queryset(venues,latitude=latitude,longitude=longitude,radius=radius)
   if city:venues=venues.filter(city__iexact=city)
   if 'venue'in types:add('venue',venues[:100],lambda x:x.name,lambda x:x.description,'',lambda x:float(x.rating))

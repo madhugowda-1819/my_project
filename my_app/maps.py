@@ -39,9 +39,11 @@ def find_live_sports_grounds(*, latitude, longitude, sport=None, radius_km=10):
             latitude=latitude, longitude=longitude, sport=sport, radius_km=radius_km,
         )
     else:
-        # A generic "sports ground" query also returns gyms. Request only the
-        # supported activities when no sport filter has been selected.
-        query = f'{sport} ground' if sport else f"{' '.join(SUPPORTED_SPORTS)} sports ground"
+        # Combining every sport into one phrase makes Google Text Search match
+        # the whole phrase too narrowly and can return only one facility. A
+        # broad venue query returns nearby turfs, arenas and courts; a selected
+        # sport remains an exact, more focused query.
+        query = f'{sport} ground' if sport else 'sports grounds, turf and sports arena'
         body = {'textQuery': query, 'maxResultCount': 20, 'locationBias': {'circle': {'center': {'latitude': latitude, 'longitude': longitude}, 'radius': min(radius_km * 1000, 50000)}}, 'languageCode': 'en'}
         request = Request('https://places.googleapis.com/v1/places:searchText', data=json.dumps(body).encode('utf-8'), headers={'Content-Type': 'application/json', 'X-Goog-Api-Key': api_key, 'X-Goog-FieldMask': 'places.id,places.displayName,places.formattedAddress,places.location,places.types,places.googleMapsUri'}, method='POST')
         try:

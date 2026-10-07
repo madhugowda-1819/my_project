@@ -642,6 +642,15 @@ class UniversalGroundsView(APIView):
             except requests.RequestException:
                 pass  # Return the cache if the public provider is unavailable.
             grounds = self._nearby_cached(latitude, longitude)
+            # Commercial facilities are often absent from OSM or are tagged
+            # only as sports clubs. When configured, Google Places fills this
+            # gap while the local database remains the fast read path.
+            if len(grounds) < self.cache_minimum and settings.GOOGLE_MAPS_PLACES_API_KEY:
+                try:
+                    self._refresh_from_google_places(latitude, longitude)
+                except MapsProviderError:
+                    pass
+                grounds = self._nearby_cached(latitude, longitude)
         payload = [{'id': ground.id, 'name': ground.name, 'sport': ground.sport,
                     'ground_type': ground.ground_type, 'latitude': ground.latitude,
                     'longitude': ground.longitude, 'distance_km': round(distance, 2)}
@@ -667,9 +676,9 @@ class UniversalGroundsView(APIView):
 
     def _refresh_from_overpass(self, latitude, longitude):
         query = ('[out:json][timeout:30];('
-                 f'node["leisure"~"^(pitch|sports_centre|stadium)$"](around:20000,{latitude},{longitude});'
-                 f'way["leisure"~"^(pitch|sports_centre|stadium)$"](around:20000,{latitude},{longitude});'
-                 f'rel["leisure"~"^(pitch|sports_centre|stadium)$"](around:20000,{latitude},{longitude});'
+                 f'nwr["leisure"~"^(pitch|sports_centre|stadium)$"]["name"](around:20000,{latitude},{longitude});'
+                 f'nwr["sport"~"^(cricket|football|soccer|badminton|tennis|table_tennis|volleyball|pickleball|basketball)$",i]["name"](around:20000,{latitude},{longitude});'
+                 f'nwr["club"="sport"]["name"](around:20000,{latitude},{longitude});'
                  ');out center tags;')
         response = requests.post(
             settings.OVERPASS_API_URL,
@@ -700,6 +709,38 @@ class UniversalGroundsView(APIView):
                           'ground_type': str(tags.get('leisure') or 'sports_ground'),
                           'sport': str(tags.get('sport') or tags.get('sport:1') or 'multi-sport'),
                           'latitude': element_latitude, 'longitude': element_longitude},
+            )
+
+    def _refresh_from_google_places(self, latitude, longitude):
+        """Cache configured Google Places results using the same API shape."""
+        for place in find_live_sports_grounds(
+            latitude=latitude, longitude=longitude, radius_km=self.radius_km,
+        ):
+            try:
+                place_latitude = float(place.get('latitude'))
+                place_longitude = float(place.get('longitude'))
+            except (TypeError, ValueError):
+                continue
+            if haversine_distance(latitude, longitude, place_latitude, place_longitude) > self.radius_km:
+                continue
+            place_id = str(place.get('id') or '').strip()
+            if not place_id:
+                continue
+            name = str(place.get('name') or 'Unnamed Sports Ground')
+            metadata = ' '.join([name, *(str(value) for value in place.get('types', []))]).lower()
+            sport = next((value for value in (
+                'cricket', 'football', 'badminton', 'tennis', 'table tennis',
+                'volleyball', 'pickleball', 'basketball',
+            ) if value in metadata), 'multi-sport')
+            SportsGround.objects.update_or_create(
+                osm_id=f'google/{place_id}',
+                defaults={
+                    'name': clean_google_maps_name(name),
+                    'ground_type': 'sports_centre',
+                    'sport': sport,
+                    'latitude': place_latitude,
+                    'longitude': place_longitude,
+                },
             )
 
 

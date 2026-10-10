@@ -19,8 +19,11 @@ from django.utils.encoding import force_bytes, force_str
 from django.core.mail import send_mail
 from django.conf import settings
 from django.core.cache import cache
+from django.urls import reverse
 from urllib.parse import urlencode
 import json
+import hashlib
+import hmac
 import math
 
 import requests
@@ -40,7 +43,7 @@ from .serializers import (
     PlayerRecommendationQuerySerializer,
     VenueSerializer, VenueDiscoveryQuerySerializer, VenueReviewCreateSerializer, VenueReviewSerializer,
     VenueAvailabilityQuerySerializer, CourtBookingCreateSerializer,
-    BookingCreateSerializer, BookingSerializer,
+    BookingCreateSerializer, BookingSerializer, RazorpayVerificationSerializer,
     MatchSerializer, MessageSerializer,
     NotificationSerializer, AvailabilityToggleSerializer,
     GroundSerializer, GroundDiscoverySerializer, AutoGameCreateSerializer, MatchCreateSerializer,
@@ -60,6 +63,7 @@ from .permissions import IsActiveAccount, IsPlatformAdmin, IsPlatformModerator, 
 from .services.accounts import AuthenticationService, UserService
 from .services.availability import VenueAvailabilityService
 from .services.bookings import BookingCancellationService, BookingService
+from .services.payments import PaymentService
 from .services.games import ACTIVE_GAME_STATUSES, GameLifecycleService, GameService
 from .services.game_matching import GameMatchingService
 from .services.chat import (
@@ -285,9 +289,9 @@ class AccountTokenRefreshView(TokenRefreshView):
 class MySportsView(APIView):
     permission_classes = [IsActiveAccount]
 
-    # def get(self, request):
-    #     sports = request.user.user_sports.select_related('sport').order_by('sport__name')
-    #     return Response({'success': True, 'data': UserSportSerializer(sports, many=True).data})
+    def get(self, request):
+        sports = request.user.user_sports.select_related('sport').order_by('-preferred', 'sport__name')
+        return Response({'success': True, 'data': UserSportSerializer(sports, many=True).data})
 
     def patch(self, request):
         serializer = UserSportWriteSerializer(data=request.data.get('sports', []), many=True)
@@ -551,7 +555,7 @@ class BookingListCreateView(generics.ListCreateAPIView):
     serializer_class = BookingSerializer
 
     def get_queryset(self):
-        queryset = CourtBooking.objects.filter(user=self.request.user).select_related('venue', 'court')
+        queryset = CourtBooking.objects.filter(user=self.request.user).select_related('venue', 'court', 'payment')
         status = self.request.query_params.get('status')
         date = self.request.query_params.get('date')
         venue = self.request.query_params.get('venue')
@@ -603,7 +607,7 @@ class BookingDetailView(generics.RetrieveAPIView):
     lookup_field = 'public_id'
 
     def get_queryset(self):
-        return CourtBooking.objects.filter(user=self.request.user).select_related('venue', 'court')
+        return CourtBooking.objects.filter(user=self.request.user).select_related('venue', 'court', 'payment')
 
 
 class BookingCancelView(APIView):
@@ -613,6 +617,65 @@ class BookingCancelView(APIView):
         booking = get_object_or_404(CourtBooking.objects.select_related('venue'), public_id=public_id)
         booking = BookingCancellationService.cancel(actor=request.user, booking=booking, reason=request.data.get('reason', ''))
         return Response({'success': True, 'data': BookingSerializer(booking).data})
+
+
+class PaymentStartView(APIView):
+    permission_classes = [IsActiveAccount]
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = 'booking'
+
+    def post(self, request):
+        serializer = BookingCreateSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        payment, key_id = PaymentService.start(user=request.user, booking_data=serializer.validated_data)
+        return Response({'success': True, 'data': {
+            'key_id': key_id, 'order_id': payment.provider_order_id, 'amount': payment.amount_paise,
+            'currency': payment.currency, 'booking': BookingSerializer(payment.booking).data,
+        }}, status=201)
+
+
+class PaymentVerifyView(APIView):
+    permission_classes = [IsActiveAccount]
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = 'booking'
+
+    def post(self, request):
+        serializer = RazorpayVerificationSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        payment = PaymentService.verify_checkout(user=request.user, **{
+            'provider_order_id': serializer.validated_data['razorpay_order_id'],
+            'provider_payment_id': serializer.validated_data['razorpay_payment_id'],
+            'signature': serializer.validated_data['razorpay_signature'],
+        })
+        return Response({'success': True, 'data': {'payment_status': payment.status, 'booking': BookingSerializer(payment.booking).data}})
+
+
+class RazorpayWebhookView(APIView):
+    """Public endpoint authenticated with Razorpay's webhook HMAC signature."""
+    permission_classes = [AllowAny]
+    authentication_classes = []
+
+    def post(self, request):
+        secret = settings.RAZORPAY_WEBHOOK_SECRET
+        signature = request.headers.get('X-Razorpay-Signature', '')
+        expected = hmac.new(secret.encode(), request.body, hashlib.sha256).hexdigest() if secret else ''
+        if not secret or not hmac.compare_digest(expected, signature):
+            return Response({'detail': 'Invalid webhook signature.'}, status=400)
+        try:
+            payload = json.loads(request.body.decode('utf-8'))
+            payment_entity = payload['payload']['payment']['entity']
+            order_id = payment_entity['order_id']
+            event = payload['event']
+            if event == 'payment.captured':
+                PaymentService.capture(provider_order_id=order_id, provider_payment_id=payment_entity['id'])
+            elif event == 'payment.failed':
+                PaymentService.fail(provider_order_id=order_id, reason=payment_entity.get('error_description', 'Payment failed.'))
+        except (KeyError, ValueError):
+            return Response({'detail': 'Invalid webhook payload.'}, status=400)
+        except Exception:
+            # A duplicate or late event should be retried by Razorpay, not exposed to clients.
+            return Response({'detail': 'Webhook processing failed.'}, status=500)
+        return Response({'success': True})
 
 
 # ---------------- OSM NEARBY GROUNDS ----------------
@@ -637,27 +700,37 @@ class UniversalGroundsView(APIView):
         # receive locally cached results immediately instead of queueing behind
         # the same public API request.
         refresh_key = self._refresh_cache_key(latitude, longitude)
-        should_refresh = len(grounds) < self.cache_minimum and cache.add(
+        # When a Google Places key is configured, refresh from Google even if
+        # OSM already has enough records: ratings and licensed photos only
+        # exist on the Google records. Without a key, retain the free OSM
+        # fallback's sparse-cache behaviour.
+        provider_refresh_needed = bool(settings.GOOGLE_MAPS_PLACES_API_KEY) or len(grounds) < self.cache_minimum
+        should_refresh = provider_refresh_needed and cache.add(
             refresh_key, True, timeout=self.refresh_cooldown_seconds,
         )
         if should_refresh:
-            try:
-                self._refresh_from_overpass(latitude, longitude)
-            except requests.RequestException:
-                pass  # Return the cache if the public provider is unavailable.
-            grounds = self._nearby_cached(latitude, longitude)
-            # Commercial facilities are often absent from OSM or are tagged
-            # only as sports clubs. When configured, Google Places fills this
-            # gap while the local database remains the fast read path.
-            if len(grounds) < self.cache_minimum and settings.GOOGLE_MAPS_PLACES_API_KEY:
+            if settings.GOOGLE_MAPS_PLACES_API_KEY:
                 try:
                     self._refresh_from_google_places(latitude, longitude)
                 except MapsProviderError:
                     pass
-                grounds = self._nearby_cached(latitude, longitude)
+            else:
+                try:
+                    self._refresh_from_overpass(latitude, longitude)
+                except requests.RequestException:
+                    pass  # Return the cache if the public provider is unavailable.
+            grounds = self._nearby_cached(latitude, longitude)
         payload = [{'id': ground.id, 'name': ground.name, 'sport': ground.sport,
                     'ground_type': ground.ground_type, 'latitude': ground.latitude,
-                    'longitude': ground.longitude, 'distance_km': round(distance, 2)}
+                    'longitude': ground.longitude, 'distance_km': round(distance, 2),
+                    # Ratings and photos are only populated for results that
+                    # came from Google Places.  The client deliberately uses
+                    # our photo proxy so the Places key never reaches a device.
+                    'google_rating': ground.google_rating,
+                    'google_rating_count': ground.google_rating_count,
+                    'photo_url': request.build_absolute_uri(
+                        reverse('ground-photo', args=[ground.id])
+                    ) if ground.google_photo_name else None}
                    for ground, distance in grounds]
         return Response({'count': len(payload), 'radius_km': self.radius_km, 'grounds': payload})
 
@@ -736,6 +809,14 @@ class UniversalGroundsView(APIView):
                 'cricket', 'football', 'badminton', 'tennis', 'table tennis',
                 'volleyball', 'pickleball', 'basketball',
             ) if value in metadata), 'multi-sport')
+            try:
+                rating = float(place['rating']) if place.get('rating') is not None else None
+            except (TypeError, ValueError):
+                rating = None
+            try:
+                rating_count = int(place['ratingCount']) if place.get('ratingCount') is not None else None
+            except (TypeError, ValueError):
+                rating_count = None
             SportsGround.objects.update_or_create(
                 osm_id=f'google/{place_id}',
                 defaults={
@@ -744,8 +825,45 @@ class UniversalGroundsView(APIView):
                     'sport': sport,
                     'latitude': place_latitude,
                     'longitude': place_longitude,
+                    'google_rating': rating,
+                    'google_rating_count': rating_count,
+                    'google_photo_name': str(place.get('photoName') or '')[:512],
                 },
             )
+
+
+class SportsGroundPhotoView(APIView):
+    """Serve one Google Places photo without exposing the server API key."""
+
+    permission_classes = [AllowAny]
+    authentication_classes = []
+
+    def get(self, request, ground_id):
+        ground = get_object_or_404(SportsGround, pk=ground_id)
+        photo_name = ground.google_photo_name
+        if (not settings.GOOGLE_MAPS_PLACES_API_KEY or
+                not photo_name.startswith('places/') or '/photos/' not in photo_name):
+            return Response({'detail': 'Ground photo unavailable.'}, status=404)
+
+        try:
+            photo_response = requests.get(
+                f'https://places.googleapis.com/v1/{photo_name}/media',
+                params={'maxHeightPx': 480, 'skipHttpRedirect': 'false'},
+                headers={'X-Goog-Api-Key': settings.GOOGLE_MAPS_PLACES_API_KEY},
+                timeout=(3, settings.MAPS_PROVIDER_TIMEOUT_SECONDS),
+                allow_redirects=True,
+            )
+            photo_response.raise_for_status()
+        except requests.RequestException:
+            return Response({'detail': 'Ground photo is temporarily unavailable.'}, status=503)
+
+        content_type = photo_response.headers.get('Content-Type', '')
+        if not content_type.startswith('image/'):
+            return Response({'detail': 'Ground photo is temporarily unavailable.'}, status=503)
+        response = HttpResponse(photo_response.content, content_type=content_type)
+        # Google Places photo content must not be stored as a persistent local cache.
+        response['Cache-Control'] = 'no-store'
+        return response
 
 
 # ---------------- GROUNDS ----------------
@@ -1929,13 +2047,21 @@ class AiMatchView(APIView):
 
     def get(self, request):
         user = request.user
+        # AI recommendations must never leak unrelated sports into a player's
+        # feed. Prefer skill-profile sports; use sign-up sports for older
+        # accounts that have not yet completed the skill profile.
+        sport_ids = list(user.user_sports.filter(sport__is_active=True).values_list('sport_id', flat=True))
+        if not sport_ids:
+            sport_ids = list(user.sports.filter(is_active=True).values_list('id', flat=True))
+        if not sport_ids:
+            return Response([])
 
         user_lat = user.latitude
         user_lng = user.longitude
 
         # fallback if no location
         matches = Match.objects.select_related('sport', 'ground', 'organizer').prefetch_related('joined_players').filter(
-            status='upcoming', date_time__gte=timezone.now()
+            status='upcoming', date_time__gte=timezone.now(), sport_id__in=sport_ids,
         ).annotate(players_count=Count('joined_players'))
 
         if user_lat is None or user_lng is None:
@@ -1990,6 +2116,10 @@ class AutoGameCreateView(APIView):
         serializer = AutoGameCreateSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
+        if 'latitude' in data:
+            request.user.latitude = data['latitude']
+            request.user.longitude = data['longitude']
+            request.user.save(update_fields=['latitude', 'longitude'])
         radius = data.get('radius')
         if radius is None:
             radius = getattr(getattr(request.user, 'profile', None), 'preferred_distance', 15)

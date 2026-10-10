@@ -311,6 +311,27 @@ class CourtBooking(TimestampedPublicModel):
         indexes += [models.Index(fields=['user', 'status', 'booking_date'], name='booking_user_status_date_idx')]
 
 
+class PaymentTransaction(TimestampedPublicModel):
+    class Status(models.TextChoices):
+        CREATED = 'created', 'Created'
+        AUTHORIZED = 'authorized', 'Authorized'
+        CAPTURED = 'captured', 'Captured'
+        FAILED = 'failed', 'Failed'
+
+    booking = models.OneToOneField(CourtBooking, on_delete=models.PROTECT, related_name='payment')
+    provider = models.CharField(max_length=32, default='razorpay')
+    provider_order_id = models.CharField(max_length=64, unique=True, db_index=True)
+    provider_payment_id = models.CharField(max_length=64, unique=True, null=True, blank=True)
+    amount_paise = models.PositiveIntegerField()
+    currency = models.CharField(max_length=3, default='INR')
+    status = models.CharField(max_length=16, choices=Status.choices, default=Status.CREATED, db_index=True)
+    captured_at = models.DateTimeField(null=True, blank=True)
+    failure_reason = models.CharField(max_length=255, blank=True)
+
+    class Meta:
+        indexes = [models.Index(fields=['status', 'created_at'], name='payment_status_created_idx')]
+
+
 class VenueCancellationPolicy(TimestampedPublicModel):
     venue = models.OneToOneField(Venue, on_delete=models.CASCADE, related_name='cancellation_policy')
     minimum_cancellation_hours = models.PositiveIntegerField(default=0)
@@ -404,6 +425,9 @@ class SportsGround(models.Model):
     sport = models.CharField(max_length=100, db_index=True)
     latitude = models.FloatField(db_index=True)
     longitude = models.FloatField(db_index=True)
+    google_rating = models.FloatField(null=True, blank=True)
+    google_rating_count = models.PositiveIntegerField(null=True, blank=True)
+    google_photo_name = models.CharField(max_length=512, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 

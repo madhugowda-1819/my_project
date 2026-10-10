@@ -4,6 +4,13 @@ from . import views
 urlpatterns = [
     path('', views.api_root_landing),
     path('health/', views.health_check),
+    path('bookings/', views.BookingListCreateView.as_view()),
+    path('bookings/quote/', views.BookingQuoteView.as_view()),
+    path('bookings/<uuid:public_id>/', views.BookingDetailView.as_view()),
+    path('bookings/<uuid:public_id>/cancel/', views.BookingCancelView.as_view()),
+    path('payments/razorpay/start/', views.PaymentStartView.as_view()),
+    path('payments/razorpay/verify/', views.PaymentVerifyView.as_view()),
+    path('payments/razorpay/webhook/', views.RazorpayWebhookView.as_view()),
     path('search/', views.GlobalSearchView.as_view()),
     path('search/suggestions/', views.SearchSuggestionsView.as_view()),
     # ---------------- REPORTS & PLATFORM MODERATION ----------------
@@ -31,9 +38,13 @@ urlpatterns = [
     path('users/me/progress/', views.MyProgressView.as_view()),
     path('me/', views.MeView.as_view()),  # legacy
 
-    # Legacy alias for venue discovery. Keep `/grounds/` reserved for the
-    # dedicated ground endpoint below, which accepts `lat` and `lng`.
+    # Bookable venues. Keep `/grounds/` reserved for the separate OSM-ground
+    # discovery resource, which is not itself a reservable court inventory.
+    path('venues/', views.VenueListView.as_view()),
+    path('venues/search/', views.VenueSearchView.as_view()),
     path('venues/nearby/', views.VenueNearbyView.as_view()),
+    path('venues/<uuid:public_id>/', views.VenueDetailView.as_view()),
+    path('venues/<uuid:public_id>/availability/', views.VenueAvailabilityView.as_view()),
 
     # ---------------- PLAYERS ----------------
     path('players/', views.PlayerListView.as_view()),        # ✅ list first
@@ -56,6 +67,7 @@ urlpatterns = [
 
     # ---------------- GROUNDS ----------------
     path('grounds/nearby/', views.UniversalGroundsView.as_view()),
+    path('grounds/<int:ground_id>/photo/', views.SportsGroundPhotoView.as_view(), name='ground-photo'),
     path('grounds/discover/', views.GroundDiscoveryView.as_view()),
     path('grounds/', views.GroundListView.as_view()),
     path('grounds/live/', views.LiveGroundListView.as_view()),

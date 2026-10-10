@@ -45,7 +45,7 @@ def find_live_sports_grounds(*, latitude, longitude, sport=None, radius_km=10):
         # sport remains an exact, more focused query.
         query = f'{sport} ground' if sport else 'sports grounds, turf and sports arena'
         body = {'textQuery': query, 'maxResultCount': 20, 'locationBias': {'circle': {'center': {'latitude': latitude, 'longitude': longitude}, 'radius': min(radius_km * 1000, 50000)}}, 'languageCode': 'en'}
-        request = Request('https://places.googleapis.com/v1/places:searchText', data=json.dumps(body).encode('utf-8'), headers={'Content-Type': 'application/json', 'X-Goog-Api-Key': api_key, 'X-Goog-FieldMask': 'places.id,places.displayName,places.formattedAddress,places.location,places.types,places.googleMapsUri'}, method='POST')
+        request = Request('https://places.googleapis.com/v1/places:searchText', data=json.dumps(body).encode('utf-8'), headers={'Content-Type': 'application/json', 'X-Goog-Api-Key': api_key, 'X-Goog-FieldMask': 'places.id,places.displayName,places.formattedAddress,places.location,places.types,places.googleMapsUri,places.rating,places.userRatingCount,places.photos'}, method='POST')
         try:
             with urlopen(request, timeout=settings.MAPS_PROVIDER_TIMEOUT_SECONDS) as response:
                 payload = json.loads(response.read().decode('utf-8'))
@@ -53,7 +53,7 @@ def find_live_sports_grounds(*, latitude, longitude, sport=None, radius_km=10):
             raise MapsProviderError(f'Google Places request failed ({error.code}).') from error
         except (URLError, TimeoutError) as error:
             raise MapsProviderError('Google Places could not be reached.') from error
-        results = [{'id': place.get('id'), 'name': place.get('displayName', {}).get('text', 'Sports ground'), 'address': place.get('formattedAddress', ''), 'latitude': place.get('location', {}).get('latitude'), 'longitude': place.get('location', {}).get('longitude'), 'types': place.get('types', []), 'mapsUrl': place.get('googleMapsUri'), 'source': 'google_maps_live'} for place in payload.get('places', [])]
+        results = [{'id': place.get('id'), 'name': place.get('displayName', {}).get('text', 'Sports ground'), 'address': place.get('formattedAddress', ''), 'latitude': place.get('location', {}).get('latitude'), 'longitude': place.get('location', {}).get('longitude'), 'types': place.get('types', []), 'mapsUrl': place.get('googleMapsUri'), 'rating': place.get('rating'), 'ratingCount': place.get('userRatingCount'), 'photoName': (place.get('photos') or [{}])[0].get('name', ''), 'source': 'google_maps_live'} for place in payload.get('places', [])]
     cache.set(cache_key, results, settings.GROUND_SEARCH_CACHE_SECONDS)
     return results
 

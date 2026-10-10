@@ -221,6 +221,11 @@ EMAIL_HOST_USER = env('EMAIL_HOST_USER', '')
 EMAIL_HOST_PASSWORD = env('EMAIL_HOST_PASSWORD', '')
 DEFAULT_FROM_EMAIL = env('DEFAULT_FROM_EMAIL', 'noreply@sportmate.com')
 
+# Razorpay credentials are server-only; never put either secret in Flutter.
+RAZORPAY_KEY_ID = env('RAZORPAY_KEY_ID', '')
+RAZORPAY_KEY_SECRET = env('RAZORPAY_KEY_SECRET', '')
+RAZORPAY_WEBHOOK_SECRET = env('RAZORPAY_WEBHOOK_SECRET', '')
+
 # Court-backed game discovery/lifecycle tuning. These values are deliberately
 # environment-controlled so capacity policy can change without code changes.
 GAME_ALMOST_FULL_SLOTS_THRESHOLD = int(env('GAME_ALMOST_FULL_SLOTS_THRESHOLD', '1'))

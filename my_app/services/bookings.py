@@ -158,7 +158,7 @@ class BookingService:
 
     @classmethod
     @transaction.atomic
-    def create(cls, *, user, venue_id, court_id, booking_date, start_time, end_time):
+    def create(cls, *, user, venue_id, court_id, booking_date, start_time, end_time, status=CourtBooking.Status.CONFIRMED):
         try:
             venue = Venue.objects.select_for_update().get(public_id=venue_id)
         except Venue.DoesNotExist as exc:
@@ -177,7 +177,7 @@ class BookingService:
                 return CourtBooking.objects.create(
                     user=user, venue=venue, court=court, booking_date=booking_date,
                     start_time=start_time, end_time=end_time, starts_at=starts_at, ends_at=ends_at,
-                    booking_reference=cls._reference(), status=CourtBooking.Status.CONFIRMED, **prices,
+                    booking_reference=cls._reference(), status=status, **prices,
                 )
             except IntegrityError:
                 continue

@@ -150,6 +150,13 @@ class AutoGameCreateSerializer(serializers.Serializer):
         source='sport', queryset=Sport.objects.filter(is_active=True), required=False,
     )
     radius = serializers.FloatField(min_value=0.1, max_value=100, required=False)
+    latitude = serializers.FloatField(min_value=-90, max_value=90, required=False)
+    longitude = serializers.FloatField(min_value=-180, max_value=180, required=False)
+
+    def validate(self, attrs):
+        if ('latitude' in attrs) != ('longitude' in attrs):
+            raise serializers.ValidationError('latitude and longitude must be supplied together.')
+        return attrs
 
 
 class NearbySearchSerializer(serializers.Serializer):
@@ -220,6 +227,7 @@ class VenueSerializer(serializers.ModelSerializer):
 class VenueDiscoveryQuerySerializer(NearbySearchSerializer):
     latitude = serializers.FloatField(min_value=-90, max_value=90, required=False)
     longitude = serializers.FloatField(min_value=-180, max_value=180, required=False)
+    longitude = serializers.FloatField(min_value=-180, max_value=180, required=False)
     radius = serializers.FloatField(min_value=0.1, max_value=500, required=False, default=15)
     city = serializers.CharField(required=False)
     min_rating = serializers.DecimalField(max_digits=3, decimal_places=2, min_value=0, max_value=5, required=False)
@@ -259,19 +267,30 @@ class BookingCreateSerializer(serializers.Serializer):
     end_time = serializers.TimeField()
 
 
+class RazorpayVerificationSerializer(serializers.Serializer):
+    razorpay_order_id = serializers.CharField(max_length=64)
+    razorpay_payment_id = serializers.CharField(max_length=64)
+    razorpay_signature = serializers.CharField(max_length=128)
+
+
 class BookingSerializer(serializers.ModelSerializer):
     venue_id = serializers.UUIDField(source='venue.public_id', read_only=True)
     court_id = serializers.UUIDField(source='court.public_id', read_only=True)
     venue_name = serializers.CharField(source='venue.name', read_only=True)
     court_name = serializers.CharField(source='court.name', read_only=True)
+    payment_status = serializers.SerializerMethodField()
 
     class Meta:
         model = CourtBooking
         fields = [
             'public_id', 'booking_reference', 'venue_id', 'venue_name', 'court_id', 'court_name',
             'booking_date', 'start_time', 'end_time', 'base_price', 'additional_fees', 'discount',
-            'final_amount', 'status', 'cancellation_reason', 'cancelled_at', 'created_at', 'updated_at',
+            'final_amount', 'status', 'payment_status', 'cancellation_reason', 'cancelled_at', 'created_at', 'updated_at',
         ]
+
+    def get_payment_status(self, obj):
+        payment = getattr(obj, 'payment', None)
+        return payment.status if payment else None
 
 
 # ------------------------------------------------------------------

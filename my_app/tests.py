@@ -79,6 +79,7 @@ class MatchApiTests(APITestCase):
         self.assertEqual(response.data['error']['code'], 'VALIDATION_ERROR')
 
     def test_ai_recommendations_return_paginated_matches(self):
+        UserSport.objects.create(user=self.player, sport=self.sport, skill_level='intermediate', preferred=True)
         Match.objects.create(
             sport=self.sport, ground=self.ground, organizer=self.organizer,
             date_time=timezone.now() + timedelta(days=1), total_players=2,
@@ -86,8 +87,18 @@ class MatchApiTests(APITestCase):
         self.client.force_authenticate(self.player)
         response = self.client.get('/api/v1/ai/matches/')
         self.assertEqual(response.status_code, 200)
-        self.assertTrue(response.data['success'])
-        self.assertEqual(response.data['count'], 1)
+        self.assertEqual(len(response.data), 1)
+
+    def test_ai_recommendations_exclude_sports_not_in_player_profile(self):
+        cricket = Sport.objects.get(name='Cricket')
+        UserSport.objects.create(user=self.player, sport=self.sport, skill_level='intermediate', preferred=True)
+        Match.objects.create(sport=self.sport, ground=self.ground, organizer=self.organizer, date_time=timezone.now() + timedelta(days=1), total_players=2)
+        Match.objects.create(sport=cricket, ground=self.ground, organizer=self.organizer, date_time=timezone.now() + timedelta(days=1), total_players=2)
+        self.client.force_authenticate(self.player)
+        response = self.client.get('/api/v1/ai/matches/')
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.data), 1)
+        self.assertEqual(response.data[0]['sportName'], self.sport.name)
 
 
 class AuthenticationApiTests(APITestCase):

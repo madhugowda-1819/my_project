@@ -18,15 +18,25 @@ AUTO_GAME_DURATION_MINUTES = 60
 class AutoGameService:
     @staticmethod
     def _sports_for(user, sport=None):
+        entries = UserSport.objects.filter(user=user, sport__is_active=True).select_related('sport')
         if sport:
-            if not UserSport.objects.filter(user=user, sport=sport).exists():
-                raise ValidationError({'sport_id': ['Add this sport to your player profile first.']})
-            return [sport]
-        entries = UserSport.objects.filter(user=user, sport__is_active=True).select_related('sport').order_by('-preferred', 'sport__name')
-        sports = [entry.sport for entry in entries]
-        if not sports:
+            entry = entries.filter(sport=sport).first()
+            if entry:
+                return [entry]
+            # Accounts created before the skill-profile flow have sports from
+            # sign-up only. Promote the selected sport with a transparent
+            # beginner default so auto-create works and can be refined later.
+            if user.sports.filter(pk=sport.pk, is_active=True).exists():
+                entry, _ = UserSport.objects.get_or_create(user=user, sport=sport, defaults={'skill_level': UserSport.SkillLevel.BEGINNER})
+                return [entry]
+            raise ValidationError({'sport_id': ['Add this sport to your player profile first.']})
+        entries = list(entries.order_by('-preferred', 'sport__name'))
+        if not entries:
+            legacy_sports = user.sports.filter(is_active=True).order_by('name')
+            entries = [UserSport.objects.get_or_create(user=user, sport=item, defaults={'skill_level': UserSport.SkillLevel.BEGINNER})[0] for item in legacy_sports]
+        if not entries:
             raise ValidationError({'sport_id': ['Add at least one sport to your player profile first.']})
-        return sports
+        return entries
 
     @staticmethod
     def _preferred_slot(slot, preferences):
@@ -60,8 +70,8 @@ class AutoGameService:
         if not venues:
             raise ValidationError({'location': ['No verified active venues were found within your selected distance.']})
 
-        for selected_sport in cls._sports_for(user, sport):
-            user_sport = UserSport.objects.get(user=user, sport=selected_sport)
+        for user_sport in cls._sports_for(user, sport):
+            selected_sport = user_sport.sport
             for venue in venues:
                 courts = [court for court in venue.courts.all() if court.active and court.sport_id == selected_sport.id]
                 for day_offset in range(AUTO_GAME_DAYS_AHEAD + 1):

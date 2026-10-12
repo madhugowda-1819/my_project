@@ -18,6 +18,10 @@ urlpatterns = [
     path('reports/<uuid:public_id>/', views.ReportDetailView.as_view()),
     path('admin/dashboard/', views.AdminDashboardView.as_view()),
     path('admin/users/', views.AdminUsersView.as_view()),
+    path('admin/access/users/', views.AccessManagementView.as_view()),
+    path('admin/access/users/<uuid:public_id>/', views.AccessManagementView.as_view()),
+    path('admin/venue-owner-applications/<uuid:public_id>/', views.VenueOwnerApplicationReviewView.as_view()),
+    path('admin/venue-owner-applications/', views.VenueOwnerApplicationReviewView.as_view()),
     path('admin/reports/', views.AdminReportsView.as_view()),
     path('admin/moderation/actions/', views.AdminModerationActionsView.as_view()),
     path('admin/statistics/', views.AdminStatisticsView.as_view()),
@@ -36,6 +40,7 @@ urlpatterns = [
     path('users/me/rewards/', views.MyRewardsView.as_view()),
     path('users/me/level/', views.MyLevelView.as_view()),
     path('users/me/progress/', views.MyProgressView.as_view()),
+    path('users/me/venue-owner-applications/', views.VenueOwnerApplicationView.as_view()),
     path('me/', views.MeView.as_view()),  # legacy
 
     # Bookable venues. Keep `/grounds/` reserved for the separate OSM-ground
@@ -53,10 +58,13 @@ urlpatterns = [
     path('recommendations/players/', views.PlayerRecommendationView.as_view()),
     path('players/<int:pk>/', views.PlayerDetailView.as_view()),
     path('players/<uuid:public_id>/ratings/', views.PlayerRatingsView.as_view()),
+    path('players/<uuid:public_id>/rating-summary/', views.PlayerRatingSummaryView.as_view()),
+    path('players/<uuid:public_id>/rating-eligibility/', views.PlayerRatingEligibilityView.as_view()),
     path('players/<uuid:public_id>/achievements/', views.UserAchievementsView.as_view()),
     path('players/<uuid:public_id>/statistics/', views.PlayerStatisticsView.as_view()),
     path('players/<uuid:public_id>/statistics/<int:sport_id>/', views.PlayerStatisticsView.as_view()),
     path('ratings/<uuid:public_id>/', views.RatingDetailView.as_view()),
+    path('games/<uuid:public_id>/rating-status/', views.GameRatingStatusView.as_view()),
     path('leaderboards/', views.LeaderboardView.as_view()),
 
     # ---------------- SPORTS ----------------
@@ -76,6 +84,9 @@ urlpatterns = [
     path('matches/', views.MatchListView.as_view()),
     path('matches/create/', views.CreateMatchView.as_view()),
     path('matches/<int:match_id>/join/', views.JoinMatchView.as_view()),
+    path('matches/<int:match_id>/leave/', views.LeaveMatchView.as_view()),
+    path('matches/<int:match_id>/participants/', views.MatchParticipantsView.as_view()),
+    path('matches/<int:match_id>/participants/<int:user_id>/remove/', views.RemoveMatchParticipantView.as_view()),
 
     # ---------------- COURT-BACKED GAMES ----------------
     path('games/', views.GameListCreateView.as_view()),

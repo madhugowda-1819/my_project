@@ -7,7 +7,7 @@ from datetime import timedelta
 from unittest.mock import patch
 from rest_framework.test import APITestCase
 
-from .models import Ground, Match, PlayerProfile, Sport, UserSport, UserBlock, Venue, VenueSport, Court, VenueAmenity, CourtBooking, VenueReview, CourtBlockedPeriod, Game, GamePlayer, Conversation, ConversationMember, Message, Community, CommunityMember, CommunityPostLike, Event, EventParticipant, Tournament, Notification, UserDevice, RecommendationProfile, Report, ModerationAction
+from .models import Ground, Match, PlayerProfile, Sport, UserSport, UserBlock, Venue, VenueSport, Court, VenueAmenity, CourtBooking, VenueReview, CourtBlockedPeriod, Game, GamePlayer, Conversation, ConversationMember, Message, Community, CommunityMember, CommunityPostLike, Event, EventParticipant, Tournament, Notification, UserDevice, RecommendationProfile, Report, ModerationAction, PlayerRating
 from .services.locations import nearby_queryset
 from .services.ground_ingestion import GroundIngestionService
 from .services.player_matching import PlayerMatchingService
@@ -70,6 +70,53 @@ class MatchApiTests(APITestCase):
         self.assertEqual(second_join.status_code, 200)
         self.assertEqual(Match.objects.get(pk=match_id).joined_count(), 1)
         self.assertEqual(self.organizer.notifications.count(), 1)
+
+    def test_expired_match_cannot_be_joined(self):
+        match = Match.objects.create(
+            sport=self.sport, ground=self.ground, organizer=self.organizer,
+            date_time=timezone.now() - timedelta(minutes=1), total_players=2,
+        )
+        self.client.force_authenticate(self.player)
+
+        response = self.client.post(f'/api/v1/matches/{match.id}/join/')
+
+        self.assertEqual(response.status_code, 409)
+        self.assertIn('expired', response.data['error']['message'].lower())
+        self.assertEqual(match.joined_count(), 0)
+
+    def test_cannot_create_match_in_the_past(self):
+        self.client.force_authenticate(self.organizer)
+        response = self.client.post('/api/v1/matches/create/', {
+            'sport': self.sport.id,
+            'ground': self.ground.id,
+            'date_time': (timezone.now() - timedelta(minutes=1)).isoformat(),
+            'total_players': 2,
+        }, format='json')
+        self.assertEqual(response.status_code, 400)
+
+    def test_player_can_leave_upcoming_match_and_reopen_slot(self):
+        match = Match.objects.create(sport=self.sport, ground=self.ground, organizer=self.organizer, date_time=timezone.now() + timedelta(days=1), total_players=1)
+        match.joined_players.add(self.player)
+        self.client.force_authenticate(self.player)
+        response = self.client.post(f'/api/v1/matches/{match.id}/leave/')
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(Match.objects.get(pk=match.pk).joined_count(), 0)
+        again = self.client.post(f'/api/v1/matches/{match.id}/leave/')
+        self.assertEqual(again.status_code, 409)
+
+    def test_only_organizer_can_remove_participant_and_notification_is_idempotent(self):
+        match = Match.objects.create(sport=self.sport, ground=self.ground, organizer=self.organizer, date_time=timezone.now() + timedelta(days=1), total_players=2)
+        match.joined_players.add(self.player)
+        self.client.force_authenticate(self.player)
+        denied = self.client.post(f'/api/v1/matches/{match.id}/participants/{self.organizer.id}/remove/')
+        self.assertEqual(denied.status_code, 403)
+        self.client.force_authenticate(self.organizer)
+        removed = self.client.post(f'/api/v1/matches/{match.id}/participants/{self.player.id}/remove/', {'reason': 'Roster changed'}, format='json')
+        self.assertEqual(removed.status_code, 200)
+        self.assertEqual(self.player.notifications.filter(title='Removed from match').count(), 1)
+        repeated = self.client.post(f'/api/v1/matches/{match.id}/participants/{self.player.id}/remove/')
+        self.assertEqual(repeated.status_code, 409)
+        self.assertEqual(self.player.notifications.filter(title='Removed from match').count(), 1)
 
     def test_validation_errors_use_standard_envelope(self):
         self.client.force_authenticate(self.organizer)
@@ -668,6 +715,51 @@ class GameApiTests(APITestCase):
         self.assertEqual(players.status_code, 200)
         self.assertNotIn('email', players.data['results'][0]['player'])
         self.assertNotIn('latitude', players.data['results'][0]['player'])
+
+
+class PlayerRatingApiTests(APITestCase):
+    def setUp(self):
+        self.reviewer = User.objects.create_user(username='rating-reviewer', email='rating-reviewer@example.com', password='StrongPass!123')
+        self.player = User.objects.create_user(username='rating-player', email='rating-player@example.com', password='StrongPass!123')
+        self.outsider = User.objects.create_user(username='rating-outsider', email='rating-outsider@example.com', password='StrongPass!123')
+        for user in (self.reviewer, self.player, self.outsider): PlayerProfile.objects.create(user=user)
+        sport = Sport.objects.get(name='Badminton')
+        venue = Venue.objects.create(name='Rating Arena', address='7 Rating Road', city='Bengaluru', latitude=12.9716, longitude=77.5946, opening_time='09:00', closing_time='20:00', timezone='Asia/Kolkata')
+        court = Court.objects.create(venue=venue, sport=sport, name='Rating Court', capacity=4, price_per_hour=500)
+        start = timezone.now() - timedelta(hours=2)
+        self.game = Game.objects.create(game_reference='GM-RATING', host=self.reviewer, sport=sport, venue=venue, court=court, game_date=start.date(), start_time=start.time(), end_time=(start + timedelta(hours=1)).time(), starts_at=start, ends_at=start + timedelta(hours=1), min_players=2, max_players=4, status=Game.Status.COMPLETED)
+        GamePlayer.objects.create(game=self.game, user=self.reviewer)
+        GamePlayer.objects.create(game=self.game, user=self.player)
+        self.client.force_authenticate(self.reviewer)
+
+    def payload(self, **changes):
+        data = {'game_id': str(self.game.public_id), 'playing_performance': 5, 'teamwork': 4, 'sportsmanship': 5, 'punctuality': 4, 'review': 'A supportive teammate.'}
+        data.update(changes)
+        return data
+
+    def test_valid_rating_duplicate_and_summary(self):
+        url = f'/api/v1/players/{self.player.public_id}/ratings/'
+        created = self.client.post(url, self.payload(), format='json')
+        duplicate = self.client.post(url, self.payload(), format='json')
+        self.assertEqual(created.status_code, 201)
+        self.assertEqual(float(created.data['data']['rating']), 4.5)
+        self.assertEqual(duplicate.status_code, 400)
+        summary = self.client.get(f'/api/v1/players/{self.player.public_id}/rating-summary/')
+        self.assertEqual(summary.data['data']['rating_count'], 1)
+        self.assertEqual(summary.data['data']['teamwork'], 4.0)
+
+    def test_self_outsider_and_invalid_score_are_rejected(self):
+        self.assertEqual(self.client.post(f'/api/v1/players/{self.reviewer.public_id}/ratings/', self.payload(), format='json').status_code, 400)
+        self.client.force_authenticate(self.outsider)
+        self.assertEqual(self.client.post(f'/api/v1/players/{self.player.public_id}/ratings/', self.payload(), format='json').status_code, 403)
+        self.client.force_authenticate(self.reviewer)
+        self.assertEqual(self.client.post(f'/api/v1/players/{self.player.public_id}/ratings/', self.payload(teamwork=6), format='json').status_code, 400)
+
+    def test_incomplete_game_is_not_eligible(self):
+        self.game.status = Game.Status.OPEN
+        self.game.save(update_fields=['status', 'updated_at'])
+        response = self.client.post(f'/api/v1/players/{self.player.public_id}/ratings/', self.payload(), format='json')
+        self.assertEqual(response.status_code, 403)
 
 
 class GameMatchingServiceTests(APITestCase):

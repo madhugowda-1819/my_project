@@ -4,6 +4,14 @@ from django.utils import timezone
 
 MODERATOR_GROUPS = {'SportMate Moderators', 'SportMate Admins', 'SportMate Support'}
 ADMIN_GROUPS = {'SportMate Admins'}
+VENUE_OWNER_GROUP = 'SportMate Venue Owners'
+COMMUNITY_MODERATOR_GROUP = 'SportMate Community Moderators'
+
+
+def is_venue_owner(user):
+    return bool(user and user.is_authenticated and (
+        user.is_superuser or user.groups.filter(name__in={VENUE_OWNER_GROUP, *ADMIN_GROUPS}).exists()
+    ))
 
 
 def has_platform_role(user, groups):

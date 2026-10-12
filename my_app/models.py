@@ -210,6 +210,7 @@ class Venue(TimestampedPublicModel):
         'Ground', null=True, blank=True, on_delete=models.SET_NULL,
         related_name='verified_venue',
     )
+    owner = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.SET_NULL, related_name='owned_venues')
     name = models.CharField(max_length=200)
     description = models.TextField(blank=True)
     address = models.CharField(max_length=255)
@@ -414,6 +415,30 @@ class Ground(models.Model):
             models.CheckConstraint(check=models.Q(latitude__gte=-90, latitude__lte=90), name='ground_latitude_is_valid'),
             models.CheckConstraint(check=models.Q(longitude__gte=-180, longitude__lte=180), name='ground_longitude_is_valid'),
         ]
+
+
+class VenueOwnerApplication(TimestampedPublicModel):
+    class Status(models.TextChoices):
+        PENDING = 'pending', 'Pending'
+        APPROVED = 'approved', 'Approved'
+        REJECTED = 'rejected', 'Rejected'
+
+    applicant = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='venue_owner_applications')
+    business_name = models.CharField(max_length=200)
+    phone = models.CharField(max_length=20)
+    city = models.CharField(max_length=100)
+    address = models.CharField(max_length=255)
+    status = models.CharField(max_length=16, choices=Status.choices, default=Status.PENDING, db_index=True)
+    reviewed_by = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.SET_NULL, related_name='reviewed_venue_owner_applications')
+    review_note = models.CharField(max_length=500, blank=True)
+
+
+class RoleAuditLog(TimestampedPublicModel):
+    actor = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, on_delete=models.SET_NULL, related_name='role_audit_actions')
+    target_user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='role_audit_entries')
+    role = models.CharField(max_length=64)
+    action = models.CharField(max_length=16)
+    reason = models.CharField(max_length=500, blank=True)
 
 
 class SportsGround(models.Model):
@@ -907,9 +932,16 @@ class PlayerRating(TimestampedPublicModel):
     reviewer=models.ForeignKey(settings.AUTH_USER_MODEL,on_delete=models.CASCADE,related_name='ratings_given')
     player=models.ForeignKey(settings.AUTH_USER_MODEL,on_delete=models.CASCADE,related_name='ratings_received')
     game=models.ForeignKey(Game,null=True,blank=True,on_delete=models.CASCADE,related_name='player_ratings')
-    rating=models.PositiveSmallIntegerField(); review=models.TextField(blank=True); deleted_at=models.DateTimeField(null=True,blank=True)
+    # `rating` remains the stored overall score for backwards compatibility.
+    # It is calculated from the four feedback categories by RatingService.
+    rating=models.DecimalField(max_digits=3, decimal_places=1)
+    playing_performance=models.PositiveSmallIntegerField()
+    teamwork=models.PositiveSmallIntegerField()
+    sportsmanship=models.PositiveSmallIntegerField()
+    punctuality=models.PositiveSmallIntegerField()
+    review=models.TextField(blank=True); deleted_at=models.DateTimeField(null=True,blank=True)
     class Meta:
-        constraints=[models.CheckConstraint(check=models.Q(rating__gte=1,rating__lte=5),name='player_rating_range_valid'),models.UniqueConstraint(fields=['reviewer','player','game'],name='unique_player_game_rating')]
+        constraints=[models.CheckConstraint(check=models.Q(rating__gte=1,rating__lte=5),name='player_rating_range_valid'),models.CheckConstraint(check=models.Q(playing_performance__gte=1,playing_performance__lte=5),name='rating_performance_range_valid'),models.CheckConstraint(check=models.Q(teamwork__gte=1,teamwork__lte=5),name='rating_teamwork_range_valid'),models.CheckConstraint(check=models.Q(sportsmanship__gte=1,sportsmanship__lte=5),name='rating_sportsmanship_range_valid'),models.CheckConstraint(check=models.Q(punctuality__gte=1,punctuality__lte=5),name='rating_punctuality_range_valid'),models.UniqueConstraint(fields=['reviewer','player','game'],name='unique_player_game_rating')]
         indexes=[models.Index(fields=['player','created_at'],name='player_rating_created_idx')]
 
 

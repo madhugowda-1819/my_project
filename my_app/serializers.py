@@ -356,14 +356,29 @@ class PublicPlayerSerializer(serializers.ModelSerializer):
     distance_km = serializers.SerializerMethodField()
     sports = UserSportSerializer(source='user_sports', many=True, read_only=True)
     availability = serializers.BooleanField(source='is_available', read_only=True)
+    rating_summary = serializers.SerializerMethodField()
 
     class Meta:
         model = User
-        fields = ['public_id', 'name', 'username', 'location', 'distance_km', 'availability', 'bio', 'sports']
+        fields = ['public_id', 'name', 'username', 'location', 'distance_km', 'availability', 'bio', 'sports', 'rating_summary']
 
     def get_distance_km(self, obj):
         distance = getattr(obj, 'distance_km', None)
         return round(distance, 1) if distance is not None else None
+
+    def get_rating_summary(self, obj):
+        from django.db.models import Avg, Count
+        values = obj.ratings_received.filter(deleted_at__isnull=True).aggregate(
+            overall=Avg('rating'), count=Count('id'), playing_performance=Avg('playing_performance'),
+            teamwork=Avg('teamwork'), sportsmanship=Avg('sportsmanship'), punctuality=Avg('punctuality'),
+        )
+        return {
+            'average_rating': round(float(values['overall'] or 0), 1), 'rating_count': values['count'],
+            'playing_performance': round(float(values['playing_performance'] or 0), 1),
+            'teamwork': round(float(values['teamwork'] or 0), 1),
+            'sportsmanship': round(float(values['sportsmanship'] or 0), 1),
+            'punctuality': round(float(values['punctuality'] or 0), 1),
+        }
 
 
 # ------------------------------------------------------------------
@@ -478,14 +493,18 @@ class UserSerializer(serializers.ModelSerializer):
 class CurrentUserSerializer(serializers.ModelSerializer):
     name = serializers.CharField(source='full_name', required=False)
     phone = serializers.CharField(required=False, allow_blank=True, validators=[phone_validator])
+    roles = serializers.SerializerMethodField()
 
     class Meta:
         model = User
         fields = [
             'public_id', 'name', 'username', 'email', 'phone', 'avatar', 'city',
-            'latitude', 'longitude', 'bio', 'date_joined', 'is_active', 'account_status',
+            'latitude', 'longitude', 'bio', 'date_joined', 'is_active', 'account_status', 'roles',
         ]
         read_only_fields = ['public_id', 'username', 'email', 'date_joined', 'is_active', 'account_status']
+
+    def get_roles(self, obj):
+        return list(obj.groups.values_list('name', flat=True))
 
 
 # ------------------------------------------------------------------
@@ -500,6 +519,9 @@ class MatchSerializer(serializers.ModelSerializer):
     groundLocation = serializers.CharField(source='ground.city')
 
     joinedPlayers = serializers.SerializerMethodField()
+    status = serializers.SerializerMethodField()
+    is_joined = serializers.SerializerMethodField()
+    is_organizer = serializers.SerializerMethodField()
 
     class Meta:
         model = Match
@@ -511,12 +533,32 @@ class MatchSerializer(serializers.ModelSerializer):
             'date_time',
             'total_players',
             'joinedPlayers',
-            'organizer',
-            'status'
+            'organizer', 'status', 'is_joined', 'is_organizer'
         ]
 
     def get_joinedPlayers(self, obj):
         return obj.joined_players.count()
+
+    def get_status(self, obj):
+        # Legacy matches retain their stored status, but an unprocessed match
+        # must never look joinable once its scheduled time has passed.
+        if obj.status == 'upcoming' and obj.date_time <= timezone.now():
+            return 'completed'
+        return obj.status
+
+    def get_is_joined(self, obj):
+        user = self.context.get('request').user if self.context.get('request') else None
+        return bool(user and user.is_authenticated and obj.joined_players.filter(pk=user.pk).exists())
+
+    def get_is_organizer(self, obj):
+        user = self.context.get('request').user if self.context.get('request') else None
+        return bool(user and user.is_authenticated and obj.organizer_id == user.pk)
+
+
+class MatchParticipantSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = User
+        fields = ['id', 'public_id', 'username', 'full_name', 'avatar']
 
 
 class MatchCreateSerializer(serializers.ModelSerializer):
@@ -870,9 +912,29 @@ class UserDeviceCreateSerializer(serializers.Serializer):
     device_name=serializers.CharField(required=False,allow_blank=True,max_length=120)
 class PlayerRatingSerializer(serializers.ModelSerializer):
     reviewer=serializers.CharField(source='reviewer.username',read_only=True)
-    class Meta: model=PlayerRating;fields=['public_id','reviewer','rating','review','game','created_at','updated_at']
+    class Meta: model=PlayerRating;fields=['public_id','reviewer','rating','playing_performance','teamwork','sportsmanship','punctuality','review','game','created_at','updated_at']
 class PlayerRatingCreateSerializer(serializers.Serializer):
-    game_id=serializers.UUIDField();rating=serializers.IntegerField(min_value=1,max_value=5);review=serializers.CharField(required=False,allow_blank=True,max_length=2000)
+    game_id=serializers.UUIDField()
+    # Accept the old one-score payload during client rollout.  It is expanded
+    # to four categories, while all new clients must send each category.
+    rating=serializers.IntegerField(min_value=1,max_value=5,required=False,write_only=True)
+    playing_performance=serializers.IntegerField(min_value=1,max_value=5,required=False)
+    teamwork=serializers.IntegerField(min_value=1,max_value=5,required=False)
+    sportsmanship=serializers.IntegerField(min_value=1,max_value=5,required=False)
+    punctuality=serializers.IntegerField(min_value=1,max_value=5,required=False)
+    review=serializers.CharField(required=False,allow_blank=True,max_length=2000,trim_whitespace=True)
+
+    def validate(self, attrs):
+        categories = ('playing_performance', 'teamwork', 'sportsmanship', 'punctuality')
+        missing = [field for field in categories if field not in attrs]
+        if missing:
+            if len(missing) == len(categories) and 'rating' in attrs:
+                for field in categories:
+                    attrs[field] = attrs['rating']
+            else:
+                raise serializers.ValidationError({field: ['This category is required.'] for field in missing})
+        attrs.pop('rating', None)
+        return attrs
 class AchievementSerializer(serializers.ModelSerializer):
     class Meta: model=Achievement;fields=['public_id','code','name','description','category','icon','target_value','is_active']
 class UserAchievementSerializer(serializers.ModelSerializer):

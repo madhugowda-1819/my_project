@@ -1,4 +1,5 @@
 from django.contrib.auth import get_user_model
+from django.contrib.auth.models import Group
 from django.db.models import Q, Count, F
 from django.db import connection
 from django.shortcuts import get_object_or_404
@@ -32,7 +33,7 @@ from .models import (
     Sport, AvailabilitySlot, Match, Message, Notification, Ground, SportsGround,
     Venue, Court, VenueReview, CourtBooking, Game, GamePlayer, Conversation, ConversationMember,
     Community, CommunityMember, CommunityPost, CommunityComment, CommunityPostLike,
-    Event, EventParticipant, Tournament, TournamentTeam, TournamentMatch, NotificationPreference, UserDevice, PlayerRating, Achievement, UserAchievement, Report, ModerationAction,
+    Event, EventParticipant, Tournament, TournamentTeam, TournamentMatch, NotificationPreference, UserDevice, PlayerRating, Achievement, UserAchievement, Report, ModerationAction, VenueOwnerApplication, RoleAuditLog,
 )
 
 from .serializers import (
@@ -44,7 +45,7 @@ from .serializers import (
     VenueSerializer, VenueDiscoveryQuerySerializer, VenueReviewCreateSerializer, VenueReviewSerializer,
     VenueAvailabilityQuerySerializer, CourtBookingCreateSerializer,
     BookingCreateSerializer, BookingSerializer, RazorpayVerificationSerializer,
-    MatchSerializer, MessageSerializer,
+    MatchSerializer, MatchParticipantSerializer, MessageSerializer,
     NotificationSerializer, AvailabilityToggleSerializer,
     GroundSerializer, GroundDiscoverySerializer, AutoGameCreateSerializer, MatchCreateSerializer,
     GameCreateSerializer, GameUpdateSerializer, GameQuerySerializer, GameRecommendationQuerySerializer,
@@ -59,7 +60,7 @@ from .serializers import (
     ReportCreateSerializer, ReportSerializer, ReportUpdateSerializer, ModerationActionSerializer, AdminUserSerializer,
 )
 from .maps import MapsProviderError, find_live_sports_grounds
-from .permissions import IsActiveAccount, IsPlatformAdmin, IsPlatformModerator, has_platform_role, MODERATOR_GROUPS
+from .permissions import IsActiveAccount, IsPlatformAdmin, IsPlatformModerator, has_platform_role, MODERATOR_GROUPS, VENUE_OWNER_GROUP
 from .services.accounts import AuthenticationService, UserService
 from .services.availability import VenueAvailabilityService
 from .services.bookings import BookingCancellationService, BookingService
@@ -86,7 +87,7 @@ from .services.players import PlayerService
 from .services.venues import VenueDiscoveryService, VenueReviewService
 from .services.ground_ingestion import GroundIngestionService
 from .services.auto_games import AutoGameService
-from .services.matches import join_match
+from .services.matches import join_match, leave_match, remove_player
 from .utils.geo_utils import clean_google_maps_name, haversine_distance
 
 User = get_user_model()
@@ -979,20 +980,9 @@ class CreateMatchView(APIView):
     permission_classes = [IsActiveAccount]
 
     def post(self, request):
-        required = ('sport', 'ground', 'date_time', 'total_players')
-        missing = [field for field in required if not request.data.get(field)]
-        if missing:
-            return Response({'detail': f"Missing required fields: {', '.join(missing)}."}, status=400)
-        try:
-            match = Match.objects.create(
-                sport_id=request.data['sport'], organizer=request.user,
-                ground_id=request.data['ground'], date_time=request.data['date_time'],
-                total_players=int(request.data['total_players'])
-            )
-        except (Sport.DoesNotExist, Ground.DoesNotExist):
-            return Response({'detail': 'Selected sport or ground does not exist.'}, status=400)
-        except (TypeError, ValueError):
-            return Response({'detail': 'Player capacity must be a valid number.'}, status=400)
+        serializer = MatchCreateSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        match = serializer.save(organizer=request.user)
         return Response({'match': MatchSerializer(match).data}, status=201)
 
 
@@ -1004,8 +994,35 @@ class JoinMatchView(APIView):
         return Response({
             'success': True,
             'message': 'Joined successfully' if joined else 'Already joined this match.',
-            'match': MatchSerializer(match).data,
+            'match': MatchSerializer(match, context={'request': request}).data,
         })
+
+
+class LeaveMatchView(APIView):
+    permission_classes = [IsActiveAccount]
+
+    def post(self, request, match_id):
+        match = leave_match(match_id=match_id, user=request.user)
+        return Response({'success': True, 'message': 'You left the match.', 'match': MatchSerializer(match, context={'request': request}).data})
+
+
+class MatchParticipantsView(APIView):
+    permission_classes = [IsActiveAccount]
+
+    def get(self, request, match_id):
+        match = get_object_or_404(Match.objects.prefetch_related('joined_players'), pk=match_id)
+        return Response({'success': True, 'data': MatchParticipantSerializer(match.joined_players.all(), many=True).data})
+
+
+class RemoveMatchParticipantView(APIView):
+    permission_classes = [IsActiveAccount]
+
+    def post(self, request, match_id, user_id):
+        reason = str(request.data.get('reason', '')).strip()
+        if len(reason) > 500:
+            raise ValidationError({'reason': ['Reason cannot exceed 500 characters.']})
+        match = remove_player(match_id=match_id, organizer=request.user, player_id=user_id, reason=reason)
+        return Response({'success': True, 'message': 'Player removed from the match.', 'match': MatchSerializer(match, context={'request': request}).data})
 
 
 # ---------------- COURT-BACKED GAMES ----------------
@@ -1884,6 +1901,63 @@ class AdminReportsView(ReportListCreateView):
     permission_classes = [IsPlatformAdmin]
 
 
+class VenueOwnerApplicationView(APIView):
+    permission_classes = [IsActiveAccount]
+
+    def get(self, request):
+        items = request.user.venue_owner_applications.order_by('-created_at')
+        return Response({'success': True, 'data': [{'public_id': str(item.public_id), 'business_name': item.business_name, 'status': item.status, 'review_note': item.review_note} for item in items]})
+
+    def post(self, request):
+        required = ('business_name', 'phone', 'city', 'address')
+        missing = [field for field in required if not str(request.data.get(field, '')).strip()]
+        if missing:
+            raise ValidationError({field: ['This field is required.'] for field in missing})
+        item = VenueOwnerApplication.objects.create(applicant=request.user, **{field: str(request.data[field]).strip() for field in required})
+        return Response({'success': True, 'data': {'public_id': str(item.public_id), 'status': item.status}}, status=201)
+
+
+class AccessManagementView(APIView):
+    permission_classes = [IsPlatformAdmin]
+    allowed_roles = {'SportMate Venue Owners', 'SportMate Moderators', 'SportMate Admins', 'SportMate Support'}
+
+    def get(self, request):
+        users = User.objects.prefetch_related('groups').order_by('username')[:200]
+        return Response({'success': True, 'data': [{'public_id': str(user.public_id), 'username': user.username, 'email': user.email, 'account_status': user.account_status, 'roles': list(user.groups.values_list('name', flat=True))} for user in users]})
+
+    def patch(self, request, public_id):
+        user = get_object_or_404(User, public_id=public_id)
+        role = str(request.data.get('role', '')).strip()
+        action = str(request.data.get('action', '')).strip().lower()
+        if role not in self.allowed_roles or action not in {'grant', 'revoke'}:
+            raise ValidationError({'detail': 'Use a supported role and grant or revoke action.'})
+        group, _ = Group.objects.get_or_create(name=role)
+        (user.groups.add if action == 'grant' else user.groups.remove)(group)
+        RoleAuditLog.objects.create(actor=request.user, target_user=user, role=role, action=action, reason=str(request.data.get('reason', '')).strip())
+        return Response({'success': True, 'roles': list(user.groups.values_list('name', flat=True))})
+
+
+class VenueOwnerApplicationReviewView(APIView):
+    permission_classes = [IsPlatformAdmin]
+
+    def get(self, request):
+        items = VenueOwnerApplication.objects.select_related('applicant').order_by('-created_at')
+        return Response({'success': True, 'data': [{'public_id': str(item.public_id), 'business_name': item.business_name, 'phone': item.phone, 'city': item.city, 'address': item.address, 'status': item.status, 'applicant': item.applicant.username, 'review_note': item.review_note} for item in items]})
+
+    def patch(self, request, public_id):
+        item = get_object_or_404(VenueOwnerApplication, public_id=public_id)
+        status = request.data.get('status')
+        if status not in {VenueOwnerApplication.Status.APPROVED, VenueOwnerApplication.Status.REJECTED}:
+            raise ValidationError({'status': ['Use approved or rejected.']})
+        item.status, item.reviewed_by, item.review_note = status, request.user, str(request.data.get('review_note', '')).strip()
+        item.save(update_fields=['status', 'reviewed_by', 'review_note', 'updated_at'])
+        group, _ = Group.objects.get_or_create(name=VENUE_OWNER_GROUP)
+        if status == VenueOwnerApplication.Status.APPROVED:
+            item.applicant.groups.add(group)
+            RoleAuditLog.objects.create(actor=request.user, target_user=item.applicant, role=VENUE_OWNER_GROUP, action='grant', reason=item.review_note)
+        return Response({'success': True, 'status': item.status})
+
+
 class AdminDashboardView(APIView):
     permission_classes = [IsPlatformAdmin]
 
@@ -1945,7 +2019,30 @@ class PlayerRatingsView(generics.ListCreateAPIView):
     def get_player(self): return get_object_or_404(User,public_id=self.kwargs['public_id'],is_active=True)
     def get_queryset(self): return PlayerRating.objects.filter(player=self.get_player(),deleted_at__isnull=True).select_related('reviewer','game').order_by('-created_at')
     def create(self,request,*args,**kwargs):
-        s=PlayerRatingCreateSerializer(data=request.data);s.is_valid(raise_exception=True);rating=RatingService.rate_player(reviewer=request.user,player=self.get_player(),game=get_object_or_404(Game,public_id=s.validated_data['game_id']),rating=s.validated_data['rating'],review=s.validated_data.get('review',''));return Response({'success':True,'data':PlayerRatingSerializer(rating).data},status=201)
+        s=PlayerRatingCreateSerializer(data=request.data);s.is_valid(raise_exception=True);values=s.validated_data.copy();game=get_object_or_404(Game,public_id=values.pop('game_id'));rating=RatingService.rate_player(reviewer=request.user,player=self.get_player(),game=game,**values);return Response({'success':True,'data':PlayerRatingSerializer(rating).data},status=201)
+
+class PlayerRatingSummaryView(APIView):
+    permission_classes=[IsActiveAccount]
+    def get(self,request,public_id):
+        return Response({'success':True,'data':RatingService.aggregate(get_object_or_404(User,public_id=public_id,is_active=True))})
+
+class PlayerRatingEligibilityView(APIView):
+    permission_classes=[IsActiveAccount]
+    def get(self,request,public_id):
+        player=get_object_or_404(User,public_id=public_id,is_active=True)
+        games=RatingService.eligible_games(reviewer=request.user,player=player).select_related('sport','venue','court')
+        rated_game_ids=set(PlayerRating.objects.filter(reviewer=request.user,player=player,deleted_at__isnull=True).values_list('game_id',flat=True))
+        return Response({'success':True,'data':[{'game_id':str(game.public_id),'game_reference':game.game_reference,'sport':game.sport.name,'date':game.game_date,'already_rated':game.id in rated_game_ids} for game in games]})
+
+class GameRatingStatusView(APIView):
+    permission_classes=[IsActiveAccount]
+    def get(self,request,public_id):
+        game=get_object_or_404(Game,public_id=public_id)
+        if game.status != Game.Status.COMPLETED or not GamePlayer.objects.filter(game=game,user=request.user,status=GamePlayer.Status.CONFIRMED).exists():
+            raise PermissionDenied('Ratings are available only to participants of completed games.')
+        ratings={rating.player_id:rating.public_id for rating in PlayerRating.objects.filter(game=game,reviewer=request.user,deleted_at__isnull=True)}
+        participants=GamePlayer.objects.filter(game=game,status=GamePlayer.Status.CONFIRMED).exclude(user=request.user).select_related('user')
+        return Response({'success':True,'data':[{'player_id':str(row.user.public_id),'username':row.user.username,'rating_id':str(ratings[row.user_id]) if row.user_id in ratings else None,'can_rate':row.user_id not in ratings} for row in participants]})
 class PlayerStatisticsView(APIView):
     permission_classes=[IsActiveAccount]
     def get(self,request,public_id,sport_id=None):
@@ -1956,7 +2053,8 @@ class RatingDetailView(APIView):
     def patch(self,request,public_id):
         rating=get_object_or_404(PlayerRating,public_id=public_id,deleted_at__isnull=True)
         if rating.reviewer_id!=request.user.id: raise PermissionDenied('Only reviewer can edit.')
-        s=PlayerRatingCreateSerializer(data={**request.data,'game_id':str(rating.game.public_id)});s.is_valid(raise_exception=True);rating.rating=s.validated_data['rating'];rating.review=s.validated_data.get('review','');rating.save(update_fields=['rating','review','updated_at']);return Response({'success':True,'data':PlayerRatingSerializer(rating).data})
+        s=PlayerRatingCreateSerializer(data={**request.data,'game_id':str(rating.game.public_id)});s.is_valid(raise_exception=True)
+        values=s.validated_data;rating.playing_performance=values['playing_performance'];rating.teamwork=values['teamwork'];rating.sportsmanship=values['sportsmanship'];rating.punctuality=values['punctuality'];rating.rating=(rating.playing_performance+rating.teamwork+rating.sportsmanship+rating.punctuality)/4;rating.review=values.get('review','').strip();rating.save(update_fields=['rating','playing_performance','teamwork','sportsmanship','punctuality','review','updated_at']);return Response({'success':True,'data':PlayerRatingSerializer(rating).data})
     def delete(self,request,public_id):
         rating=get_object_or_404(PlayerRating,public_id=public_id,deleted_at__isnull=True)
         if rating.reviewer_id!=request.user.id and not request.user.is_staff: raise PermissionDenied('Not allowed.')

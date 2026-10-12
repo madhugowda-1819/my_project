@@ -94,6 +94,15 @@ class MatchApiTests(APITestCase):
         }, format='json')
         self.assertEqual(response.status_code, 400)
 
+    def test_match_end_time_must_follow_start_time(self):
+        self.client.force_authenticate(self.organizer)
+        starts = timezone.now() + timedelta(days=1)
+        response = self.client.post('/api/v1/matches/create/', {
+            'sport': self.sport.id, 'ground': self.ground.id,
+            'date_time': starts.isoformat(), 'end_date_time': starts.isoformat(), 'total_players': 2,
+        }, format='json')
+        self.assertEqual(response.status_code, 400)
+
     def test_player_can_leave_upcoming_match_and_reopen_slot(self):
         match = Match.objects.create(sport=self.sport, ground=self.ground, organizer=self.organizer, date_time=timezone.now() + timedelta(days=1), total_players=1)
         match.joined_players.add(self.player)
@@ -406,6 +415,9 @@ class GroundIngestionAndAutoGameTests(APITestCase):
         self.assertEqual(second.status_code, 200)
         self.assertFalse(second.data['created'])
         self.assertEqual(Game.objects.filter(host=self.user).count(), 1)
+        recommendations = self.client.get('/api/v1/ai/matches/')
+        self.assertEqual(recommendations.status_code, 200)
+        self.assertEqual(recommendations.data[0]['public_id'], first.data['data']['public_id'])
 
 
 class PlayerMatchingServiceTests(APITestCase):
@@ -502,6 +514,8 @@ class VenueManagementTests(APITestCase):
         duplicate = self.client.post('/api/v1/venues/reviews/', {'booking_id': completed.id, 'rating': 5}, format='json')
         cancelled_response = self.client.post('/api/v1/venues/reviews/', {'booking_id': cancelled.id, 'rating': 4}, format='json')
         self.assertEqual(review.status_code, 201)
+        self.venue.refresh_from_db()
+        self.assertEqual(float(self.venue.rating), 5.0)
         self.assertEqual(duplicate.status_code, 400)
         self.assertEqual(cancelled_response.status_code, 400)
         self.client.force_authenticate(self.other)
@@ -511,6 +525,8 @@ class VenueManagementTests(APITestCase):
         deleted = self.client.delete(f"/api/v1/venues/reviews/{review.data['review']['public_id']}/")
         self.assertEqual(deleted.status_code, 204)
         self.assertFalse(VenueReview.objects.exists())
+        self.venue.refresh_from_db()
+        self.assertEqual(float(self.venue.rating), 0.0)
 
 
 class VenueAvailabilityTests(APITestCase):
@@ -641,6 +657,25 @@ class BookingEngineTests(APITestCase):
         self.assertEqual(BookingStatusService.complete_expired(), 1)
         booking.refresh_from_db()
         self.assertEqual(booking.status, CourtBooking.Status.COMPLETED)
+
+    def test_lifecycle_filters_keep_cancelled_bookings_in_their_own_tab(self):
+        upcoming = self.create(start_time='10:00', end_time='11:00')
+        cancelled = self.create(start_time='12:00', end_time='13:00')
+        cancelled_id = cancelled.data['data']['public_id']
+        self.client.post(f'/api/v1/bookings/{cancelled_id}/cancel/', {'reason': 'Changed plans'}, format='json')
+        past = CourtBooking.objects.get(public_id=upcoming.data['data']['public_id'])
+        past.starts_at = timezone.now() - timedelta(hours=2)
+        past.ends_at = timezone.now() - timedelta(hours=1)
+        past.status = CourtBooking.Status.COMPLETED
+        past.save(update_fields=['starts_at', 'ends_at', 'status', 'updated_at'])
+
+        upcoming_rows = self.client.get('/api/v1/bookings/', {'upcoming': 'true'}).data['results']
+        past_rows = self.client.get('/api/v1/bookings/', {'past': 'true'}).data['results']
+        cancelled_rows = self.client.get('/api/v1/bookings/', {'status': 'cancelled'}).data['results']
+
+        self.assertEqual(upcoming_rows, [])
+        self.assertEqual(len(past_rows), 1)
+        self.assertEqual(len(cancelled_rows), 1)
 
 
 class GameApiTests(APITestCase):
@@ -886,6 +921,9 @@ class ConversationChatTests(APITestCase):
         unread = self.client.get('/api/v1/messages/unread/')
         self.assertEqual(unread.status_code, 200)
         self.assertEqual(unread.data['unread'], 1)
+        notification = Notification.objects.get(user=self.user, type='message')
+        self.assertEqual(notification.data['conversation_id'], conversation_id)
+        self.assertFalse(notification.is_read)
         self.client.post(f'/api/v1/conversations/{conversation_id}/read/')
         self.assertEqual(self.client.get('/api/v1/messages/unread/').data['unread'], 0)
 

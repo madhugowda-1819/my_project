@@ -1,6 +1,7 @@
 from rest_framework import serializers
 from django.contrib.auth import get_user_model
 from django.utils import timezone
+from datetime import timedelta
 from django.core.validators import RegexValidator
 from django.core.files.images import get_image_dimensions
 from .models import (
@@ -201,6 +202,9 @@ class VenueReviewSerializer(serializers.ModelSerializer):
 
 
 class VenueSerializer(serializers.ModelSerializer):
+    # A zero is merely the default for a venue with no reviews. Returning null
+    # lets clients display a helpful "New" label instead of a false 0.00 score.
+    rating = serializers.SerializerMethodField()
     sports = serializers.SerializerMethodField()
     amenities = VenueAmenitySerializer(read_only=True)
     courts = CourtSerializer(many=True, read_only=True)
@@ -215,6 +219,9 @@ class VenueSerializer(serializers.ModelSerializer):
             'opening_time', 'closing_time', 'active', 'sports', 'amenities', 'courts', 'images',
             'reviews', 'distance_km',
         ]
+
+    def get_rating(self, obj):
+        return float(obj.rating) if obj.rating and obj.rating > 0 else None
 
     def get_sports(self, obj):
         return SportSerializer([item.sport for item in obj.venue_sports.all()], many=True).data
@@ -531,6 +538,7 @@ class MatchSerializer(serializers.ModelSerializer):
             'groundName',
             'groundLocation',
             'date_time',
+            'end_date_time',
             'total_players',
             'joinedPlayers',
             'organizer', 'status', 'is_joined', 'is_organizer'
@@ -542,8 +550,11 @@ class MatchSerializer(serializers.ModelSerializer):
     def get_status(self, obj):
         # Legacy matches retain their stored status, but an unprocessed match
         # must never look joinable once its scheduled time has passed.
-        if obj.status == 'upcoming' and obj.date_time <= timezone.now():
-            return 'completed'
+        if obj.status == 'upcoming':
+            if obj.end_date_time <= timezone.now():
+                return 'completed'
+            if obj.date_time <= timezone.now():
+                return 'ongoing'
         return obj.status
 
     def get_is_joined(self, obj):
@@ -564,15 +575,25 @@ class MatchParticipantSerializer(serializers.ModelSerializer):
 class MatchCreateSerializer(serializers.ModelSerializer):
     sport = serializers.PrimaryKeyRelatedField(queryset=Sport.objects.filter(is_active=True))
     ground = serializers.PrimaryKeyRelatedField(queryset=Ground.objects.all())
+    end_date_time = serializers.DateTimeField(required=False)
 
     class Meta:
         model = Match
-        fields = ['sport', 'ground', 'date_time', 'total_players']
+        fields = ['sport', 'ground', 'date_time', 'end_date_time', 'total_players']
 
     def validate_date_time(self, value):
         if value <= timezone.now():
             raise serializers.ValidationError('date_time must be in the future.')
         return value
+
+    def validate(self, attrs):
+        # Older clients send only the start time; retain compatibility with a
+        # one-hour same-day match while new clients provide the explicit end.
+        end = attrs.get('end_date_time') or attrs['date_time'] + timedelta(hours=1)
+        if end <= attrs['date_time']:
+            raise serializers.ValidationError({'end_date_time': 'End time must be after the match start time.'})
+        attrs['end_date_time'] = end
+        return attrs
 
 
 # ------------------------------------------------------------------
@@ -853,6 +874,14 @@ class EventParticipantSerializer(serializers.ModelSerializer):
     class Meta: model=EventParticipant; fields=['username','status','joined_at','left_at']
 class TournamentCreateSerializer(serializers.Serializer):
     name=serializers.CharField(max_length=200); sport_id=serializers.PrimaryKeyRelatedField(source='sport',queryset=Sport.objects.filter(is_active=True)); venue_id=serializers.UUIDField(); start_date=serializers.DateField(); end_date=serializers.DateField(); registration_deadline=serializers.DateTimeField(); maximum_teams=serializers.IntegerField(min_value=2); format=serializers.ChoiceField(choices=Tournament.Format.choices,default=Tournament.Format.SINGLE_ELIMINATION); skill_level=serializers.ChoiceField(choices=UserSport.SkillLevel.choices,required=False,allow_blank=True,default='')
+    def validate(self, attrs):
+        if attrs['start_date'] < timezone.localdate():
+            raise serializers.ValidationError({'start_date': 'Tournament start date must not be in the past.'})
+        if attrs['end_date'] < attrs['start_date']:
+            raise serializers.ValidationError({'end_date': 'End date must be on or after the start date.'})
+        if attrs['registration_deadline'] <= timezone.now() or attrs['registration_deadline'].date() > attrs['start_date']:
+            raise serializers.ValidationError({'registration_deadline': 'Deadline must be in the future and on or before the tournament start date.'})
+        return attrs
 class TournamentSerializer(serializers.ModelSerializer):
     class Meta: model=Tournament; fields=['public_id','tournament_reference','name','sport','venue','start_date','end_date','registration_deadline','maximum_teams','format','skill_level','status']
 class TournamentTeamSerializer(serializers.ModelSerializer):

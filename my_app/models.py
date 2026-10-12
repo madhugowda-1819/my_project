@@ -1,5 +1,6 @@
 import math
 import uuid
+from datetime import timedelta
 from django.contrib.auth.models import AbstractUser
 from django.db import models
 from django.conf import settings
@@ -508,6 +509,7 @@ class Match(TimestampedPublicModel):
     ground = models.ForeignKey(Ground, on_delete=models.CASCADE)
 
     date_time = models.DateTimeField()
+    end_date_time = models.DateTimeField()
     total_players = models.IntegerField()
 
     joined_players = models.ManyToManyField(
@@ -517,6 +519,13 @@ class Match(TimestampedPublicModel):
     )
 
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='upcoming')
+
+    def save(self, *args, **kwargs):
+        # Keep existing integrations working while all new matches submit an
+        # explicit end time through MatchCreateSerializer.
+        if self.end_date_time is None and self.date_time:
+            self.end_date_time = self.date_time + timedelta(hours=1)
+        super().save(*args, **kwargs)
 
     def joined_count(self):
         return self.joined_players.count()
@@ -529,6 +538,7 @@ class Match(TimestampedPublicModel):
         ]
         constraints = [
             models.CheckConstraint(check=models.Q(total_players__gt=0), name='match_total_players_is_positive'),
+            models.CheckConstraint(check=models.Q(end_date_time__gt=models.F('date_time')), name='match_end_after_start'),
         ]
 
 

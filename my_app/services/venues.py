@@ -1,4 +1,4 @@
-from django.db.models import Q
+from django.db.models import Avg, Q
 from rest_framework.exceptions import PermissionDenied, ValidationError
 
 from my_app.models import CourtBooking, VenueReview
@@ -52,6 +52,12 @@ class VenueDiscoveryService:
 
 class VenueReviewService:
     @staticmethod
+    def _refresh_rating(venue):
+        average = VenueReview.objects.filter(venue=venue).aggregate(average=Avg('rating'))['average']
+        venue.rating = average or 0
+        venue.save(update_fields=['rating', 'updated_at'])
+
+    @staticmethod
     def create(*, user, booking, rating, comment=''):
         if booking.user_id != user.id:
             raise PermissionDenied('You may only review your own booking.')
@@ -59,10 +65,14 @@ class VenueReviewService:
             raise ValidationError({'booking': ['Only completed bookings can be reviewed.']})
         if hasattr(booking, 'review'):
             raise ValidationError({'booking': ['This booking has already been reviewed.']})
-        return VenueReview.objects.create(venue=booking.court.venue, user=user, booking=booking, rating=rating, comment=comment)
+        review = VenueReview.objects.create(venue=booking.court.venue, user=user, booking=booking, rating=rating, comment=comment)
+        VenueReviewService._refresh_rating(review.venue)
+        return review
 
     @staticmethod
     def delete(*, user, review):
         if review.user_id != user.id:
             raise PermissionDenied('You may only delete your own review.')
+        venue = review.venue
         review.delete()
+        VenueReviewService._refresh_rating(venue)

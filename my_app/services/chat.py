@@ -154,7 +154,7 @@ class MessageService:
         for member in recipients:
             create_notification(
                 user=member.user, type='message', title=f'New message from {sender.username}',
-                body=message.content[:80], data={'message_id': message.public_id.hex, 'conversation_id': conversation.public_id.hex},
+                body=message.content[:80], data={'message_id': str(message.public_id), 'conversation_id': str(conversation.public_id)},
             )
         return message
 

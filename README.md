@@ -60,10 +60,11 @@ Distance thresholds are configurable constants in `my_app/services/player_matchi
 The API returns a privacy-safe player summary, total score, approximate distance,
 sport, skill, rating, and matching reasons.
 
-## Court bookings (no payments)
+## Court bookings and Razorpay test payments
 
-SportMate bookings are reservations only. The backend has no payment model,
-gateway, webhooks, payment status, or refund flow.
+Court bookings use Razorpay Checkout. The Flutter client receives only the
+Razorpay key ID and an order ID; the secret key remains on the Django server.
+Bookings stay `pending` until the payment is verified and captured.
 
 | Method | Endpoint | Description |
 |---|---|---|
@@ -71,6 +72,22 @@ gateway, webhooks, payment status, or refund flow.
 | POST | `/api/v1/bookings/` | Creates a confirmed reservation from `venue_id`, `court_id`, `booking_date`, `start_time`, and `end_time`. |
 | GET | `/api/v1/bookings/{public_id}/` | Owner-only booking detail. |
 | POST | `/api/v1/bookings/{public_id}/cancel/` | Owner/admin cancellation; accepts optional `reason`. |
+| POST | `/api/v1/payments/razorpay/start/` | Creates a pending booking and Razorpay order. |
+| POST | `/api/v1/payments/razorpay/verify/` | Verifies Checkout signature and payment ownership. |
+| POST | `/api/v1/payments/razorpay/webhook/` | Processes signed `payment.captured` and `payment.failed` events. |
+
+For Razorpay **test mode**, configure server-only environment variables (never
+put the secret in Flutter):
+
+```text
+RAZORPAY_KEY_ID=rzp_test_...
+RAZORPAY_KEY_SECRET=...
+RAZORPAY_WEBHOOK_SECRET=...
+```
+
+Set the Razorpay dashboard webhook URL to
+`https://<your-domain>/api/payments/razorpay/webhook/` and subscribe to
+`payment.captured` and `payment.failed`.
 
 The server validates active venue/court ownership, future date, venue-local
 operating hours, allowed duration, blocked/maintenance periods, and overlap.

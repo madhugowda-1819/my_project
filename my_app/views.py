@@ -570,9 +570,9 @@ class BookingListCreateView(generics.ListCreateAPIView):
         if court:
             queryset = queryset.filter(court_id=court)
         if self.request.query_params.get('upcoming') == 'true':
-            queryset = queryset.filter(ends_at__gt=timezone.now())
+            queryset = queryset.exclude(status=CourtBooking.Status.CANCELLED).filter(ends_at__gt=timezone.now())
         if self.request.query_params.get('past') == 'true':
-            queryset = queryset.filter(ends_at__lte=timezone.now())
+            queryset = queryset.exclude(status=CourtBooking.Status.CANCELLED).filter(ends_at__lte=timezone.now())
         return queryset.order_by('-starts_at')
 
     def create(self, request, *args, **kwargs):
@@ -2145,52 +2145,34 @@ class AiMatchView(APIView):
 
     def get(self, request):
         user = request.user
-        # AI recommendations must never leak unrelated sports into a player's
-        # feed. Prefer skill-profile sports; use sign-up sports for older
-        # accounts that have not yet completed the skill profile.
+        # AutoGameCreateView creates court-backed Game records.  This feed must
+        # query the same model; previously it queried legacy Match rows, which
+        # made a successfully created game appear to disappear immediately.
+        # Restrict the feed to the player's active sports.
         sport_ids = list(user.user_sports.filter(sport__is_active=True).values_list('sport_id', flat=True))
         if not sport_ids:
             sport_ids = list(user.sports.filter(is_active=True).values_list('id', flat=True))
         if not sport_ids:
             return Response([])
 
-        user_lat = user.latitude
-        user_lng = user.longitude
+        games = Game.objects.filter(
+            visibility=Game.Visibility.PUBLIC,
+            status__in=ACTIVE_GAME_STATUSES,
+            ends_at__gt=timezone.now(),
+            sport_id__in=sport_ids,
+        ).select_related('sport', 'venue', 'court__sport', 'host').prefetch_related(
+            'game_players__user__user_sports__sport',
+        ).order_by('starts_at')
 
-        # fallback if no location
-        matches = Match.objects.select_related('sport', 'ground', 'organizer').prefetch_related('joined_players').filter(
-            status='upcoming', date_time__gte=timezone.now(), sport_id__in=sport_ids,
-        ).annotate(players_count=Count('joined_players'))
-
-        if user_lat is None or user_lng is None:
-            return Response(MatchSerializer(matches.filter(players_count__lt=F('total_players'))[:10], many=True).data)
-
-        matches = matches.filter(players_count__lt=F('total_players'))
-
-        results = []
-
-        for match in matches:
-            if not match.ground:
-                continue
-
-            g = match.ground
-
-            if not g.latitude or not g.longitude:
-                continue
-
-            distance = self.calculate_distance(
-                user_lat, user_lng,
-                g.latitude, g.longitude
+        if user.latitude is not None and user.longitude is not None:
+            games = nearby_queryset(
+                games, latitude=user.latitude, longitude=user.longitude, radius=10,
+                latitude_field='venue__latitude', longitude_field='venue__longitude',
             )
-
-            # filter nearby (within 10 km)
-            if distance <= 10:
-                results.append((match, distance))
-
-        # sort by nearest
-        results.sort(key=lambda x: x[1])
-
-        return Response(MatchSerializer([m[0] for m in results[:10]], many=True).data)
+        games = list(games[:10])
+        for game in games:
+            GameLifecycleService.refresh(game)
+        return Response(GameSerializer(games, many=True, context={'request': request}).data)
 
     def calculate_distance(self, lat1, lon1, lat2, lon2):
         R = 6371  # km

@@ -48,6 +48,8 @@ urlpatterns = [
     path('venues/', views.VenueListView.as_view()),
     path('venues/search/', views.VenueSearchView.as_view()),
     path('venues/nearby/', views.VenueNearbyView.as_view()),
+    path('venues/reviews/', views.VenueReviewView.as_view()),
+    path('venues/reviews/<uuid:public_id>/', views.VenueReviewDetailView.as_view()),
     path('venues/<uuid:public_id>/', views.VenueDetailView.as_view()),
     path('venues/<uuid:public_id>/availability/', views.VenueAvailabilityView.as_view()),
 

@@ -236,7 +236,10 @@ def login_view(request):
     )
     if not allowed:
         if audience == 'player' and is_admin:
-            detail = 'This account must use Admin login.'
+            detail = (
+                'This account is assigned the SportMate Admin role. Use Admin login, '
+                'or ask the application superowner to correct the role if this should be a player account.'
+            )
         elif audience == 'player' and is_venue_owner:
             detail = 'This account must use Venue login.'
         elif audience == 'player':
@@ -3094,7 +3097,7 @@ class AccessManagementView(APIView):
         data = []
         for user in users:
             roles = list(user.groups.values_list('name', flat=True))
-            if (user.is_superuser or user.has_perm('my_app.view_user')) and 'SportMate Admins' not in roles:
+            if user.is_superuser and 'SportMate Admins' not in roles:
                 roles.append('SportMate Admins')
             data.append({
                 'public_id': str(user.public_id),
@@ -3111,6 +3114,17 @@ class AccessManagementView(APIView):
         action = str(request.data.get('action', '')).strip().lower()
         if role not in self.allowed_roles or action not in {'grant', 'revoke'}:
             raise ValidationError({'detail': 'Use a supported role and grant or revoke action.'})
+        target_is_admin = user.is_superuser or user.groups.filter(name__in=ADMIN_GROUPS).exists()
+        target_is_venue_owner = user.groups.filter(name=VENUE_OWNER_GROUP).exists()
+        target_is_player = PlayerProfile.objects.filter(user=user).exists()
+        if action == 'grant' and role == 'SportMate Admins' and (target_is_player or target_is_venue_owner):
+            raise ValidationError({
+                'role': ['Player and venue-owner accounts cannot be promoted to administrator. Use a separate admin account.']
+            })
+        if action == 'grant' and role == VENUE_OWNER_GROUP and target_is_admin:
+            raise ValidationError({
+                'role': ['Administrator accounts cannot be assigned venue-owner access. Use a separate venue-owner account.']
+            })
         group, _ = Group.objects.get_or_create(name=role)
         (user.groups.add if action == 'grant' else user.groups.remove)(group)
         RoleAuditLog.objects.create(actor=request.user, target_user=user, role=role, action=action, reason=str(request.data.get('reason', '')).strip())

@@ -654,6 +654,50 @@ class AuthenticationApiTests(APITestCase):
         self.client.force_authenticate(player)
         self.assertEqual(self.client.get('/api/v1/admin/dashboard/').status_code, 403)
 
+    def test_role_management_prevents_admin_overlap_and_can_correct_misassigned_player(self):
+        superowner = User.objects.create_user(
+            username='role-superowner', email='role-superowner@example.com', password='StrongPass!123'
+        )
+        superowner.groups.add(Group.objects.create(name='SportMate Admins'))
+        player = self.create_user(username='misassigned-player', email='misassigned-player@example.com')
+        venue_owner = User.objects.create_user(
+            username='role-venue-owner', email='role-venue-owner@example.com', password='StrongPass!123'
+        )
+        venue_owner.groups.add(Group.objects.create(name='SportMate Venue Owners'))
+        admin_url = f'/api/v1/admin/access/users/{player.public_id}/'
+        venue_url = f'/api/v1/admin/access/users/{venue_owner.public_id}/'
+
+        self.client.force_authenticate(superowner)
+        denied_player_promotion = self.client.patch(admin_url, {
+            'role': 'SportMate Admins', 'action': 'grant', 'reason': 'Must remain a player.'
+        }, format='json')
+        denied_venue_promotion = self.client.patch(venue_url, {
+            'role': 'SportMate Admins', 'action': 'grant', 'reason': 'Must remain venue owner.'
+        }, format='json')
+        self.assertEqual(denied_player_promotion.status_code, 400)
+        self.assertEqual(denied_venue_promotion.status_code, 400)
+
+        # A previously misassigned explicit role can be removed by the superowner.
+        player.groups.add(Group.objects.get(name='SportMate Admins'))
+        revoked = self.client.patch(admin_url, {
+            'role': 'SportMate Admins', 'action': 'revoke', 'reason': 'Correct player role.'
+        }, format='json')
+        self.assertEqual(revoked.status_code, 200, revoked.data)
+        self.assertEqual(self.client.post(self.login_url, {
+            'identifier': player.email, 'password': 'StrongPass!123', 'audience': 'player',
+        }, format='json').status_code, 200)
+
+        admin_target = User.objects.create_user(
+            username='role-admin-target', email='role-admin-target@example.com', password='StrongPass!123'
+        )
+        admin_target.groups.add(Group.objects.get(name='SportMate Admins'))
+        venue_grant_to_admin = self.client.patch(
+            f'/api/v1/admin/access/users/{admin_target.public_id}/',
+            {'role': 'SportMate Venue Owners', 'action': 'grant', 'reason': 'Must remain admin.'},
+            format='json',
+        )
+        self.assertEqual(venue_grant_to_admin.status_code, 400)
+
     def test_suspended_account_cannot_use_protected_endpoints(self):
         user = self.create_user()
         login = self.client.post(self.login_url, {'identifier': user.email, 'password': 'StrongPass!123'}, format='json')

@@ -12,7 +12,7 @@ from .models import (
     NotificationPreference, UserDevice,
     PlayerRating,
     Achievement, UserAchievement,
-    Report, ModerationAction, UserModeration,
+    Report, ModerationAction, UserModeration, VenueOwnerApplication,
 )
 from .models import UserSport
 from .models import Venue, VenueAmenity, VenueImage, VenueReview, Court
@@ -455,6 +455,17 @@ class RegistrationRequestSerializer(serializers.Serializer):
     )
 
 
+class VenueOwnerRegistrationSerializer(serializers.Serializer):
+    name = serializers.CharField(source='full_name', max_length=150)
+    username = serializers.CharField(max_length=150)
+    email = serializers.EmailField()
+    phone = serializers.CharField(max_length=20, validators=[phone_validator])
+    city = serializers.CharField(max_length=100)
+    password = serializers.CharField(write_only=True, trim_whitespace=False, min_length=8)
+    business_name = serializers.CharField(max_length=200)
+    address = serializers.CharField(max_length=255)
+
+
 class LoginRequestSerializer(serializers.Serializer):
     identifier = serializers.CharField(max_length=254, required=False)
     email = serializers.EmailField(required=False)
@@ -511,7 +522,10 @@ class CurrentUserSerializer(serializers.ModelSerializer):
         read_only_fields = ['public_id', 'username', 'email', 'date_joined', 'is_active', 'account_status']
 
     def get_roles(self, obj):
-        return list(obj.groups.values_list('name', flat=True))
+        roles = list(obj.groups.values_list('name', flat=True))
+        if (obj.is_superuser or obj.has_perm('my_app.view_user')) and 'SportMate Admins' not in roles:
+            roles.append('SportMate Admins')
+        return roles
 
 
 # ------------------------------------------------------------------

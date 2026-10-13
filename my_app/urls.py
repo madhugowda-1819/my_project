@@ -27,6 +27,7 @@ urlpatterns = [
     path('admin/statistics/', views.AdminStatisticsView.as_view()),
     # ---------------- AUTH ----------------
     path('auth/register/', views.RegisterView.as_view()),
+    path('auth/register/venue-owner/', views.VenueOwnerRegisterView.as_view()),
     path('auth/login/', views.login_view),
     path('auth/logout/', views.LogoutView.as_view()),
     path('auth/token/refresh/', views.AccountTokenRefreshView.as_view()),

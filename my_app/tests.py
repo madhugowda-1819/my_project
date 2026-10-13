@@ -159,6 +159,7 @@ class MatchApiTests(APITestCase):
 
 class AuthenticationApiTests(APITestCase):
     register_url = '/api/v1/auth/register/'
+    venue_owner_register_url = '/api/v1/auth/register/venue-owner/'
     login_url = '/api/v1/auth/login/'
 
     def setUp(self):
@@ -191,6 +192,18 @@ class AuthenticationApiTests(APITestCase):
         self.assertEqual(user.city, 'Bengaluru')
         self.assertIn('access', response.data['tokens'])
         self.assertNotIn('password', response.data['user'])
+
+    def test_venue_owner_registration_creates_pending_application_without_player_profile(self):
+        response = self.client.post(self.venue_owner_register_url, {
+            **self.payload(username='arena-owner', email='owner@example.com', city='Bengaluru'),
+            'business_name': 'Arena Sports', 'address': '1 Sports Road',
+        }, format='json')
+        self.assertEqual(response.status_code, 201)
+        user = User.objects.get(email='owner@example.com')
+        self.assertFalse(PlayerProfile.objects.filter(user=user).exists())
+        application = user.venue_owner_applications.get()
+        self.assertEqual(application.status, 'pending')
+        self.assertEqual(application.business_name, 'Arena Sports')
 
     def test_duplicate_email_and_username_are_rejected(self):
         self.create_user()

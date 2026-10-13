@@ -1,7 +1,7 @@
 from django.contrib.auth import get_user_model
 from django.contrib.auth.models import Group
 from django.db.models import Q, Count, F
-from django.db import connection
+from django.db import connection, transaction
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
 from django.http import HttpResponse, HttpResponseBadRequest, JsonResponse
@@ -37,7 +37,7 @@ from .models import (
 )
 
 from .serializers import (
-    RegistrationRequestSerializer, LoginRequestSerializer, CurrentUserSerializer,
+    RegistrationRequestSerializer, VenueOwnerRegistrationSerializer, LoginRequestSerializer, CurrentUserSerializer,
     UserSerializer, SportSerializer, PublicPlayerSerializer, UserSportSerializer,
     UserSportWriteSerializer, PlayerProfilePreferencesSerializer,
     NearbySearchSerializer,
@@ -149,6 +149,32 @@ class RegisterView(APIView):
             'success': True,
             'user': CurrentUserSerializer(user).data,
             'tokens': AuthenticationService.tokens_for(user),
+        }, status=201)
+
+
+class VenueOwnerRegisterView(APIView):
+    """Create a non-player venue-owner account and its pending application."""
+    permission_classes = [AllowAny]
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = 'registration'
+
+    def post(self, request):
+        serializer = VenueOwnerRegistrationSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+        with transaction.atomic():
+            user = AuthenticationService.register(data=data, create_player_profile=False)
+            application = VenueOwnerApplication.objects.create(
+                applicant=user,
+                business_name=data['business_name'].strip(),
+                phone=data['phone'].strip(),
+                city=data['city'].strip(),
+                address=data['address'].strip(),
+            )
+        return Response({
+            'success': True,
+            'message': 'Venue-owner account created. Your application is pending admin approval.',
+            'application': {'public_id': str(application.public_id), 'status': application.status},
         }, status=201)
 
 
@@ -1760,14 +1786,20 @@ class UnreadMessageCountView(APIView):
         last_read_by_conversation = {
             member.conversation_id: member.last_read_at for member in members
         }
-        messages = Message.objects.filter(
-            conversation_id__in=last_read_by_conversation,
-            deleted_at__isnull=True,
-        ).exclude(sender=request.user).only('conversation_id', 'created_at')
-        conversation_count = sum(
-            1 for message in messages
-            if last_read_by_conversation[message.conversation_id] is None
-            or message.created_at > last_read_by_conversation[message.conversation_id]
+        # Build one indexed database count rather than loading every message
+        # into Python. Large inboxes previously made the chat tab exceed the
+        # mobile client's request timeout.
+        unread_filter = Q()
+        for conversation_id, last_read_at in last_read_by_conversation.items():
+            item_filter = Q(conversation_id=conversation_id)
+            if last_read_at is not None:
+                item_filter &= Q(created_at__gt=last_read_at)
+            unread_filter |= item_filter
+        conversation_count = (
+            Message.objects.filter(unread_filter, deleted_at__isnull=True)
+            .exclude(sender=request.user)
+            .count()
+            if last_read_by_conversation else 0
         )
         return Response({'unread': legacy_count + conversation_count})
 

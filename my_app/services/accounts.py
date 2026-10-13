@@ -17,7 +17,7 @@ class AccountUnavailable(PermissionDenied):
 
 class AuthenticationService:
     @staticmethod
-    def register(*, data):
+    def register(*, data, create_player_profile=True):
         email = data['email'].strip().lower()
         username = data['username'].strip()
         if User.objects.filter(email__iexact=email).exists():
@@ -41,7 +41,8 @@ class AuthenticationService:
                     city=data.get('city', '').strip(),
                     password=data['password'],
                 )
-                PlayerProfile.objects.create(user=user)
+                if create_player_profile:
+                    PlayerProfile.objects.create(user=user)
                 sports = data.get('sports', [])
                 if sports:
                     user.sports.set(sports)

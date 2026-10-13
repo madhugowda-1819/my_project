@@ -69,7 +69,7 @@ class RecommendationService:
     @classmethod
     def venues(cls, user, limit=20):
         latitude, longitude = cls._location(user)
-        queryset = Venue.objects.filter(active=True).prefetch_related('courts__sport')
+        queryset = Venue.objects.filter(active=True, is_demo=False, courts__active=True).distinct().prefetch_related('courts__sport')
         if latitude is not None:
             queryset = nearby_queryset(queryset, latitude=latitude, longitude=longitude, radius=20)
         sports, _ = cls._sports(user)
@@ -91,7 +91,9 @@ class RecommendationService:
     @classmethod
     def communities(cls, user, limit=20):
         latitude, longitude = cls._location(user)
-        kwargs = {'user': user, 'queryset': Community.objects.filter(visibility='public')}
+        # Public club details intentionally require membership in the club
+        # module; recommend only public communities that can be opened directly.
+        kwargs = {'user': user, 'queryset': Community.objects.filter(visibility='public', is_club=False)}
         if latitude is not None:
             kwargs.update(latitude=latitude, longitude=longitude, radius=20)
         return [{'community': item, 'score': RecommendationRankingService.bounded(item.discovery_score), 'reasons': ['Matches your sports or nearby location']} for item in CommunityDiscoveryService.discover(**kwargs)[:limit]]

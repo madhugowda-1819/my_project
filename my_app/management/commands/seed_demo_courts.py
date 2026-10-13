@@ -23,7 +23,8 @@ class Command(BaseCommand):
                 'description': 'Development-only demo venue for booking and AI matching tests.',
                 'address': 'Demo Sports Road', 'city': options['city'],
                 'latitude': latitude, 'longitude': longitude,
-                'opening_time': '06:00', 'closing_time': '23:00', 'active': True,
+                'opening_time': '06:00', 'closing_time': '23:00', 'active': False,
+                'is_demo': True,
             },
         )
         for sport, name, capacity, price in ((cricket, 'Cricket Turf 1', 12, 1200), (badminton, 'Badminton Court 1', 4, 500)):

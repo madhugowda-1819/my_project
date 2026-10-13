@@ -106,8 +106,8 @@ class BookingService:
 
     @classmethod
     def _validate_request(cls, *, venue, court, booking_date, start_time, end_time, lock_bookings=False):
-        if not venue.active:
-            raise BookingError('Venue is inactive.')
+        if not venue.active or venue.is_demo:
+            raise BookingError('Venue is inactive or is not a real bookable venue.')
         if court.venue_id != venue.id:
             raise BookingError('Court does not belong to the selected venue.')
         if not court.active:

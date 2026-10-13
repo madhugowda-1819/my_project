@@ -15,7 +15,11 @@ VALID_AMENITIES = {
 class VenueDiscoveryService:
     @staticmethod
     def filter_and_rank(*, queryset, data, amenities):
-        queryset = queryset.filter(active=True).prefetch_related(
+        queryset = queryset.filter(
+            active=True,
+            is_demo=False,
+            courts__active=True,
+        ).distinct().prefetch_related(
             'venue_sports__sport', 'courts__sport', 'images', 'reviews', 'amenities',
         )
         if data.get('sport'):

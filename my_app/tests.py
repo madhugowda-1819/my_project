@@ -897,6 +897,15 @@ class NearbySearchApiTests(APITestCase):
         self.assertNotIn('latitude', player)
         self.assertTrue(player['availability'])
 
+    def test_home_player_feed_uses_database_distance_filter_and_bounded_results(self):
+        response = self.client.get('/api/v1/players/', {
+            'lat': 12.9716, 'lng': 77.5946, 'radius': 2, 'sport': 'badminton',
+        })
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual([row['username'] for row in response.data], ['near-player'])
+        self.assertLess(response.data[0]['distance_km'], 1)
+        self.assertEqual(response.data[0]['rating_summary']['rating_count'], 0)
+
     def test_nearby_venues_and_invalid_or_missing_coordinates(self):
         venues = self.client.get('/api/v1/grounds/', {
             'latitude': 12.9716, 'longitude': 77.5946, 'radius': 2, 'sport': 'badminton',
@@ -1333,6 +1342,23 @@ class BookingEngineTests(APITestCase):
         self.assertEqual(response.data['venue_name'], 'Booking Arena')
         self.assertEqual(response.data['court_name'], 'Booking Court')
         self.assertEqual(str(response.data['final_amount']), '500.00')
+
+    def test_demo_inventory_is_hidden_and_cannot_be_booked(self):
+        demo = Venue.objects.create(
+            name='SportMate Demo Arena', address='Test Road', city='Bengaluru',
+            latitude=12.97, longitude=77.59, opening_time='09:00', closing_time='20:00',
+            active=True, is_demo=True,
+        )
+        demo_court = Court.objects.create(
+            venue=demo, sport=self.court.sport, name='Demo court', capacity=4,
+            price_per_hour=500, active=True,
+        )
+        listed = self.client.get('/api/v1/venues/')
+        items = listed.data.get('results', listed.data)
+        self.assertNotIn(str(demo.public_id), [str(item['public_id']) for item in items])
+        payload = self.payload(venue_id=str(demo.public_id), court_id=str(demo_court.public_id))
+        self.assertEqual(self.client.post('/api/v1/bookings/quote/', payload, format='json').status_code, 400)
+        self.assertEqual(self.create(venue_id=str(demo.public_id), court_id=str(demo_court.public_id)).status_code, 400)
 
     def test_conflict_overlap_cancellation_and_slot_reuse(self):
         first = self.create()
@@ -1822,6 +1848,7 @@ class CommunityApiTests(APITestCase):
         self.assertEqual(created.status_code, 201)
         community_id = created.data['data']['public_id']
         community = Community.objects.get(public_id=community_id)
+        self.assertFalse(community.is_club)
         self.assertEqual(community.member_count, 1)
         self.assertEqual(community.members.get(user=self.owner).role, CommunityMember.Role.OWNER)
         self.client.force_authenticate(self.member)
@@ -1836,6 +1863,20 @@ class CommunityApiTests(APITestCase):
         self.assertEqual(like.status_code, 201)
         self.assertEqual(duplicate.status_code, 200)
         self.assertEqual(CommunityPostLike.objects.count(), 1)
+
+    def test_community_update_and_owner_only_archive_preserve_record(self):
+        created = self.create(is_club=False)
+        community_id = created.data['data']['public_id']
+        self.client.force_authenticate(self.member)
+        denied = self.client.delete(f'/api/v1/communities/{community_id}/')
+        self.assertEqual(denied.status_code, 403)
+        self.client.force_authenticate(self.owner)
+        changed = self.client.patch(f'/api/v1/communities/{community_id}/', {'name': 'Updated community'}, format='json')
+        self.assertEqual(changed.status_code, 200, changed.data)
+        self.assertEqual(changed.data['data']['name'], 'Updated community')
+        archived = self.client.delete(f'/api/v1/communities/{community_id}/')
+        self.assertEqual(archived.status_code, 204)
+        self.assertTrue(Community.objects.filter(public_id=community_id, is_active=False).exists())
 
     def test_club_list_details_and_members_require_membership_for_club(self):
         created = self.create(is_club=True)
@@ -1969,6 +2010,36 @@ class EventTournamentTests(APITestCase):
         event.registration_deadline=timezone.now()-timedelta(seconds=1);event.save(update_fields=['registration_deadline','updated_at'])
         self.client.force_authenticate(self.second)
         self.assertEqual(self.client.post(f'/api/v1/events/{event.public_id}/register/').status_code,400)
+
+    def test_event_organizer_update_and_delete_cancel_preserve_event(self):
+        created = self.create_event()
+        event = Event.objects.get(public_id=created.data['data']['public_id'])
+        self.client.force_authenticate(self.organizer)
+        changed = self.client.patch(f'/api/v1/events/{event.public_id}/', {'title': 'Updated event', 'description': 'New details'}, format='json')
+        self.assertEqual(changed.status_code, 200, changed.data)
+        event.refresh_from_db()
+        self.assertEqual(event.title, 'Updated event')
+        cancelled = self.client.delete(f'/api/v1/events/{event.public_id}/')
+        self.assertEqual(cancelled.status_code, 204)
+        event.refresh_from_db()
+        self.assertEqual(event.status, Event.Status.CANCELLED)
+
+    def test_tournament_crud_is_organizer_only_and_delete_cancels(self):
+        start = timezone.localdate() + timedelta(days=7)
+        payload = {'name': 'City Cup', 'sport_id': self.sport.id, 'venue_id': str(self.venue.public_id), 'start_date': start.isoformat(), 'end_date': (start + timedelta(days=1)).isoformat(), 'registration_deadline': (timezone.now() + timedelta(days=2)).isoformat(), 'maximum_teams': 4}
+        created = self.client.post('/api/v1/tournaments/', payload, format='json')
+        self.assertEqual(created.status_code, 201, created.data)
+        tournament_id = created.data['data']['public_id']
+        self.client.force_authenticate(self.first)
+        denied = self.client.patch(f'/api/v1/tournaments/{tournament_id}/', {'name': 'Not allowed'}, format='json')
+        self.assertEqual(denied.status_code, 403)
+        self.client.force_authenticate(self.organizer)
+        updated = self.client.patch(f'/api/v1/tournaments/{tournament_id}/', {'name': 'City Cup Updated'}, format='json')
+        self.assertEqual(updated.status_code, 200, updated.data)
+        self.assertEqual(updated.data['name'], 'City Cup Updated')
+        deleted = self.client.delete(f'/api/v1/tournaments/{tournament_id}/')
+        self.assertEqual(deleted.status_code, 204)
+        self.assertEqual(Tournament.objects.get(public_id=tournament_id).status, Tournament.Status.CANCELLED)
 
     def test_tournament_registration_uses_team_records_and_enforces_deadline_capacity(self):
         start=timezone.localdate()+timedelta(days=5)
@@ -2119,6 +2190,14 @@ class NotificationApiTests(APITestCase):
     def test_notification_ownership(self):
         self.client.force_authenticate(self.other)
         self.assertEqual(self.client.get(f'/api/v1/notifications/{self.notification.public_id}/').status_code,404)
+
+    def test_notification_list_is_paginated_and_private_to_current_user(self):
+        Notification.objects.create(user=self.other, type='message', title='Private')
+        response = self.client.get('/api/v1/notifications/')
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data['count'], 1)
+        self.assertEqual(len(response.data['results']), 1)
+        self.assertEqual(response.data['results'][0]['public_id'], str(self.notification.public_id))
 
 
 class RecommendationEngineTests(APITestCase):

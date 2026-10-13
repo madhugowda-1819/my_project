@@ -154,6 +154,7 @@ REST_FRAMEWORK = {
         'ratings': '20/hour',
         'reports': '10/hour',
         'recommendations': '60/minute',
+        'admin_access': '60/minute',
     },
 }
 

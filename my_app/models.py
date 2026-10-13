@@ -233,6 +233,7 @@ class Venue(TimestampedPublicModel):
     closing_time = models.TimeField()
     timezone = models.CharField(max_length=64, default='Asia/Kolkata')
     active = models.BooleanField(default=True, db_index=True)
+    is_demo = models.BooleanField(default=False, db_index=True)
 
     class Meta:
         indexes = [models.Index(fields=['city', 'active'], name='venue_city_active_idx')]
@@ -1104,6 +1105,8 @@ class Notification(TimestampedPublicModel):
         indexes = [
             models.Index(fields=['user', 'is_read', 'created_at'], name='notif_user_read_time_idx'),
             models.Index(fields=['user', 'type', 'created_at'], name='notification_user_type_idx'),
+            models.Index(fields=['user', 'deleted_at', '-created_at'], name='notif_user_del_created_idx'),
+            models.Index(fields=['user', 'is_read', 'deleted_at'], name='notif_user_unread_idx'),
         ]
 
 

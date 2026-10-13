@@ -1,6 +1,6 @@
 from django.contrib.auth import get_user_model
 from django.contrib.auth.models import Group
-from django.db.models import Q, Count, F
+from django.db.models import Q, Count, F, Avg
 from django.db import connection, transaction, IntegrityError
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
@@ -57,7 +57,7 @@ from .serializers import (
     ConversationMessageCreateSerializer, ConversationMessageSerializer,
     CommunityCreateSerializer, CommunityUpdateSerializer, CommunitySerializer, CommunityMemberSerializer,
     CommunityPostCreateSerializer, CommunityContentSerializer, CommunityPostSerializer, CommunityCommentSerializer,
-    EventCreateSerializer, EventSerializer, EventParticipantSerializer, EventReminderSerializer, TournamentCreateSerializer, TournamentRegistrationSerializer, TournamentSerializer, TournamentTeamSerializer, TournamentMatchSerializer,
+    EventCreateSerializer, EventUpdateSerializer, EventSerializer, EventParticipantSerializer, EventReminderSerializer, TournamentCreateSerializer, TournamentUpdateSerializer, TournamentRegistrationSerializer, TournamentSerializer, TournamentTeamSerializer, TournamentMatchSerializer,
     NotificationPreferenceSerializer, UserDeviceSerializer, UserDeviceCreateSerializer,
     PlayerRatingSerializer, PlayerRatingCreateSerializer, MatchReflectionSerializer, MatchReflectionInputSerializer,
     AchievementSerializer, UserAchievementSerializer,
@@ -432,41 +432,74 @@ class SportDetailView(generics.RetrieveAPIView):
 
 
 # ---------------- AI PLAYER MATCHING ----------------
-class PlayerListView(APIView):
+def _with_public_player_rating_summary(queryset):
+    """Fetch public rating aggregates with the player rows, not N+1 queries."""
+    return queryset.annotate(
+        public_rating_count=Count(
+            'ratings_received',
+            filter=Q(ratings_received__deleted_at__isnull=True),
+            distinct=True,
+        ),
+        public_average_rating=Avg(
+            'ratings_received__rating',
+            filter=Q(ratings_received__deleted_at__isnull=True),
+        ),
+        public_performance=Avg(
+            'ratings_received__playing_performance',
+            filter=Q(ratings_received__deleted_at__isnull=True),
+        ),
+        public_teamwork=Avg(
+            'ratings_received__teamwork',
+            filter=Q(ratings_received__deleted_at__isnull=True),
+        ),
+        public_sportsmanship=Avg(
+            'ratings_received__sportsmanship',
+            filter=Q(ratings_received__deleted_at__isnull=True),
+        ),
+        public_punctuality=Avg(
+            'ratings_received__punctuality',
+            filter=Q(ratings_received__deleted_at__isnull=True),
+        ),
+    )
+
+
+class PlayerListView(generics.ListAPIView):
+    serializer_class = PublicPlayerSerializer
     permission_classes = [IsActiveAccount]
+    pagination_class = None
 
-    def get(self, request):
-        sport = request.query_params.get('sport')
-        try:
-            lat = float(request.query_params['lat']) if 'lat' in request.query_params else None
-            lng = float(request.query_params['lng']) if 'lng' in request.query_params else None
-            radius = float(request.query_params.get('radius', 15))
-        except ValueError:
-            return Response({'success': False, 'error': {'code': 'VALIDATION_ERROR', 'message': 'lat, lng, and radius must be numbers.'}}, status=400)
-
-        user = request.user
-
-        players = User.objects.filter(is_available=True, profile__profile_visibility='public').exclude(id=user.id).prefetch_related('user_sports__sport')
-
+    def get_queryset(self):
+        params = self.request.query_params
+        queryset = User.objects.filter(
+            is_available=True, profile__profile_visibility='public',
+        ).exclude(pk=self.request.user.pk)
+        sport = params.get('sport')
         if sport:
-            players = players.filter(Q(user_sports__sport__slug__iexact=sport) | Q(user_sports__sport__name__iexact=sport))
+            queryset = queryset.filter(
+                Q(user_sports__sport__slug__iexact=sport)
+                | Q(user_sports__sport__name__iexact=sport)
+            )
+        queryset = _with_public_player_rating_summary(queryset).prefetch_related(
+            'user_sports__sport')
 
-        results = []
-
-        for p in players.distinct():
-            distance = p.distance_to(lat, lng) if lat is not None and lng is not None else None
-
-            if distance is not None and distance > radius:
-                continue
-
-            # 🔥 AI MATCHING ALGORITHM
-            p.distance_km = distance
-
-            results.append(p)
-
-        results.sort(key=lambda x: x.distance_km if x.distance_km is not None else float('inf'))
-
-        return Response(PublicPlayerSerializer(results, many=True).data)
+        if 'lat' in params or 'lng' in params:
+            search = NearbySearchSerializer(data={
+                'latitude': params.get('lat'),
+                'longitude': params.get('lng'),
+                'radius': params.get('radius', 15),
+            })
+            search.is_valid(raise_exception=True)
+            data = search.validated_data
+            queryset = nearby_queryset(
+                queryset, latitude=data['latitude'], longitude=data['longitude'],
+                radius=data['radius'],
+            )
+            return queryset.distinct()[:100]
+        else:
+            # Legacy callers without coordinates get a bounded directory, not
+            # an unbounded full-table scan and one ratings query per player.
+            queryset = queryset.order_by('username').distinct()[:100]
+        return queryset
 
 
 class NearbyPlayerView(generics.ListAPIView):
@@ -477,9 +510,9 @@ class NearbyPlayerView(generics.ListAPIView):
         params = NearbySearchSerializer(data=self.request.query_params)
         params.is_valid(raise_exception=True)
         data = params.validated_data
-        queryset = User.objects.filter(
+        queryset = _with_public_player_rating_summary(User.objects.filter(
             is_available=True, profile__profile_visibility='public',
-        ).exclude(pk=self.request.user.pk).prefetch_related('user_sports__sport')
+        ).exclude(pk=self.request.user.pk)).prefetch_related('user_sports__sport')
         if data.get('sport'):
             queryset = queryset.filter(
                 Q(user_sports__sport__slug__iexact=data['sport'])
@@ -846,6 +879,7 @@ class AdminVenueManagementView(APIView):
         queryset = queryset[:200]
         data = VenueSerializer(queryset, many=True, context={'request': request}).data
         for row, venue in zip(data, queryset):
+            row['is_demo'] = venue.is_demo
             row['owner'] = ({'public_id': str(venue.owner.public_id), 'username': venue.owner.username, 'email': venue.owner.email} if venue.owner_id else None)
             row['booking_count'] = venue.bookings.count()
         return Response({'success': True, 'data': data})
@@ -864,6 +898,8 @@ class AdminVenueManagementView(APIView):
         if 'active' in changes:
             if not isinstance(changes['active'], bool):
                 raise ValidationError({'active': 'Must be true or false.'})
+            if changes['active'] and venue.is_demo:
+                raise ValidationError({'active': 'Demo venues cannot be enabled for player booking.'})
             if changes['active'] and not venue.active:
                 if not venue.owner_id or not venue.venue_sports.exists() or not venue.courts.filter(active=True).exists():
                     raise ValidationError({'active': 'Assign an approved owner, at least one sport, and an active court before approval.'})
@@ -917,7 +953,7 @@ class VenueDetailView(generics.RetrieveAPIView):
     lookup_field = 'public_id'
 
     def get_queryset(self):
-        return Venue.objects.filter(active=True).prefetch_related(
+        return Venue.objects.filter(active=True, is_demo=False, courts__active=True).distinct().prefetch_related(
             'venue_sports__sport', 'courts__sport', 'images', 'reviews__user', 'amenities',
         )
 
@@ -976,7 +1012,9 @@ class VenueAvailabilityView(APIView):
     permission_classes = [AllowAny]
 
     def get(self, request, public_id):
-        venue = get_object_or_404(Venue, public_id=public_id)
+        venue = get_object_or_404(Venue.objects.filter(
+            active=True, is_demo=False, courts__active=True,
+        ).distinct(), public_id=public_id)
         query = VenueAvailabilityQuerySerializer(data=request.query_params)
         query.is_valid(raise_exception=True)
         data = query.validated_data
@@ -2119,15 +2157,31 @@ class EventListCreateView(generics.ListCreateAPIView):
   s=EventCreateSerializer(data=request.data);s.is_valid(raise_exception=True);d=s.validated_data
   d['venue']=get_object_or_404(Venue,public_id=d.pop('venue_id')); d['court']=get_object_or_404(Court,public_id=d.pop('court_id')) if d.get('court_id') else None; d.pop('court_id',None)
   d['community']=get_object_or_404(Community,public_id=d.pop('community_id')) if d.get('community_id') else None; d.pop('community_id',None); d['game']=get_object_or_404(Game,public_id=d.pop('game_id')) if d.get('game_id') else None; d.pop('game_id',None)
-  event=EventService.create(organizer=request.user,**d); return Response({'success':True,'data':EventSerializer(event).data},status=201)
+  event=EventService.create(organizer=request.user,**d); return Response({'success':True,'data':EventSerializer(event,context={'request':request}).data},status=201)
 class EventDetailView(generics.RetrieveUpdateDestroyAPIView):
  permission_classes=[IsActiveAccount];serializer_class=EventSerializer;lookup_field='public_id'
  def get_queryset(self):
   return Event.objects.filter(Q(visibility=Event.Visibility.PUBLIC)|Q(organizer=self.request.user)|Q(participants__user=self.request.user)|Q(community__members__user=self.request.user,community__members__status=CommunityMember.Status.ACTIVE)).select_related('sport','venue','court','community').distinct()
  def perform_update(self, serializer):
-  if self.get_object().organizer_id != self.request.user.id:
+  event = serializer.instance
+  if event.organizer_id != self.request.user.id:
    raise PermissionDenied('Only the event organizer can edit this event.')
-  serializer.save()
+  changes = EventUpdateSerializer(event, data=self.request.data, partial=True)
+  changes.is_valid(raise_exception=True)
+  data = changes.validated_data
+  event_date = data.get('event_date', event.event_date)
+  start_time = data.get('start_time', event.start_time)
+  end_time = data.get('end_time', event.end_time)
+  starts_at, ends_at = BookingService._local_datetimes(venue=event.venue, booking_date=event_date, start_time=start_time, end_time=end_time)
+  if starts_at <= timezone.now():
+   raise ValidationError({'event_date': 'Event must remain in the future.'})
+  if data.get('registration_deadline', event.registration_deadline) >= starts_at:
+   raise ValidationError({'registration_deadline': 'Deadline must precede the event start.'})
+  for key, value in data.items():
+   setattr(event, key, value)
+  event.starts_at, event.ends_at = starts_at, ends_at
+  event.save(update_fields=[*data.keys(), 'starts_at', 'ends_at', 'updated_at'])
+  EventCapacityService.refresh(event)
  def destroy(self,request,*args,**kwargs):
   e=self.get_object()
   EventCancellationService.cancel(event=e,actor=request.user);return Response(status=204)
@@ -2186,12 +2240,26 @@ class TournamentListCreateView(generics.ListCreateAPIView):
  def get_queryset(self): return _calendar_filters(self.request,tournaments=True)
  def create(self,request,*args,**kwargs):
   s=TournamentCreateSerializer(data=request.data);s.is_valid(raise_exception=True);d=s.validated_data;d['venue']=get_object_or_404(Venue,public_id=d.pop('venue_id'))
-  t=Tournament.objects.create(tournament_reference=EventService.ref('TR'),organizer=request.user,**d);return Response({'success':True,'data':TournamentSerializer(t).data},status=201)
-class TournamentDetailView(generics.RetrieveUpdateAPIView):
+  t=Tournament.objects.create(tournament_reference=EventService.ref('TR'),organizer=request.user,**d);return Response({'success':True,'data':TournamentSerializer(t,context={'request':request}).data},status=201)
+class TournamentDetailView(generics.RetrieveUpdateDestroyAPIView):
  permission_classes=[IsActiveAccount];serializer_class=TournamentSerializer;lookup_field='public_id';queryset=Tournament.objects.select_related('sport','venue')
  def perform_update(self,serializer):
-  if self.get_object().organizer_id!=self.request.user.id: raise PermissionDenied('Only the tournament organizer can edit this tournament.')
-  serializer.save()
+  tournament = serializer.instance
+  if tournament.organizer_id!=self.request.user.id: raise PermissionDenied('Only the tournament organizer can edit this tournament.')
+  changes = TournamentUpdateSerializer(tournament, data=self.request.data, partial=True)
+  changes.is_valid(raise_exception=True)
+  for key, value in changes.validated_data.items():
+   setattr(tournament, key, value)
+  tournament.save(update_fields=[*changes.validated_data.keys(), 'updated_at'])
+ def destroy(self,request,*args,**kwargs):
+  tournament = self.get_object()
+  if tournament.organizer_id != request.user.id:
+   raise PermissionDenied('Only the tournament organizer can cancel it.')
+  if tournament.status == Tournament.Status.COMPLETED:
+   raise ValidationError('Completed tournaments cannot be cancelled.')
+  tournament.status = Tournament.Status.CANCELLED
+  tournament.save(update_fields=['status', 'updated_at'])
+  return Response(status=204)
 
 class TournamentRegistrationView(APIView):
  permission_classes=[IsActiveAccount]
@@ -2469,6 +2537,9 @@ class CommunityListCreateView(generics.ListCreateAPIView):
         queryset = Community.objects.filter(visible, is_active=True).select_related('sport', 'owner').distinct()
         sport = self.request.query_params.get('sport')
         clubs_only = self.request.query_params.get('clubs') == 'true'
+        communities_only = self.request.query_params.get('communities') == 'true'
+        if communities_only:
+            queryset = queryset.filter(is_club=False)
         if clubs_only:
             queryset = queryset.filter(is_club=True)
             queryset = queryset.filter(
@@ -2493,7 +2564,6 @@ class CommunityListCreateView(generics.ListCreateAPIView):
     def create(self, request, *args, **kwargs):
         serializer = CommunityCreateSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
-        serializer.validated_data['is_club'] = True
         community = CommunityService.create(owner=request.user, **serializer.validated_data)
         return Response({'success': True, 'data': CommunitySerializer(community, context={'request': request}).data}, status=201)
 
@@ -2523,6 +2593,14 @@ class CommunityDetailView(APIView):
             setattr(community, key, value)
         community.save(update_fields=[*serializer.validated_data.keys(), 'updated_at'])
         return Response({'success': True, 'data': CommunitySerializer(community, context={'request': request}).data})
+
+    def delete(self, request, public_id):
+        community = get_object_or_404(Community, public_id=public_id, is_active=True)
+        if community.owner_id != request.user.id:
+            raise PermissionDenied('Only the community owner can archive it.')
+        community.is_active = False
+        community.save(update_fields=['is_active', 'updated_at'])
+        return Response(status=204)
 
 
 class CommunityJoinLeaveView(APIView):
@@ -3090,6 +3168,11 @@ class VenueOwnerApplicationView(APIView):
 
 class AccessManagementView(APIView):
     permission_classes = [IsPlatformAdmin]
+    # Role revocation is an account-recovery operation. Isolate it from the
+    # much broader default per-user API quota so a busy app cannot lock a
+    # superowner out of correcting an account role.
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = 'admin_access'
     allowed_roles = {'SportMate Venue Owners', 'SportMate Moderators', 'SportMate Admins', 'SportMate Support'}
 
     def get(self, request):
@@ -3103,6 +3186,7 @@ class AccessManagementView(APIView):
                 'public_id': str(user.public_id),
                 'username': user.username,
                 'email': user.email,
+                'is_active': user.is_active,
                 'account_status': user.account_status,
                 'roles': roles,
             })

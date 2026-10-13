@@ -473,11 +473,21 @@ class PublicPlayerSerializer(serializers.ModelSerializer):
         return round(distance, 1) if distance is not None else None
 
     def get_rating_summary(self, obj):
-        from django.db.models import Avg, Count
-        values = obj.ratings_received.filter(deleted_at__isnull=True).aggregate(
-            overall=Avg('rating'), count=Count('id'), playing_performance=Avg('playing_performance'),
-            teamwork=Avg('teamwork'), sportsmanship=Avg('sportsmanship'), punctuality=Avg('punctuality'),
-        )
+        if hasattr(obj, 'public_rating_count'):
+            values = {
+                'overall': obj.public_average_rating,
+                'count': obj.public_rating_count,
+                'playing_performance': obj.public_performance,
+                'teamwork': obj.public_teamwork,
+                'sportsmanship': obj.public_sportsmanship,
+                'punctuality': obj.public_punctuality,
+            }
+        else:
+            from django.db.models import Avg, Count
+            values = obj.ratings_received.filter(deleted_at__isnull=True).aggregate(
+                overall=Avg('rating'), count=Count('id'), playing_performance=Avg('playing_performance'),
+                teamwork=Avg('teamwork'), sportsmanship=Avg('sportsmanship'), punctuality=Avg('punctuality'),
+            )
         return {
             'average_rating': round(float(values['overall'] or 0), 1), 'rating_count': values['count'],
             'playing_performance': round(float(values['playing_performance'] or 0), 1),
@@ -1277,6 +1287,47 @@ class EventSerializer(serializers.ModelSerializer):
     def get_is_organizer(self,obj):
         request=self.context.get('request')
         return bool(request and request.user.is_authenticated and obj.organizer_id==request.user.id)
+
+
+class EventUpdateSerializer(serializers.Serializer):
+    title = serializers.CharField(max_length=200, required=False)
+    description = serializers.CharField(required=False, allow_blank=True)
+    event_date = serializers.DateField(required=False)
+    start_time = serializers.TimeField(required=False)
+    end_time = serializers.TimeField(required=False)
+    maximum_participants = serializers.IntegerField(min_value=1, required=False)
+    minimum_participants = serializers.IntegerField(min_value=1, required=False)
+    skill_level = serializers.ChoiceField(choices=UserSport.SkillLevel.choices, required=False, allow_blank=True)
+    visibility = serializers.ChoiceField(choices=Event.Visibility.choices, required=False)
+    event_type = serializers.ChoiceField(choices=Event.Type.choices, required=False)
+    registration_deadline = serializers.DateTimeField(required=False)
+
+    def validate_registration_deadline(self, value):
+        raw = self.initial_data.get('registration_deadline')
+        if not isinstance(raw, str) or not (raw.endswith('Z') or '+' in raw[10:] or '-' in raw[10:]):
+            raise serializers.ValidationError('Include a timezone offset, such as +05:30 or Z.')
+        return value
+
+    def validate(self, attrs):
+        event = self.instance
+        start = attrs.get('start_time', event.start_time)
+        end = attrs.get('end_time', event.end_time)
+        event_date = attrs.get('event_date', event.event_date)
+        maximum = attrs.get('maximum_participants', event.maximum_participants)
+        minimum = attrs.get('minimum_participants', event.minimum_participants)
+        if end <= start:
+            raise serializers.ValidationError({'end_time': 'Must be later than the start time.'})
+        if minimum > maximum:
+            raise serializers.ValidationError({'minimum_participants': 'Must not exceed the maximum.'})
+        active_count = event.participants.filter(status=EventParticipant.Status.REGISTERED).count()
+        if maximum < active_count:
+            raise serializers.ValidationError({'maximum_participants': 'Cannot be lower than the current registered participant count.'})
+        if event_date < timezone.localdate():
+            raise serializers.ValidationError({'event_date': 'Event date must not be in the past.'})
+        deadline = attrs.get('registration_deadline', event.registration_deadline)
+        if deadline <= timezone.now():
+            raise serializers.ValidationError({'registration_deadline': 'Must be in the future.'})
+        return attrs
 class EventParticipantSerializer(serializers.ModelSerializer):
     username=serializers.CharField(source='user.username',read_only=True)
     class Meta: model=EventParticipant; fields=['username','status','joined_at','left_at']
@@ -1302,15 +1353,51 @@ class TournamentCreateSerializer(serializers.Serializer):
         return attrs
 
 
+class TournamentUpdateSerializer(serializers.Serializer):
+    name = serializers.CharField(max_length=200, required=False)
+    start_date = serializers.DateField(required=False)
+    end_date = serializers.DateField(required=False)
+    registration_deadline = serializers.DateTimeField(required=False)
+    maximum_teams = serializers.IntegerField(min_value=2, required=False)
+    format = serializers.ChoiceField(choices=Tournament.Format.choices, required=False)
+    skill_level = serializers.ChoiceField(choices=UserSport.SkillLevel.choices, required=False, allow_blank=True)
+
+    def validate_registration_deadline(self, value):
+        raw = self.initial_data.get('registration_deadline')
+        if not isinstance(raw, str) or not (raw.endswith('Z') or '+' in raw[10:] or '-' in raw[10:]):
+            raise serializers.ValidationError('Include a timezone offset, such as +05:30 or Z.')
+        return value
+
+    def validate(self, attrs):
+        tournament = self.instance
+        start = attrs.get('start_date', tournament.start_date)
+        end = attrs.get('end_date', tournament.end_date)
+        deadline = attrs.get('registration_deadline', tournament.registration_deadline)
+        maximum = attrs.get('maximum_teams', tournament.maximum_teams)
+        if start < timezone.localdate():
+            raise serializers.ValidationError({'start_date': 'Tournament start date must not be in the past.'})
+        if end < start:
+            raise serializers.ValidationError({'end_date': 'End date must be on or after the start date.'})
+        if deadline <= timezone.now() or deadline.date() > start:
+            raise serializers.ValidationError({'registration_deadline': 'Deadline must be in the future and on or before the tournament start date.'})
+        if tournament.teams.filter(status=TournamentTeam.Status.ACTIVE).count() > maximum:
+            raise serializers.ValidationError({'maximum_teams': 'Cannot be lower than the current active team count.'})
+        return attrs
+
+
 class TournamentRegistrationSerializer(serializers.Serializer):
     team_name = serializers.CharField(max_length=120, required=False, allow_blank=True, default='')
 class TournamentSerializer(serializers.ModelSerializer):
     sport_name=serializers.CharField(source='sport.name',read_only=True); venue_name=serializers.CharField(source='venue.name',read_only=True); venue_city=serializers.CharField(source='venue.city',read_only=True)
     registration_status=serializers.SerializerMethodField()
+    is_organizer=serializers.SerializerMethodField()
     class Meta:
         model=Tournament
-        fields=['public_id','tournament_reference','name','sport','sport_name','venue','venue_name','venue_city','start_date','end_date','registration_deadline','maximum_teams','format','skill_level','status','registration_status','is_inter_college']
+        fields=['public_id','tournament_reference','name','sport','sport_name','venue','venue_name','venue_city','start_date','end_date','registration_deadline','maximum_teams','format','skill_level','status','registration_status','is_inter_college','is_organizer']
         read_only_fields=fields
+    def get_is_organizer(self,obj):
+        request=self.context.get('request')
+        return bool(request and request.user.is_authenticated and obj.organizer_id==request.user.id)
     def get_registration_status(self,obj):
         request=self.context.get('request')
         if not request or not request.user.is_authenticated:return None

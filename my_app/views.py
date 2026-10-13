@@ -32,7 +32,7 @@ import requests
 
 from .models import (
     Sport, AvailabilitySlot, Match, Message, Notification, Ground, SportsGround, PlayerProfile,
-    Venue, Court, VenueReview, CourtBooking, Game, GamePlayer, Conversation, ConversationMember,
+    Venue, VenueSport, Court, CourtBlockedPeriod, VenueReview, CourtBooking, Game, GamePlayer, Conversation, ConversationMember,
     Community, CommunityMember, CommunityPost, CommunityComment, CommunityPostLike,
     Event, EventParticipant, EventReminder, Tournament, TournamentTeam, TournamentTeamMember, TournamentMatch, NotificationPreference, UserDevice, PlayerRating, Achievement, UserAchievement, Report, ModerationAction, VenueOwnerApplication, RoleAuditLog,
     College, CollegeMembership, CollegeChallenge, CollegeResultDispute, MatchTimePoll, MatchReflection,
@@ -44,8 +44,9 @@ from .serializers import (
     UserSportWriteSerializer, PlayerProfilePreferencesSerializer,
     NearbySearchSerializer,
     PlayerRecommendationQuerySerializer, MatchMyMoodQuerySerializer,
-    VenueSerializer, VenueDiscoveryQuerySerializer, VenueReviewCreateSerializer, VenueReviewSerializer,
+    VenueSerializer, CourtSerializer, VenueDiscoveryQuerySerializer, VenueReviewCreateSerializer, VenueReviewSerializer,
     VenueAvailabilityQuerySerializer, CourtBookingCreateSerializer,
+    VenueOwnerVenueWriteSerializer, VenueOwnerCourtWriteSerializer, VenueOwnerBlockedPeriodWriteSerializer,
     BookingCreateSerializer, BookingSerializer, RazorpayVerificationSerializer,
     MatchSerializer, MatchParticipantSerializer, MessageSerializer,
     NotificationSerializer, AvailabilityToggleSerializer,
@@ -76,7 +77,7 @@ from .serializers import (
     TrainingRecommendationInputSerializer,
 )
 from .maps import MapsProviderError, find_live_sports_grounds
-from .permissions import ADMIN_GROUPS, IsActiveAccount, IsPlatformAdmin, IsPlatformModerator, has_platform_role, MODERATOR_GROUPS, VENUE_OWNER_GROUP
+from .permissions import ADMIN_GROUPS, IsActiveAccount, IsApprovedVenueOwner, IsPlatformAdmin, IsPlatformModerator, has_platform_role, MODERATOR_GROUPS, VENUE_OWNER_GROUP
 from .services.accounts import AuthenticationService, UserService
 from .services.availability import VenueAvailabilityService
 from .services.bookings import BookingCancellationService, BookingService
@@ -220,13 +221,18 @@ def login_view(request):
     user = AuthenticationService.login(identifier=identifier, password=password)
 
     roles = set(user.groups.values_list('name', flat=True))
-    is_admin = user.is_superuser or user.has_perm('my_app.view_user') or bool(roles & ADMIN_GROUPS)
+    # Login audiences are account roles, not incidental Django model
+    # permissions. A player may have a limited staff permission without
+    # becoming a platform administrator.
+    is_admin = user.is_superuser or bool(roles & ADMIN_GROUPS)
     is_venue_owner = VENUE_OWNER_GROUP in roles
     is_player = PlayerProfile.objects.filter(user_id=user.id).exists()
     allowed = (
         (audience == 'admin' and is_admin)
         or (audience == 'venue' and is_venue_owner and not is_admin)
-        or (audience == 'player' and is_player and not is_admin and not is_venue_owner)
+        # A venue owner who also has a player profile may use player features;
+        # venue-only accounts must use Venue login. Admins remain exclusive.
+        or (audience == 'player' and is_player and not is_admin)
     )
     if not allowed:
         if audience == 'player' and is_admin:
@@ -647,6 +653,249 @@ class MatchMyMoodView(APIView):
                 for item in player_results
             ],
         })
+
+
+class VenueOwnerDashboardView(APIView):
+    permission_classes = [IsApprovedVenueOwner]
+
+    def get(self, request):
+        venues = Venue.objects.filter(owner=request.user)
+        venue_ids = venues.values('pk')
+        bookings = CourtBooking.objects.filter(venue_id__in=venue_ids)
+        today = timezone.now()
+        return Response({'success': True, 'data': {
+            'venues': venues.count(),
+            'active_venues': venues.filter(active=True).count(),
+            'pending_venues': venues.filter(active=False).count(),
+            'courts': Court.objects.filter(venue__in=venue_ids).count(),
+            'active_courts': Court.objects.filter(venue__in=venue_ids, active=True).count(),
+            'upcoming_bookings': bookings.filter(status__in=[CourtBooking.Status.PENDING, CourtBooking.Status.CONFIRMED], ends_at__gt=today).count(),
+            'bookings_total': bookings.count(),
+        }})
+
+
+class VenueOwnerVenuesView(APIView):
+    permission_classes = [IsApprovedVenueOwner]
+
+    def get(self, request):
+        venues = Venue.objects.filter(owner=request.user).prefetch_related('venue_sports__sport', 'courts__sport').order_by('name')
+        return Response({'success': True, 'data': VenueSerializer(venues, many=True, context={'request': request}).data})
+
+    @transaction.atomic
+    def post(self, request):
+        serializer = VenueOwnerVenueWriteSerializer(data=request.data)
+        unknown = set(request.data.keys()) - set(serializer.fields.keys())
+        if unknown:
+            raise ValidationError({field: 'This field cannot be changed by venue owners.' for field in sorted(unknown)})
+        serializer.is_valid(raise_exception=True)
+        venue = serializer.save(owner=request.user, active=False)
+        return Response({'success': True, 'detail': 'Venue submitted for superowner review. It will become bookable after approval.', 'data': VenueSerializer(venue, context={'request': request}).data}, status=201)
+
+
+class VenueOwnerVenueDetailView(APIView):
+    permission_classes = [IsApprovedVenueOwner]
+
+    def patch(self, request, public_id):
+        venue = get_object_or_404(Venue, public_id=public_id, owner=request.user)
+        serializer = VenueOwnerVenueWriteSerializer(venue, data=request.data, partial=True)
+        unknown = set(request.data.keys()) - set(serializer.fields.keys())
+        if unknown:
+            raise ValidationError({field: 'This field cannot be changed by venue owners.' for field in sorted(unknown)})
+        serializer.is_valid(raise_exception=True)
+        venue = serializer.save()
+        return Response({'success': True, 'data': VenueSerializer(venue, context={'request': request}).data})
+
+
+class VenueOwnerCourtsView(APIView):
+    permission_classes = [IsApprovedVenueOwner]
+
+    def get_venue(self, public_id):
+        return get_object_or_404(Venue, public_id=public_id, owner=self.request.user)
+
+    def get(self, request, public_id):
+        venue = self.get_venue(public_id)
+        courts = venue.courts.select_related('sport').order_by('name')
+        return Response({'success': True, 'data': CourtSerializer(courts, many=True).data})
+
+    @transaction.atomic
+    def post(self, request, public_id):
+        venue = self.get_venue(public_id)
+        serializer = VenueOwnerCourtWriteSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        if not venue.venue_sports.filter(sport=serializer.validated_data['sport']).exists():
+            raise ValidationError({'sport_id': 'Add this sport to the venue profile before creating a court.'})
+        court = serializer.save(venue=venue)
+        return Response({'success': True, 'data': CourtSerializer(court).data}, status=201)
+
+
+class VenueOwnerCourtDetailView(APIView):
+    permission_classes = [IsApprovedVenueOwner]
+
+    def get_court(self, request, public_id):
+        return get_object_or_404(Court.objects.select_related('venue', 'sport'), public_id=public_id, venue__owner=request.user)
+
+    @transaction.atomic
+    def patch(self, request, public_id):
+        court = self.get_court(request, public_id)
+        payload = request.data.copy()
+        active = payload.pop('active', None)
+        serializer = VenueOwnerCourtWriteSerializer(court, data=payload, partial=True)
+        serializer.is_valid(raise_exception=True)
+        sport = serializer.validated_data.get('sport', court.sport)
+        if not court.venue.venue_sports.filter(sport=sport).exists():
+            raise ValidationError({'sport_id': 'Add this sport to the venue profile before assigning it to a court.'})
+        court = serializer.save()
+        if active is not None:
+            if not isinstance(active, bool):
+                raise ValidationError({'active': 'Must be true or false.'})
+            if active and not court.venue.active:
+                raise ValidationError({'active': 'A court cannot be activated while its venue is awaiting approval or inactive.'})
+            court.active = active
+            court.save(update_fields=['active', 'updated_at'])
+        return Response({'success': True, 'data': CourtSerializer(court).data})
+
+    @transaction.atomic
+    def delete(self, request, public_id):
+        court = self.get_court(request, public_id)
+        court.active = False
+        court.save(update_fields=['active', 'updated_at'])
+        return Response({'success': True, 'detail': 'Court deactivated; booking history was preserved.'})
+
+
+class VenueOwnerBookingsView(APIView):
+    permission_classes = [IsApprovedVenueOwner]
+
+    def get(self, request):
+        queryset = CourtBooking.objects.filter(venue__owner=request.user).select_related('venue', 'court', 'court__sport', 'user').order_by('-starts_at')
+        status = request.query_params.get('status')
+        if status:
+            if status not in CourtBooking.Status.values:
+                raise ValidationError({'status': 'Choose a valid booking status.'})
+            queryset = queryset.filter(status=status)
+        venue_id = request.query_params.get('venue')
+        if venue_id:
+            queryset = queryset.filter(venue__public_id=venue_id)
+        records = queryset[:200]
+        return Response({'success': True, 'data': [{
+            'public_id': str(item.public_id), 'booking_reference': item.booking_reference,
+            'venue_id': str(item.venue.public_id), 'venue_name': item.venue.name,
+            'court_name': item.court.name, 'sport': item.court.sport.name,
+            'customer': item.user.username, 'booking_date': item.booking_date,
+            'start_time': item.start_time, 'end_time': item.end_time,
+            'starts_at': item.starts_at, 'ends_at': item.ends_at,
+            'status': item.status, 'amount': item.final_amount,
+        } for item in records]})
+
+
+class VenueOwnerBlockedPeriodsView(APIView):
+    permission_classes = [IsApprovedVenueOwner]
+
+    def get_court(self, request, venue_id, court_id):
+        return get_object_or_404(Court.objects.select_related('venue'), public_id=court_id, venue__public_id=venue_id, venue__owner=request.user)
+
+    def get(self, request, venue_id, court_id):
+        court = self.get_court(request, venue_id, court_id)
+        periods = court.blocked_periods.order_by('-starts_at')[:200]
+        return Response({'success': True, 'data': [{
+            'public_id': str(item.public_id), 'starts_at': item.starts_at,
+            'ends_at': item.ends_at, 'type': item.type, 'reason': item.reason,
+        } for item in periods]})
+
+    @transaction.atomic
+    def post(self, request, venue_id, court_id):
+        court = get_object_or_404(Court.objects.select_for_update().select_related('venue'),
+            public_id=court_id, venue__public_id=venue_id, venue__owner=request.user,
+        )
+        serializer = VenueOwnerBlockedPeriodWriteSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        start, end = serializer.validated_data['starts_at'], serializer.validated_data['ends_at']
+        if CourtBooking.objects.filter(court=court, status__in=[CourtBooking.Status.PENDING, CourtBooking.Status.CONFIRMED], starts_at__lt=end, ends_at__gt=start).exists():
+            raise ValidationError({'starts_at': 'This period overlaps a customer booking. Resolve the booking before blocking this time.'})
+        if Game.objects.filter(court=court, status__in=ACTIVE_GAME_STATUSES, starts_at__lt=end, ends_at__gt=start).exists():
+            raise ValidationError({'starts_at': 'This period overlaps an active match.'})
+        period = serializer.save(court=court)
+        return Response({'success': True, 'data': {
+            'public_id': str(period.public_id), 'starts_at': period.starts_at,
+            'ends_at': period.ends_at, 'type': period.type, 'reason': period.reason,
+        }}, status=201)
+
+
+class VenueOwnerBlockedPeriodDetailView(APIView):
+    permission_classes = [IsApprovedVenueOwner]
+
+    def delete(self, request, public_id):
+        period = get_object_or_404(CourtBlockedPeriod, public_id=public_id, court__venue__owner=request.user)
+        period.delete()
+        return Response(status=204)
+
+
+class AdminVenueManagementView(APIView):
+    permission_classes = [IsPlatformAdmin]
+
+    def get(self, request):
+        queryset = Venue.objects.select_related('owner').prefetch_related('courts', 'venue_sports__sport').order_by('city', 'name')
+        search = request.query_params.get('q', '').strip()
+        if search:
+            queryset = queryset.filter(Q(name__icontains=search) | Q(city__icontains=search) | Q(owner__username__icontains=search))
+        active = request.query_params.get('active')
+        if active in ('true', 'false'):
+            queryset = queryset.filter(active=(active == 'true'))
+        queryset = queryset[:200]
+        data = VenueSerializer(queryset, many=True, context={'request': request}).data
+        for row, venue in zip(data, queryset):
+            row['owner'] = ({'public_id': str(venue.owner.public_id), 'username': venue.owner.username, 'email': venue.owner.email} if venue.owner_id else None)
+            row['booking_count'] = venue.bookings.count()
+        return Response({'success': True, 'data': data})
+
+    @transaction.atomic
+    def patch(self, request, public_id):
+        venue = get_object_or_404(Venue.objects.select_for_update().select_related('owner'), public_id=public_id)
+        changes = request.data
+        unknown = set(changes.keys()) - {'active', 'owner_id', 'reason'}
+        if unknown:
+            raise ValidationError({field: 'This field is not supported for venue operations.' for field in sorted(unknown)})
+        reason = str(changes.get('reason', '')).strip()
+        if len(reason) > 500:
+            raise ValidationError({'reason': 'Use 500 characters or fewer.'})
+        changed = False
+        if 'active' in changes:
+            if not isinstance(changes['active'], bool):
+                raise ValidationError({'active': 'Must be true or false.'})
+            if changes['active'] and not venue.active:
+                if not venue.owner_id or not venue.venue_sports.exists() or not venue.courts.filter(active=True).exists():
+                    raise ValidationError({'active': 'Assign an approved owner, at least one sport, and an active court before approval.'})
+            venue.active = changes['active']
+            changed = True
+        if 'owner_id' in changes:
+            requested = changes['owner_id']
+            owner = None
+            if requested:
+                owner = get_object_or_404(User, public_id=requested, is_active=True, account_status=User.AccountStatus.ACTIVE)
+                if not owner.groups.filter(name=VENUE_OWNER_GROUP).exists():
+                    raise ValidationError({'owner_id': 'Assign only an active approved venue owner.'})
+            venue.owner = owner
+            changed = True
+        if not changed:
+            raise ValidationError({'detail': 'Provide active and/or owner_id.'})
+        if not reason:
+            raise ValidationError({'reason': 'A reason is required for auditable venue changes.'})
+        previous_owner = venue.owner
+        venue.save(update_fields=['active', 'owner', 'updated_at'])
+        audit_target = venue.owner or previous_owner
+        if audit_target:
+            RoleAuditLog.objects.create(actor=request.user, target_user=audit_target, role='venue_management', action='update', reason=reason)
+        if venue.owner_id:
+            NotificationService.create_notification(
+                user=venue.owner, actor=request.user, type='message',
+                title='Venue operations updated',
+                body=(f'{venue.name} has been approved and is now bookable.' if venue.active else f'{venue.name} was updated by SportMate administration.'),
+                data={'venue_id': venue.public_id.hex, 'active': venue.active},
+                event_key=f'venue-admin-update:{venue.pk}:{venue.updated_at.isoformat()}',
+            )
+        return Response({'success': True, 'data': {
+            'public_id': str(venue.public_id), 'active': venue.active,
+            'owner_id': str(venue.owner.public_id) if venue.owner_id else None,
+        }})
 
 
 class VenueListView(generics.ListAPIView):
@@ -2976,6 +3225,8 @@ class AdminDashboardView(APIView):
             'reports_pending': Report.objects.filter(status=Report.Status.PENDING).count(),
             'reports_under_review': Report.objects.filter(status=Report.Status.UNDER_REVIEW).count(),
             'suspended_users': User.objects.filter(account_status__in=[User.AccountStatus.SUSPENDED, User.AccountStatus.DEACTIVATED]).count(),
+            'venues': Venue.objects.count(), 'active_venues': Venue.objects.filter(active=True).count(),
+            'pending_venues': Venue.objects.filter(active=False).count(),
         }})
 
 

@@ -98,17 +98,17 @@ class PlayerMatchingService:
                 continue
             skill = cls._skill_score(requester_sport.skill_level, candidate_sport.skill_level)
             distance = cls._distance_score(candidate.distance_km)
-            availability = cls._availability_score(
+            availability_score = cls._availability_score(
                 requester.profile.preferred_play_times, candidate.profile.preferred_play_times,
             )
             activity = ACTIVITY_WEIGHT if completed_counts.get(candidate.pk, 0) else 0
-            score = SPORT_WEIGHT + skill + distance + availability + activity
+            score = SPORT_WEIGHT + skill + distance + availability_score + activity
             reasons = ['Same sport']
             if skill:
                 reasons.append('Similar skill level')
             if distance:
                 reasons.append('Nearby')
-            if availability:
+            if availability_score:
                 reasons.append('Compatible availability')
             if activity:
                 reasons.append('Verified completed game activity')

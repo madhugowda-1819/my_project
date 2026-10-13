@@ -17,6 +17,8 @@ urlpatterns = [
     path('reports/', views.ReportListCreateView.as_view()),
     path('reports/<uuid:public_id>/', views.ReportDetailView.as_view()),
     path('admin/dashboard/', views.AdminDashboardView.as_view()),
+    path('admin/venues/', views.AdminVenueManagementView.as_view()),
+    path('admin/venues/<uuid:public_id>/', views.AdminVenueManagementView.as_view()),
     path('admin/users/', views.AdminUsersView.as_view()),
     path('admin/access/users/', views.AccessManagementView.as_view()),
     path('admin/access/users/<uuid:public_id>/', views.AccessManagementView.as_view()),
@@ -67,6 +69,14 @@ urlpatterns = [
     path('health/activity/<uuid:public_id>/', views.HealthActivityRecordView.as_view()),
     path('health/activity/disconnect/', views.HealthSourceDisconnectView.as_view()),
     path('users/me/venue-owner-applications/', views.VenueOwnerApplicationView.as_view()),
+    path('venue-owner/dashboard/', views.VenueOwnerDashboardView.as_view()),
+    path('venue-owner/venues/', views.VenueOwnerVenuesView.as_view()),
+    path('venue-owner/venues/<uuid:public_id>/', views.VenueOwnerVenueDetailView.as_view()),
+    path('venue-owner/venues/<uuid:public_id>/courts/', views.VenueOwnerCourtsView.as_view()),
+    path('venue-owner/courts/<uuid:public_id>/', views.VenueOwnerCourtDetailView.as_view()),
+    path('venue-owner/venues/<uuid:venue_id>/courts/<uuid:court_id>/blocked-periods/', views.VenueOwnerBlockedPeriodsView.as_view()),
+    path('venue-owner/blocked-periods/<uuid:public_id>/', views.VenueOwnerBlockedPeriodDetailView.as_view()),
+    path('venue-owner/bookings/', views.VenueOwnerBookingsView.as_view()),
     path('me/', views.MeView.as_view()),  # legacy
 
     # Bookable venues. Keep `/grounds/` reserved for the separate OSM-ground

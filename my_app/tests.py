@@ -8,7 +8,7 @@ from unittest.mock import patch
 from rest_framework.test import APITestCase
 from rest_framework.exceptions import ValidationError
 
-from .models import Ground, Match, MatchReplacementOpportunity, MatchReplacementInvitation, MatchReplacementHistory, PracticeActivity, PracticeCompletion, SportsGoal, HealthActivityRecord, NotificationPreference, PlayerProfile, Sport, AvailabilitySlot, UserSport, UserBlock, Venue, VenueSport, Court, VenueAmenity, CourtBooking, VenueReview, CourtBlockedPeriod, Game, GamePlayer, Conversation, ConversationMember, Message, Community, CommunityMember, CommunityPostLike, Event, EventParticipant, EventReminder, Tournament, Notification, UserDevice, RecommendationProfile, Report, ModerationAction, PlayerRating, MatchReflection, ReferralAttribution, College, CollegeMembership, CollegeChallenge, TournamentTeam, TournamentTeamMember, TournamentMatch, CollegeResultDispute, MatchTimePoll, MatchTimePollOption, MatchTimePollVote, SportChallenge, ChallengeEntry, ChallengeEntryMember, Achievement, UserAchievement
+from .models import Ground, Match, MatchReplacementOpportunity, MatchReplacementInvitation, MatchReplacementHistory, PracticeActivity, PracticeCompletion, SportsGoal, HealthActivityRecord, NotificationPreference, PlayerProfile, Sport, AvailabilitySlot, UserSport, UserBlock, Venue, VenueSport, Court, VenueAmenity, CourtBooking, VenueReview, CourtBlockedPeriod, Game, GamePlayer, Conversation, ConversationMember, Message, Community, CommunityMember, CommunityPostLike, Event, EventParticipant, EventReminder, Tournament, Notification, UserDevice, RecommendationProfile, Report, ModerationAction, PlayerRating, MatchReflection, ReferralAttribution, College, CollegeMembership, CollegeChallenge, TournamentTeam, TournamentTeamMember, TournamentMatch, CollegeResultDispute, MatchTimePoll, MatchTimePollOption, MatchTimePollVote, Achievement, UserAchievement
 from .services.matches import accept_rescue_invitation
 from .services.locations import nearby_queryset
 from .services.ground_ingestion import GroundIngestionService
@@ -28,102 +28,6 @@ from .services.recommendation_engine import RecommendationRankingService
 from .services.referrals import ReferralService
 
 User = get_user_model()
-
-
-class ChallengeArenaApiTests(APITestCase):
-    def setUp(self):
-        self.user = User.objects.create_user(username='arena-player', email='arena-player@example.com', password='pw123456')
-        self.other = User.objects.create_user(username='arena-other', email='arena-other@example.com', password='pw123456')
-        self.admin = User.objects.create_superuser(username='arena-admin', email='arena-admin@example.com', password='pw123456')
-        self.sport = Sport.objects.get(name='Cricket')
-        UserSport.objects.create(user=self.user, sport=self.sport, skill_level=UserSport.SkillLevel.BEGINNER)
-        UserSport.objects.create(user=self.other, sport=self.sport, skill_level=UserSport.SkillLevel.BEGINNER)
-        self.start = timezone.localdate()
-        self.end = self.start + timedelta(days=5)
-        self.payload = {
-            'name': 'Practice week', 'description': 'Complete practice checklist activities.',
-            'sport_id': self.sport.pk, 'kind': 'individual', 'metric': 'checklist_completions',
-            'target': 2, 'starts_on': self.start.isoformat(), 'ends_on': self.end.isoformat(),
-            'reward_points': 25,
-        }
-
-    def _create_challenge(self, **overrides):
-        self.client.force_authenticate(self.admin)
-        response = self.client.post('/api/v1/challenges/', {**self.payload, **overrides}, format='json')
-        self.assertEqual(response.status_code, 201, response.data)
-        return response.data['data']['public_id']
-
-    def test_admin_only_creation_and_untrusted_scores_are_ignored(self):
-        self.client.force_authenticate(self.user)
-        denied = self.client.post('/api/v1/challenges/', self.payload, format='json')
-        self.assertEqual(denied.status_code, 403)
-        challenge_id = self._create_challenge()
-        self.client.force_authenticate(self.user)
-        joined = self.client.post(f'/api/v1/challenges/{challenge_id}/join/', {'score': 99999}, format='json')
-        self.assertEqual(joined.status_code, 201, joined.data)
-        duplicate = self.client.post(f'/api/v1/challenges/{challenge_id}/join/', {}, format='json')
-        self.assertEqual(duplicate.status_code, 200)
-        self.assertEqual(ChallengeEntry.objects.filter(challenge__public_id=challenge_id, user=self.user).count(), 1)
-        PlayerProfile.objects.create(user=self.user, profile_visibility='private')
-        leaderboard = self.client.get(f'/api/v1/challenges/{challenge_id}/leaderboard/')
-        self.assertEqual(leaderboard.data['data'][0]['progress'], 0)
-        self.assertEqual(leaderboard.data['data'][0]['points'], 0)
-        self.assertNotEqual(leaderboard.data['data'][0]['participant']['name'], self.user.username)
-
-    def test_verified_practice_drives_points_badge_and_tied_rank(self):
-        badge = Achievement.objects.create(code='arena-practice-badge', name='Practice finisher', description='Finished a challenge.', category=Achievement.Category.ACTIVITY)
-        challenge_id = self._create_challenge(reward_achievement_id=str(badge.public_id))
-        self.client.force_authenticate(self.user)
-        self.client.post(f'/api/v1/challenges/{challenge_id}/join/', {}, format='json')
-        self.client.force_authenticate(self.other)
-        self.client.post(f'/api/v1/challenges/{challenge_id}/join/', {}, format='json')
-        for player in (self.user, self.other):
-            activity = PracticeActivity.objects.create(user=player, name='Drill')
-            for offset in (0, 1):
-                PracticeCompletion.objects.create(
-                    user=player, activity=activity, activity_name='Drill',
-                    practice_date=self.start + timedelta(days=offset),
-                )
-        response = self.client.get(f'/api/v1/challenges/{challenge_id}/leaderboard/')
-        self.assertEqual(response.status_code, 200)
-        rows = response.data['data']
-        self.assertEqual([row['rank'] for row in rows], [1, 1])
-        self.assertEqual([row['points'] for row in rows], [25, 25])
-        self.assertEqual(UserAchievement.objects.filter(achievement=badge, unlocked=True).count(), 2)
-        PracticeCompletion.objects.filter(user=self.other).delete()
-        corrected = self.client.get(f'/api/v1/challenges/{challenge_id}/leaderboard/').data['data']
-        self.assertEqual(sorted(row['points'] for row in corrected), [0, 25])
-
-    def test_ineligible_and_expired_joins_are_rejected(self):
-        challenge_id = self._create_challenge(eligibility_min_skill='advanced')
-        self.client.force_authenticate(self.user)
-        response = self.client.post(f'/api/v1/challenges/{challenge_id}/join/', {}, format='json')
-        self.assertEqual(response.status_code, 403)
-        expired_id = self._create_challenge(starts_on=(self.start-timedelta(days=5)).isoformat(), ends_on=(self.start-timedelta(days=1)).isoformat())
-        self.client.force_authenticate(self.other)
-        expired = self.client.post(f'/api/v1/challenges/{expired_id}/join/', {}, format='json')
-        self.assertEqual(expired.status_code, 400)
-
-    def test_team_challenge_requires_club_admin_and_uses_member_records(self):
-        club = Community.objects.create(name='Arena Club', slug='arena-club', owner=self.user, sport=self.sport, is_club=True)
-        CommunityMember.objects.create(community=club, user=self.user, role=CommunityMember.Role.OWNER, status=CommunityMember.Status.ACTIVE)
-        challenge_id = self._create_challenge(kind='team', metric='practice_days', target=1)
-        self.client.force_authenticate(self.other)
-        denied = self.client.post(f'/api/v1/challenges/{challenge_id}/join/', {'team_public_id': str(club.public_id)}, format='json')
-        self.assertEqual(denied.status_code, 403)
-        self.client.force_authenticate(self.user)
-        joined = self.client.post(f'/api/v1/challenges/{challenge_id}/join/', {'team_public_id': str(club.public_id)}, format='json')
-        self.assertEqual(joined.status_code, 201, joined.data)
-        # The roster snapshot is fixed at team entry; later additions do not
-        # retroactively add historical challenge progress.
-        CommunityMember.objects.create(community=club, user=self.other, role=CommunityMember.Role.MEMBER, status=CommunityMember.Status.ACTIVE)
-        activity = PracticeActivity.objects.create(user=self.user, name='Club practice')
-        PracticeCompletion.objects.create(user=self.user, activity=activity, activity_name='Club practice', practice_date=self.start)
-        other_activity = PracticeActivity.objects.create(user=self.other, name='Late club practice')
-        PracticeCompletion.objects.create(user=self.other, activity=other_activity, activity_name='Late club practice', practice_date=self.start)
-        rows = self.client.get(f'/api/v1/challenges/{challenge_id}/leaderboard/').data['data']
-        self.assertEqual(rows[0]['progress'], 1)
-        self.assertEqual(rows[0]['participant_type'], 'team')
 
 
 class HealthActivityApiTests(APITestCase):

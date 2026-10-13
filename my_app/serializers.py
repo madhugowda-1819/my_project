@@ -16,7 +16,6 @@ from .models import (
     PracticeActivity,
     PracticeCompletion,
     SportsGoal,
-    SportChallenge,
     Achievement,
     HealthActivityRecord,
     NotificationPreference, UserDevice,
@@ -848,38 +847,6 @@ class TrainingRecommendationInputSerializer(serializers.Serializer):
         if not Sport.objects.filter(pk=value, is_active=True).exists():
             raise serializers.ValidationError('Choose an active SportMate sport.')
         return value
-
-
-class SportChallengeCreateSerializer(serializers.Serializer):
-    name = serializers.CharField(max_length=120)
-    description = serializers.CharField(max_length=2000, required=False, allow_blank=True, default='')
-    sport_id = serializers.IntegerField(min_value=1, required=False, allow_null=True)
-    kind = serializers.ChoiceField(choices=SportChallenge.Kind.choices)
-    metric = serializers.ChoiceField(choices=SportChallenge.Metric.choices)
-    target = serializers.IntegerField(min_value=1, max_value=100000)
-    eligibility_min_skill = serializers.ChoiceField(choices=UserSport.SkillLevel.choices, required=False, allow_blank=True, default='')
-    starts_on = serializers.DateField()
-    ends_on = serializers.DateField()
-    reward_points = serializers.IntegerField(min_value=0, max_value=1000, required=False, default=0)
-    reward_achievement_id = serializers.UUIDField(required=False, allow_null=True)
-
-    def validate(self, attrs):
-        if attrs['ends_on'] < attrs['starts_on']:
-            raise serializers.ValidationError({'ends_on': 'End date must be on or after the start date.'})
-        if attrs.get('sport_id') and not Sport.objects.filter(pk=attrs['sport_id'], is_active=True).exists():
-            raise serializers.ValidationError({'sport_id': 'Choose an active sport.'})
-        achievement_id = attrs.get('reward_achievement_id')
-        if achievement_id and not Achievement.objects.filter(public_id=achievement_id, is_active=True).exists():
-            raise serializers.ValidationError({'reward_achievement_id': 'Choose an active existing achievement.'})
-        return attrs
-
-
-class ChallengeJoinSerializer(serializers.Serializer):
-    team_public_id = serializers.UUIDField(required=False)
-
-
-class ChallengeAdminUpdateSerializer(serializers.Serializer):
-    is_active = serializers.BooleanField()
 
 
 class HealthActivityImportSerializer(serializers.Serializer):

@@ -73,7 +73,6 @@ from .serializers import (
     SportsGoalCreateSerializer, SportsGoalUpdateSerializer, SportsGoalTransitionSerializer,
     HealthActivityCreateSerializer, HealthActivityImportSerializer, HealthSourceDisconnectSerializer,
     TrainingRecommendationInputSerializer,
-    SportChallengeCreateSerializer, ChallengeJoinSerializer, ChallengeAdminUpdateSerializer,
     TrainingRecommendationInputSerializer,
 )
 from .maps import MapsProviderError, find_live_sports_grounds
@@ -101,7 +100,6 @@ from .services.practice import PracticeService
 from .services.goals import SportsGoalService
 from .services.health import HealthActivityService
 from .services.training_recommendations import build_training_plan
-from .services.challenges import ChallengeService, serialize_challenge, serialize_entry
 from .services.search import GlobalSearchService, VALID_TYPES
 from .services.recommendation_engine import RecommendationProfileService, RecommendationService
 from .services.locations import nearby_queryset
@@ -1641,76 +1639,6 @@ class TrainingRecommendationView(APIView):
         serializer.is_valid(raise_exception=True)
         plan = build_training_plan(user=request.user, **serializer.validated_data)
         return Response({'success': True, 'data': plan})
-
-
-class ChallengeListCreateView(APIView):
-    permission_classes = [IsActiveAccount]
-    throttle_classes = [ScopedRateThrottle]
-    throttle_scope = 'recommendations'
-
-    def get(self, request):
-        status = request.query_params.get('status')
-        if status == 'inactive' and has_platform_role(request.user, ADMIN_GROUPS):
-            return Response({'success': True, 'data': ChallengeService.list_for(user=request.user, status='inactive')})
-        if status not in ('active', 'upcoming', 'completed'):
-            status = None
-        return Response({'success': True, 'data': ChallengeService.list_for(user=request.user, status=status)})
-
-    def post(self, request):
-        if not has_platform_role(request.user, ADMIN_GROUPS):
-            raise PermissionDenied('Only application administrators can create challenges and configure rewards.')
-        serializer = SportChallengeCreateSerializer(data=request.data)
-        serializer.is_valid(raise_exception=True)
-        challenge = ChallengeService.create(actor=request.user, data=serializer.validated_data)
-        return Response({'success': True, 'data': serialize_challenge(challenge, user=request.user)}, status=201)
-
-
-class ChallengeDetailView(APIView):
-    permission_classes = [IsActiveAccount]
-
-    def get(self, request, public_id):
-        challenge = ChallengeService.get(public_id=public_id)
-        return Response({'success': True, 'data': serialize_challenge(challenge, user=request.user)})
-
-    def patch(self, request, public_id):
-        if not has_platform_role(request.user, ADMIN_GROUPS):
-            raise PermissionDenied('Only application administrators can administer challenges.')
-        serializer = ChallengeAdminUpdateSerializer(data=request.data)
-        serializer.is_valid(raise_exception=True)
-        challenge = ChallengeService.get(public_id=public_id)
-        challenge.is_active = serializer.validated_data['is_active']
-        challenge.save(update_fields=['is_active', 'updated_at'])
-        return Response({'success': True, 'data': serialize_challenge(challenge, user=request.user)})
-
-
-class ChallengeJoinView(APIView):
-    permission_classes = [IsActiveAccount]
-
-    def post(self, request, public_id):
-        serializer = ChallengeJoinSerializer(data=request.data)
-        serializer.is_valid(raise_exception=True)
-        challenge = ChallengeService.get(public_id=public_id)
-        entry, created = ChallengeService.join(challenge=challenge, user=request.user, **serializer.validated_data)
-        return Response({'success': True, 'created': created, 'data': serialize_entry(entry, include_members=True)}, status=201 if created else 200)
-
-
-class ChallengeLeaveView(APIView):
-    permission_classes = [IsActiveAccount]
-
-    def post(self, request, public_id):
-        serializer = ChallengeJoinSerializer(data=request.data)
-        serializer.is_valid(raise_exception=True)
-        challenge = ChallengeService.get(public_id=public_id)
-        entry = ChallengeService.leave(challenge=challenge, user=request.user, **serializer.validated_data)
-        return Response({'success': True, 'data': serialize_entry(entry, include_members=True)})
-
-
-class ChallengeLeaderboardView(APIView):
-    permission_classes = [IsActiveAccount]
-
-    def get(self, request, public_id):
-        challenge = ChallengeService.get(public_id=public_id)
-        return Response({'success': True, 'data': ChallengeService.leaderboard(challenge=challenge)})
 
 
 class HealthActivityListCreateView(APIView):

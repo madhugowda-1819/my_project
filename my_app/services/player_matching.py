@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from django.db.models import Count, Q
 from rest_framework.exceptions import ValidationError
 
-from my_app.models import Match, User, UserBlock
+from my_app.models import AvailabilitySlot, Match, User, UserBlock
 from my_app.services.locations import nearby_queryset, validate_coordinates
 
 
@@ -48,8 +48,23 @@ class PlayerMatchingService:
             return 0
         return 15 if len(overlap) >= 2 or overlap == requester or overlap == candidate else 8
 
+    @staticmethod
+    def _has_slot_availability(user, requested):
+        if requested == 'any':
+            return True
+        slots = AvailabilitySlot.objects.filter(user=user)
+        if not slots.exists():
+            return requested in (user.profile.preferred_play_times or [])
+        if requested == 'weekend':
+            return slots.filter(day_of_week__in=[5, 6]).exists()
+        if requested == 'morning':
+            return slots.filter(start_time__lt='12:00').exists()
+        if requested == 'afternoon':
+            return slots.filter(start_time__lt='17:00', end_time__gt='12:00').exists()
+        return slots.filter(end_time__gt='17:00').exists()
+
     @classmethod
-    def recommend(cls, *, requester, sport, latitude, longitude, radius, limit):
+    def recommend(cls, *, requester, sport, latitude, longitude, radius, limit, availability='any', skill_level=None):
         latitude, longitude, radius = validate_coordinates(latitude, longitude, radius)
         if not requester.user_sports.filter(sport=sport).exists():
             raise ValidationError({'sport': ['Add this sport to your profile before requesting partners.']})
@@ -74,8 +89,12 @@ class PlayerMatchingService:
         )
         results = []
         for candidate in candidates:
+            if not cls._has_slot_availability(candidate, availability):
+                continue
             candidate_sport = next((entry for entry in candidate.user_sports.all() if entry.sport_id == sport.id), None)
             if candidate_sport is None:
+                continue
+            if skill_level and candidate_sport.skill_level != skill_level:
                 continue
             skill = cls._skill_score(requester_sport.skill_level, candidate_sport.skill_level)
             distance = cls._distance_score(candidate.distance_km)
@@ -94,6 +113,6 @@ class PlayerMatchingService:
             if activity:
                 reasons.append('Verified completed game activity')
             results.append({
-                'candidate': candidate, 'sport': candidate_sport, 'score': MatchScore(score, reasons),
+                'candidate': candidate, 'sport': candidate_sport, 'score': MatchScore(score, reasons), 'reasons': reasons,
             })
         return sorted(results, key=lambda item: (-item['score'].score, item['candidate'].distance_km))[:limit]

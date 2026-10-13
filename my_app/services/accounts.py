@@ -2,12 +2,12 @@ from django.contrib.auth.password_validation import validate_password
 from django.core.exceptions import ValidationError as DjangoValidationError
 from django.db import IntegrityError, transaction
 from django.db.models import Q
-from django.utils import timezone
 from rest_framework.exceptions import AuthenticationFailed, PermissionDenied, ValidationError
 from rest_framework_simplejwt.exceptions import TokenError
 from rest_framework_simplejwt.tokens import RefreshToken
 
 from my_app.models import PlayerProfile, User, UserSport
+from my_app.services.referrals import ReferralService
 
 
 class AccountUnavailable(PermissionDenied):
@@ -25,6 +25,8 @@ class AuthenticationService:
         if User.objects.filter(username__iexact=username).exists():
             raise ValidationError({'username': ['An account with this username already exists.']})
 
+        referral_code = data.get('referral_code', '').strip()
+
         candidate = User(email=email, username=username, full_name=data['full_name'])
         try:
             validate_password(data['password'], user=candidate)
@@ -33,6 +35,7 @@ class AuthenticationService:
 
         try:
             with transaction.atomic():
+                referrer = ReferralService.resolve_referrer(referral_code, email=email) if referral_code else None
                 user = User.objects.create_user(
                     email=email,
                     username=username,
@@ -43,6 +46,7 @@ class AuthenticationService:
                 )
                 if create_player_profile:
                     PlayerProfile.objects.create(user=user)
+                    ReferralService.ensure_code(user)
                 sports = data.get('sports', [])
                 if sports:
                     user.sports.set(sports)
@@ -50,6 +54,10 @@ class AuthenticationService:
                         UserSport(user=user, sport=sport, preferred=index == 0)
                         for index, sport in enumerate(sports)
                     ])
+                if referrer is not None:
+                    ReferralService.record_successful_registration(
+                        referrer=referrer, referred_user=user, code=referral_code,
+                    )
                 return user
         except IntegrityError as exc:
             raise ValidationError({'email': ['An account with these details already exists.']}) from exc
@@ -69,9 +77,6 @@ class AuthenticationService:
         if not user.is_active or user.account_status != User.AccountStatus.ACTIVE:
             raise AccountUnavailable()
 
-        user.last_login = timezone.now()
-        user.is_online = True
-        user.save(update_fields=['last_login', 'is_online', 'last_seen', 'updated_at'])
         return user
 
     @staticmethod

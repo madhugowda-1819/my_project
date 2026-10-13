@@ -157,6 +157,10 @@ REST_FRAMEWORK = {
     },
 }
 
+# Ranking blend for Match My Mood. The service clamps mood to 0..20 so it
+# remains a secondary signal and cannot outweigh eligibility/compatibility.
+MATCH_MOOD_RANKING_WEIGHTS = {'mood': int(env('MATCH_MOOD_WEIGHT', default='10'))}
+
 SIMPLE_JWT = {
     'ACCESS_TOKEN_LIFETIME': timedelta(minutes=30),
     'REFRESH_TOKEN_LIFETIME': timedelta(days=7),
@@ -230,6 +234,12 @@ RAZORPAY_WEBHOOK_SECRET = env('RAZORPAY_WEBHOOK_SECRET', '')
 # environment-controlled so capacity policy can change without code changes.
 GAME_ALMOST_FULL_SLOTS_THRESHOLD = int(env('GAME_ALMOST_FULL_SLOTS_THRESHOLD', '1'))
 GAME_MAX_SKILL_LEVEL_DIFFERENCE = int(env('GAME_MAX_SKILL_LEVEL_DIFFERENCE', '1'))
+
+# Last-minute replacement invitations are bounded and expire before kickoff.
+MATCH_RESCUE_WINDOW_MINUTES = int(env('MATCH_RESCUE_WINDOW_MINUTES', '360'))
+MATCH_RESCUE_INVITATION_TTL_MINUTES = int(env('MATCH_RESCUE_INVITATION_TTL_MINUTES', '120'))
+MATCH_RESCUE_RADIUS_KM = float(env('MATCH_RESCUE_RADIUS_KM', '30'))
+MATCH_RESCUE_MAX_INVITATIONS = int(env('MATCH_RESCUE_MAX_INVITATIONS', '20'))
 
 # Plain-text chat guardrail. Message content is never interpreted as HTML.
 CHAT_MESSAGE_MAX_LENGTH = int(env('CHAT_MESSAGE_MAX_LENGTH', '2000'))

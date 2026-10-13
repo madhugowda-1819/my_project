@@ -1,7 +1,7 @@
 from django.contrib.auth import get_user_model
 from django.contrib.auth.models import Group
 from django.db.models import Q, Count, F
-from django.db import connection, transaction
+from django.db import connection, transaction, IntegrityError
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
 from django.http import HttpResponse, HttpResponseBadRequest, JsonResponse
@@ -13,7 +13,7 @@ from rest_framework.views import APIView
 from rest_framework.throttling import ScopedRateThrottle
 from rest_framework_simplejwt.views import TokenRefreshView
 from rest_framework_simplejwt.tokens import RefreshToken
-from rest_framework.exceptions import AuthenticationFailed, PermissionDenied, ValidationError
+from rest_framework.exceptions import APIException, AuthenticationFailed, PermissionDenied, ValidationError
 from django.contrib.auth.tokens import PasswordResetTokenGenerator
 from django.utils.http import urlsafe_base64_encode, urlsafe_base64_decode
 from django.utils.encoding import force_bytes, force_str
@@ -26,14 +26,16 @@ import json
 import hashlib
 import hmac
 import math
+from datetime import date, datetime, time, timedelta
 
 import requests
 
 from .models import (
-    Sport, AvailabilitySlot, Match, Message, Notification, Ground, SportsGround,
+    Sport, AvailabilitySlot, Match, Message, Notification, Ground, SportsGround, PlayerProfile,
     Venue, Court, VenueReview, CourtBooking, Game, GamePlayer, Conversation, ConversationMember,
     Community, CommunityMember, CommunityPost, CommunityComment, CommunityPostLike,
-    Event, EventParticipant, Tournament, TournamentTeam, TournamentMatch, NotificationPreference, UserDevice, PlayerRating, Achievement, UserAchievement, Report, ModerationAction, VenueOwnerApplication, RoleAuditLog,
+    Event, EventParticipant, EventReminder, Tournament, TournamentTeam, TournamentTeamMember, TournamentMatch, NotificationPreference, UserDevice, PlayerRating, Achievement, UserAchievement, Report, ModerationAction, VenueOwnerApplication, RoleAuditLog,
+    College, CollegeMembership, CollegeChallenge, CollegeResultDispute, MatchTimePoll, MatchReflection,
 )
 
 from .serializers import (
@@ -41,7 +43,7 @@ from .serializers import (
     UserSerializer, SportSerializer, PublicPlayerSerializer, UserSportSerializer,
     UserSportWriteSerializer, PlayerProfilePreferencesSerializer,
     NearbySearchSerializer,
-    PlayerRecommendationQuerySerializer,
+    PlayerRecommendationQuerySerializer, MatchMyMoodQuerySerializer,
     VenueSerializer, VenueDiscoveryQuerySerializer, VenueReviewCreateSerializer, VenueReviewSerializer,
     VenueAvailabilityQuerySerializer, CourtBookingCreateSerializer,
     BookingCreateSerializer, BookingSerializer, RazorpayVerificationSerializer,
@@ -50,23 +52,37 @@ from .serializers import (
     GroundSerializer, GroundDiscoverySerializer, AutoGameCreateSerializer, MatchCreateSerializer,
     GameCreateSerializer, GameUpdateSerializer, GameQuerySerializer, GameRecommendationQuerySerializer,
     GameSerializer, GamePlayerSerializer, ConversationCreateSerializer,
+    EventSerializer, CommunityPostSerializer,
     ConversationMessageCreateSerializer, ConversationMessageSerializer,
     CommunityCreateSerializer, CommunityUpdateSerializer, CommunitySerializer, CommunityMemberSerializer,
     CommunityPostCreateSerializer, CommunityContentSerializer, CommunityPostSerializer, CommunityCommentSerializer,
-    EventCreateSerializer, EventSerializer, EventParticipantSerializer, TournamentCreateSerializer, TournamentSerializer, TournamentTeamSerializer, TournamentMatchSerializer,
+    EventCreateSerializer, EventSerializer, EventParticipantSerializer, EventReminderSerializer, TournamentCreateSerializer, TournamentRegistrationSerializer, TournamentSerializer, TournamentTeamSerializer, TournamentMatchSerializer,
     NotificationPreferenceSerializer, UserDeviceSerializer, UserDeviceCreateSerializer,
-    PlayerRatingSerializer, PlayerRatingCreateSerializer,
+    PlayerRatingSerializer, PlayerRatingCreateSerializer, MatchReflectionSerializer, MatchReflectionInputSerializer,
     AchievementSerializer, UserAchievementSerializer,
     ReportCreateSerializer, ReportSerializer, ReportUpdateSerializer, ModerationActionSerializer, AdminUserSerializer,
+    ClubMemberRoleSerializer, ClubInviteSerializer,
+    CollegeSubmitSerializer, CollegeSerializer, CollegeMembershipSerializer,
+    CollegeChallengeSerializer, CollegeChallengeCreateSerializer, ChallengeAnswerSerializer,
+    CollegeTeamCreateSerializer, CollegeRosterAddSerializer, CollegeResultDisputeSerializer,
+    CollegeDisputeCreateSerializer, CollegeDisputeResolveSerializer,
+    MatchTimePollCreateSerializer, MatchTimePollVoteSerializer, MatchTimePollFinalizeSerializer,
+    PracticeCompletionInputSerializer, PracticeActivityWriteSerializer,
+    PracticeActivityCreateSerializer, PracticeActivitySerializer,
+    SportsGoalCreateSerializer, SportsGoalUpdateSerializer, SportsGoalTransitionSerializer,
+    HealthActivityCreateSerializer, HealthActivityImportSerializer, HealthSourceDisconnectSerializer,
+    TrainingRecommendationInputSerializer,
+    SportChallengeCreateSerializer, ChallengeJoinSerializer, ChallengeAdminUpdateSerializer,
+    TrainingRecommendationInputSerializer,
 )
 from .maps import MapsProviderError, find_live_sports_grounds
-from .permissions import IsActiveAccount, IsPlatformAdmin, IsPlatformModerator, has_platform_role, MODERATOR_GROUPS, VENUE_OWNER_GROUP
+from .permissions import ADMIN_GROUPS, IsActiveAccount, IsPlatformAdmin, IsPlatformModerator, has_platform_role, MODERATOR_GROUPS, VENUE_OWNER_GROUP
 from .services.accounts import AuthenticationService, UserService
 from .services.availability import VenueAvailabilityService
 from .services.bookings import BookingCancellationService, BookingService
 from .services.payments import PaymentService
 from .services.games import ACTIVE_GAME_STATUSES, GameLifecycleService, GameService
-from .services.game_matching import GameMatchingService
+from .services.game_matching import GameMatchingService, apply_mood_ranking
 from .services.chat import (
     ChatPermissionService, ConversationService, MessageService, UnreadMessageService,
 )
@@ -74,15 +90,23 @@ from .services.communities import (
     CommunityCommentService, CommunityDiscoveryService, CommunityMembershipService,
     CommunityModerationService, CommunityPostService, CommunityService,
 )
-from .services.events import EventService, EventRegistrationService, EventCapacityService, TournamentService, TournamentBracketService, TournamentMatchService, TournamentStandingsService
+from .services.events import EventService, EventRegistrationService, EventReminderService, EventCancellationService, EventCapacityService, TournamentService, TournamentRegistrationService, TournamentBracketService, TournamentMatchService, TournamentStandingsService
 from .services.notifications import NotificationService, DeviceService
+from .services.referrals import ReferralService
 from .services.moderation import ModerationService
 from .services.statistics import RatingService, PlayerStatisticsService, LeaderboardService
 from .services.achievements import AchievementEvaluationService, AchievementService
+from .services.practice import PracticeService
+from .services.goals import SportsGoalService
+from .services.health import HealthActivityService
+from .services.training_recommendations import build_training_plan
+from .services.challenges import ChallengeService, serialize_challenge, serialize_entry
 from .services.search import GlobalSearchService, VALID_TYPES
 from .services.recommendation_engine import RecommendationProfileService, RecommendationService
 from .services.locations import nearby_queryset
 from .services.player_matching import PlayerMatchingService
+from .services.colleges import CollegeService
+from .services.match_time_polls import MatchTimePollService
 from .services.players import PlayerService
 from .services.venues import VenueDiscoveryService, VenueReviewService
 from .services.ground_ingestion import GroundIngestionService
@@ -187,10 +211,40 @@ def login_view(request):
     # the submitted identifier through as `username` regardless of its form.
     identifier = (request.data.get('identifier') or request.data.get('email') or '').strip()
     password = request.data.get('password')
+    # Missing audience defaults to Player for older clients, but role checks
+    # still prevent venue-owner/admin accounts from using the player login.
+    audience = str(request.data.get('audience', 'player')).strip().lower()
+    if audience not in {'player', 'venue', 'admin'}:
+        raise ValidationError({'audience': ['Choose player, venue, or admin login.']})
 
     user = AuthenticationService.login(identifier=identifier, password=password)
 
+    roles = set(user.groups.values_list('name', flat=True))
+    is_admin = user.is_superuser or user.has_perm('my_app.view_user') or bool(roles & ADMIN_GROUPS)
+    is_venue_owner = VENUE_OWNER_GROUP in roles
+    is_player = PlayerProfile.objects.filter(user_id=user.id).exists()
+    allowed = (
+        (audience == 'admin' and is_admin)
+        or (audience == 'venue' and is_venue_owner and not is_admin)
+        or (audience == 'player' and is_player and not is_admin and not is_venue_owner)
+    )
+    if not allowed:
+        if audience == 'player' and is_admin:
+            detail = 'This account must use Admin login.'
+        elif audience == 'player' and is_venue_owner:
+            detail = 'This account must use Venue login.'
+        elif audience == 'player':
+            detail = 'This account does not have a player profile.'
+        elif audience == 'venue':
+            detail = 'This account does not have approved venue-owner access.'
+        else:
+            detail = 'This account does not have SportMate administrator access.'
+        raise PermissionDenied(detail)
+
     # ✅ mark user online
+    user.last_login = timezone.now()
+    user.is_online = True
+    user.save(update_fields=['last_login', 'is_online', 'last_seen', 'updated_at'])
     return Response({
         'success': True,
         'user': CurrentUserSerializer(user).data,
@@ -337,6 +391,13 @@ class MyPlayerProfileView(APIView):
         return Response({'success': True, 'player_profile': PlayerProfilePreferencesSerializer(profile).data})
 
 
+class MyReferralsView(APIView):
+    permission_classes = [IsActiveAccount]
+
+    def get(self, request):
+        return Response({'success': True, 'data': ReferralService.private_summary(request.user)})
+
+
 class PlayerDetailView(generics.RetrieveAPIView):
     serializer_class = PublicPlayerSerializer
     permission_classes = [IsActiveAccount]
@@ -469,6 +530,121 @@ class PlayerRecommendationView(APIView):
                     'matching_reasons': item['score'].reasons,
                 }
                 for item in matches
+            ],
+        })
+
+
+class MatchMyMoodView(APIView):
+    """Combined, deterministic mood-aware recommendations for real players and games."""
+    permission_classes = [IsActiveAccount]
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = 'recommendations'
+
+    def get(self, request):
+        if not hasattr(request.user, 'profile'):
+            raise PermissionDenied('Player profile is required to use Match My Mood.')
+        query = MatchMyMoodQuerySerializer(data=request.query_params)
+        query.is_valid(raise_exception=True)
+        data = query.validated_data
+        profile = request.user.profile
+        selected_mood = data.get('mood', profile.matching_mood)
+        # A mood supplied for this request becomes the player's changeable saved preference.
+        profile_fields = []
+        if 'mood' in data and selected_mood != profile.matching_mood:
+            profile.matching_mood = selected_mood
+            profile_fields.append('matching_mood')
+        if profile.preferred_distance != data['radius']:
+            profile.preferred_distance = data['radius']
+            profile_fields.append('preferred_distance')
+        if data.get('availability') and data['availability'] != 'any' and profile.preferred_play_times != [data['availability']]:
+            profile.preferred_play_times = [data['availability']]
+            profile_fields.append('preferred_play_times')
+        if profile_fields:
+            profile.save(update_fields=[*profile_fields, 'updated_at'])
+        latitude = data.get('latitude', request.user.latitude)
+        longitude = data.get('longitude', request.user.longitude)
+        if latitude is None or longitude is None:
+            latitude = longitude = None
+
+        sports = request.user.user_sports.select_related('sport').filter(sport__is_active=True)
+        sport = data.get('sport')
+        if sport:
+            sports = sports.filter(sport=sport)
+        elif sports.filter(preferred=True).exists():
+            sports = sports.filter(preferred=True)
+        sport_entries = list(sports)
+        requested_skill = data.get('skill_level')
+        if requested_skill:
+            sport_entries = [entry for entry in sport_entries if entry.skill_level == requested_skill]
+        if not sport_entries:
+            return Response({'success': True, 'mood': selected_mood, 'games': [], 'players': []})
+
+        from .services.player_matching import PlayerMatchingService
+        from .services.locations import validate_coordinates
+
+        game_results = []
+        player_results = []
+        try:
+            mood_weight = max(0, min(20, int(getattr(settings, 'MATCH_MOOD_RANKING_WEIGHTS', {}).get('mood', 10))))
+        except (TypeError, ValueError):
+            mood_weight = 10
+        for user_sport in sport_entries:
+            if latitude is not None:
+                lat, lng, radius = validate_coordinates(latitude, longitude, data['radius'])
+            else:
+                lat = lng = None
+                radius = data['radius']
+
+            games = GameMatchingService.get_recommendations(
+                user=request.user, sport=user_sport.sport, latitude=lat, longitude=lng,
+                radius=radius, date=data.get('date'), skill_level=data.get('skill_level'),
+                limit=data['limit'],
+            )
+            if data['availability'] != 'any':
+                if data['availability'] == 'weekend':
+                    games = [item for item in games if item['game'].game_date.weekday() >= 5]
+                else:
+                    games = [item for item in games if GameMatchingService._time_band(item['game'].start_time) == data['availability']]
+                games = [item for item in games if data['availability'] in (item['game'].host.profile.preferred_play_times or []) or not item['game'].host.profile.preferred_play_times]
+            game_results.extend(games)
+
+            if lat is not None:
+                players = PlayerMatchingService.recommend(
+                    requester=request.user, sport=user_sport.sport, latitude=lat,
+                    longitude=lng, radius=radius, limit=data['limit'],
+                    availability=data['availability'], skill_level=data.get('skill_level'),
+                )
+                player_results.extend(players)
+
+        game_results = apply_mood_ranking(
+            game_results, requester_mood=selected_mood,
+            mood_getter=lambda item: getattr(item['game'].host, 'profile', None).matching_mood if hasattr(item['game'].host, 'profile') else '',
+            base_key='match_score', reasons_key='reasons',
+        )[:data['limit']]
+        for item in player_results:
+            if hasattr(item['score'], 'score'):
+                item['score'] = item['score'].score
+        player_results = apply_mood_ranking(
+            player_results, requester_mood=selected_mood,
+            mood_getter=lambda item: item['candidate'].profile.matching_mood if hasattr(item['candidate'], 'profile') else '',
+            base_key='score', reasons_key='reasons',
+        )[:data['limit']]
+        return Response({
+            'success': True,
+            'algorithm': 'weighted_compatibility_with_capped_mood_signal_v1',
+            'mood': selected_mood,
+            'ranking_formula': f'final = round(base_score * (1 - {mood_weight}/100) + mood_affinity * {mood_weight}/100) for games and players. Mood weight defaults to 10% and is capped at 20%; eligibility is evaluated before ranking.',
+            'games': [
+                {'game': GameSerializer(item['game'], context={'request': request}).data,
+                 'score': item['match_score'], 'distance_km': item['distance_km'],
+                 'reasons': item['reasons']}
+                for item in game_results
+            ],
+            'players': [
+                {'player': PublicPlayerSerializer(item['candidate'], context={'request': request}).data,
+                 'score': item['score'], 'distance_km': round(item['candidate'].distance_km, 2),
+                 'sport': item['sport'].sport.slug, 'reasons': item['reasons']}
+                for item in player_results
             ],
         })
 
@@ -1032,12 +1208,330 @@ class LeaveMatchView(APIView):
         return Response({'success': True, 'message': 'You left the match.', 'match': MatchSerializer(match, context={'request': request}).data})
 
 
+class MatchRescueOpportunityListView(APIView):
+    permission_classes = [IsActiveAccount]
+
+    def get(self, request):
+        from my_app.serializers import MatchReplacementInvitationSerializer
+        from my_app.services.matches import rescue_opportunities_for
+        invitations = rescue_opportunities_for(user=request.user)
+        return Response({'success': True, 'data': MatchReplacementInvitationSerializer(invitations, many=True).data})
+
+
+class MatchRescueAcceptView(APIView):
+    permission_classes = [IsActiveAccount]
+
+    def post(self, request, public_id):
+        from my_app.services.matches import accept_rescue_invitation
+        match, accepted = accept_rescue_invitation(invitation_id=public_id, user=request.user)
+        return Response({
+            'success': True,
+            'message': 'You accepted the replacement slot.' if accepted else 'You are already in this match.',
+            'match': MatchSerializer(match, context={'request': request}).data,
+        })
+
+
+class DailyPracticeView(APIView):
+    permission_classes = [IsActiveAccount]
+
+    def get(self, request):
+        today = timezone.now().date()
+        try:
+            practice_date = date.fromisoformat(request.query_params.get('date', today.isoformat()))
+        except ValueError as exc:
+            raise ValidationError({'date': ['Use YYYY-MM-DD format.']}) from exc
+        data = PracticeService.get_day(
+            user=request.user, practice_date=practice_date,
+            timezone_name=request.query_params.get('timezone', 'UTC'),
+        )
+        return Response({'success': True, 'data': data})
+
+
+class DailyPracticeCompletionView(APIView):
+    permission_classes = [IsActiveAccount]
+
+    def patch(self, request, public_id):
+        serializer = PracticeCompletionInputSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = PracticeService.set_completion(
+            user=request.user, activity_id=public_id,
+            practice_date=serializer.validated_data['date'],
+            timezone_name=serializer.validated_data['timezone'],
+            completed=serializer.validated_data['completed'],
+        )
+        return Response({'success': True, 'data': data})
+
+
+class DailyPracticeActivitiesView(APIView):
+    permission_classes = [IsActiveAccount]
+
+    def get(self, request):
+        from my_app.services.practice import ensure_default_activities
+        ensure_default_activities(request.user)
+        from my_app.models import PracticeActivity
+        activities = PracticeActivity.objects.filter(user=request.user).order_by('sort_order', 'id')
+        return Response({'success': True, 'data': PracticeActivitySerializer(activities, many=True).data})
+
+    def post(self, request):
+        serializer = PracticeActivityCreateSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        activity = PracticeService.create_activity(user=request.user, **serializer.validated_data)
+        return Response({'success': True, 'data': PracticeActivitySerializer(activity).data}, status=201)
+
+class DailyPracticeActivityDetailView(APIView):
+    permission_classes = [IsActiveAccount]
+
+    def patch(self, request, public_id):
+        serializer = PracticeActivityWriteSerializer(data=request.data, partial=True)
+        serializer.is_valid(raise_exception=True)
+        activity = PracticeService.update_activity(user=request.user, public_id=public_id, changes=serializer.validated_data)
+        return Response({'success': True, 'data': PracticeActivitySerializer(activity).data})
+
+
+class DailyPracticeHistoryView(APIView):
+    permission_classes = [IsActiveAccount]
+
+    def get(self, request):
+        today = timezone.now().date().isoformat()
+        try:
+            start = date.fromisoformat(request.query_params.get('start', today))
+            end = date.fromisoformat(request.query_params.get('end', today))
+        except ValueError as exc:
+            raise ValidationError({'date': ['Use YYYY-MM-DD format.']}) from exc
+        data = PracticeService.history(
+            user=request.user, start_date=start, end_date=end,
+            timezone_name=request.query_params.get('timezone', 'UTC'),
+        )
+        return Response({'success': True, 'data': data})
+
+
+class SportsGoalListCreateView(APIView):
+    permission_classes = [IsActiveAccount]
+
+    def get(self, request):
+        return Response({'success': True, 'data': SportsGoalService.list_for(user=request.user)})
+
+    def post(self, request):
+        serializer = SportsGoalCreateSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = SportsGoalService.create(user=request.user, data=serializer.validated_data)
+        return Response({'success': True, 'data': data}, status=201)
+
+
+class SportsGoalDetailView(APIView):
+    permission_classes = [IsActiveAccount]
+
+    def patch(self, request, public_id):
+        serializer = SportsGoalUpdateSerializer(data=request.data, partial=True)
+        serializer.is_valid(raise_exception=True)
+        data = SportsGoalService.update(user=request.user, public_id=public_id, changes=serializer.validated_data)
+        return Response({'success': True, 'data': data})
+
+    def post(self, request, public_id):
+        serializer = SportsGoalTransitionSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = SportsGoalService.transition(user=request.user, public_id=public_id, status=serializer.validated_data['status'])
+        return Response({'success': True, 'data': data})
+
+
+class SportsGoalSummaryView(APIView):
+    permission_classes = [IsActiveAccount]
+
+    def get(self, request):
+        return Response({'success': True, 'data': SportsGoalService.summaries(user=request.user)})
+
+
+class TrainingRecommendationView(APIView):
+    permission_classes = [IsActiveAccount]
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = 'recommendations'
+
+    def post(self, request):
+        serializer = TrainingRecommendationInputSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        plan = build_training_plan(user=request.user, **serializer.validated_data)
+        return Response({'success': True, 'data': plan})
+
+
+class ChallengeListCreateView(APIView):
+    permission_classes = [IsActiveAccount]
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = 'recommendations'
+
+    def get(self, request):
+        status = request.query_params.get('status')
+        if status == 'inactive' and has_platform_role(request.user, ADMIN_GROUPS):
+            return Response({'success': True, 'data': ChallengeService.list_for(user=request.user, status='inactive')})
+        if status not in ('active', 'upcoming', 'completed'):
+            status = None
+        return Response({'success': True, 'data': ChallengeService.list_for(user=request.user, status=status)})
+
+    def post(self, request):
+        if not has_platform_role(request.user, ADMIN_GROUPS):
+            raise PermissionDenied('Only application administrators can create challenges and configure rewards.')
+        serializer = SportChallengeCreateSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        challenge = ChallengeService.create(actor=request.user, data=serializer.validated_data)
+        return Response({'success': True, 'data': serialize_challenge(challenge, user=request.user)}, status=201)
+
+
+class ChallengeDetailView(APIView):
+    permission_classes = [IsActiveAccount]
+
+    def get(self, request, public_id):
+        challenge = ChallengeService.get(public_id=public_id)
+        return Response({'success': True, 'data': serialize_challenge(challenge, user=request.user)})
+
+    def patch(self, request, public_id):
+        if not has_platform_role(request.user, ADMIN_GROUPS):
+            raise PermissionDenied('Only application administrators can administer challenges.')
+        serializer = ChallengeAdminUpdateSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        challenge = ChallengeService.get(public_id=public_id)
+        challenge.is_active = serializer.validated_data['is_active']
+        challenge.save(update_fields=['is_active', 'updated_at'])
+        return Response({'success': True, 'data': serialize_challenge(challenge, user=request.user)})
+
+
+class ChallengeJoinView(APIView):
+    permission_classes = [IsActiveAccount]
+
+    def post(self, request, public_id):
+        serializer = ChallengeJoinSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        challenge = ChallengeService.get(public_id=public_id)
+        entry, created = ChallengeService.join(challenge=challenge, user=request.user, **serializer.validated_data)
+        return Response({'success': True, 'created': created, 'data': serialize_entry(entry, include_members=True)}, status=201 if created else 200)
+
+
+class ChallengeLeaveView(APIView):
+    permission_classes = [IsActiveAccount]
+
+    def post(self, request, public_id):
+        serializer = ChallengeJoinSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        challenge = ChallengeService.get(public_id=public_id)
+        entry = ChallengeService.leave(challenge=challenge, user=request.user, **serializer.validated_data)
+        return Response({'success': True, 'data': serialize_entry(entry, include_members=True)})
+
+
+class ChallengeLeaderboardView(APIView):
+    permission_classes = [IsActiveAccount]
+
+    def get(self, request, public_id):
+        challenge = ChallengeService.get(public_id=public_id)
+        return Response({'success': True, 'data': ChallengeService.leaderboard(challenge=challenge)})
+
+
+class HealthActivityListCreateView(APIView):
+    permission_classes = [IsActiveAccount]
+
+    def get(self, request):
+        today = timezone.localdate()
+        try:
+            end = date.fromisoformat(request.query_params.get('end', today.isoformat()))
+            start = date.fromisoformat(request.query_params.get('start', (end - timedelta(days=6)).isoformat()))
+        except ValueError as exc:
+            raise ValidationError({'date': ['Use YYYY-MM-DD format.']}) from exc
+        data = HealthActivityService.summary(user=request.user, start=start, end=end, timezone_name=request.query_params.get('timezone', 'Asia/Kolkata'))
+        return Response({'success': True, 'data': data})
+
+    def post(self, request):
+        serializer = HealthActivityCreateSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        values = serializer.validated_data.copy()
+        values['timezone_name'] = values.pop('timezone', 'Asia/Kolkata')
+        record = HealthActivityService.create_manual(user=request.user, **values)
+        return Response({'success': True, 'data': HealthActivityService.serialize_record(record)}, status=201)
+
+
+class HealthActivityRecordView(APIView):
+    permission_classes = [IsActiveAccount]
+
+    def delete(self, request, public_id):
+        if not HealthActivityService.delete_record(user=request.user, public_id=public_id):
+            return Response({'success': False, 'detail': 'Manual health record not found.'}, status=404)
+        return Response(status=204)
+
+
+class HealthActivitySyncView(APIView):
+    permission_classes = [IsActiveAccount]
+
+    def post(self, request):
+        serializer = HealthActivityImportSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+        result = HealthActivityService.sync_import(user=request.user, source=data['source'], records=data['records'])
+        return Response({'success': True, 'data': result})
+
+
+class HealthSourceDisconnectView(APIView):
+    permission_classes = [IsActiveAccount]
+
+    def post(self, request):
+        serializer = HealthSourceDisconnectSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        deleted = HealthActivityService.disconnect_source(user=request.user, source=serializer.validated_data['source'])
+        return Response({'success': True, 'deleted_records': deleted, 'connected': False})
+
+
 class MatchParticipantsView(APIView):
     permission_classes = [IsActiveAccount]
 
     def get(self, request, match_id):
         match = get_object_or_404(Match.objects.prefetch_related('joined_players'), pk=match_id)
         return Response({'success': True, 'data': MatchParticipantSerializer(match.joined_players.all(), many=True).data})
+
+
+class MatchTimePollListCreateView(APIView):
+    permission_classes = [IsActiveAccount]
+
+    def get(self, request, match_id):
+        match = get_object_or_404(Match, pk=match_id)
+        if match.organizer_id != request.user.id and not match.joined_players.filter(pk=request.user.pk).exists():
+            raise PermissionDenied('Only match participants can view schedule polls.')
+        poll = match.time_polls.order_by('-created_at').first()
+        if not poll:
+            return Response({'success': True, 'data': None})
+        return Response({'success': True, 'data': MatchTimePollService.serialize(poll, user=request.user)})
+
+    def post(self, request, match_id):
+        serializer = MatchTimePollCreateSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        poll = MatchTimePollService.create(match_id=match_id, actor=request.user, **serializer.validated_data)
+        return Response({'success': True, 'data': MatchTimePollService.serialize(poll, user=request.user)}, status=201)
+
+
+class MatchTimePollVoteView(APIView):
+    permission_classes = [IsActiveAccount]
+
+    def post(self, request, public_id):
+        serializer = MatchTimePollVoteSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        MatchTimePollService.vote(poll_id=public_id, actor=request.user, **serializer.validated_data)
+        poll = get_object_or_404(MatchTimePoll.objects.select_related('match', 'creator', 'finalized_option'), public_id=public_id)
+        return Response({'success': True, 'data': MatchTimePollService.serialize(poll, user=request.user)})
+
+
+class MatchTimePollFinalizeView(APIView):
+    permission_classes = [IsActiveAccount]
+
+    def post(self, request, public_id):
+        serializer = MatchTimePollFinalizeSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        poll, selected = MatchTimePollService.finalize(poll_id=public_id, actor=request.user, **serializer.validated_data)
+        poll = get_object_or_404(MatchTimePoll.objects.select_related('match', 'creator', 'finalized_option'), public_id=public_id)
+        match = get_object_or_404(Match.objects.select_related('sport', 'ground', 'organizer'), pk=poll.match_id)
+        return Response({'success': True, 'tie_requires_decision': selected is None, 'data': MatchTimePollService.serialize(poll, user=request.user), 'match': MatchSerializer(match, context={'request': request}).data})
+
+
+class MatchTimePollCloseView(APIView):
+    permission_classes = [IsActiveAccount]
+
+    def post(self, request, public_id):
+        poll = MatchTimePollService.close(poll_id=public_id, actor=request.user)
+        poll = get_object_or_404(MatchTimePoll.objects.select_related('match', 'creator', 'finalized_option'), pk=poll.pk)
+        return Response({'success': True, 'data': MatchTimePollService.serialize(poll, user=request.user)})
 
 
 class RemoveMatchParticipantView(APIView):
@@ -1304,9 +1798,71 @@ class TournamentRecommendationView(RecommendationBaseView):
         return Response({'success': True, 'data': [self._tournament(item) for item in RecommendationService.tournaments(request.user, self._limit(request))]})
 
 # ---------------- EVENTS & TOURNAMENTS ----------------
+def _calendar_date(value, name):
+    if not value:
+        return None
+    try:
+        return date.fromisoformat(value)
+    except (TypeError, ValueError) as exc:
+        raise ValidationError({name: 'Use YYYY-MM-DD.'}) from exc
+
+
+def _calendar_filters(request, *, tournaments=False):
+    date_from = _calendar_date(request.query_params.get('date_from'), 'date_from')
+    date_to = _calendar_date(request.query_params.get('date_to'), 'date_to')
+    if date_from and date_to and date_to < date_from:
+        raise ValidationError({'date_to': 'Must be on or after date_from.'})
+    sport_id = request.query_params.get('sport_id') or request.query_params.get('sport')
+    city = (request.query_params.get('location') or request.query_params.get('city') or '').strip()
+    status = request.query_params.get('status')
+    registration_status = request.query_params.get('registration_status')
+    if registration_status not in (None, '', 'registered', 'waitlisted', 'not_registered'):
+        raise ValidationError({'registration_status': 'Use registered, waitlisted, or not_registered.'})
+    if tournaments:
+        if registration_status == 'waitlisted': raise ValidationError({'registration_status':'Tournament registration status must be registered or not_registered.'})
+        if status and status not in Tournament.Status.values: raise ValidationError({'status':'Invalid tournament status.'})
+        qs = Tournament.objects.select_related('sport', 'venue', 'organizer').order_by('start_date')
+        if date_from: qs = qs.filter(end_date__gte=date_from)
+        if date_to: qs = qs.filter(start_date__lte=date_to)
+        elif not date_from: qs = qs.filter(end_date__gte=timezone.localdate())
+        if sport_id:
+            if not str(sport_id).isdigit(): raise ValidationError({'sport_id': 'Must be a valid sport id.'})
+            qs = qs.filter(sport_id=sport_id)
+        if city: qs = qs.filter(venue__city__icontains=city)
+        if status: qs = qs.filter(status=status)
+        if registration_status:
+            mine = Q(teams__members__user=request.user, teams__members__status=TournamentTeamMember.Status.ACTIVE)
+            qs = qs.filter(mine) if registration_status == 'registered' else qs.exclude(mine)
+        return qs.distinct()
+    qs = Event.objects.filter(Q(visibility=Event.Visibility.PUBLIC) | Q(organizer=request.user) | Q(participants__user=request.user) | Q(community__members__user=request.user,community__members__status=CommunityMember.Status.ACTIVE)).exclude(tournament__isnull=False).select_related('sport', 'venue', 'court', 'community', 'organizer').order_by('starts_at')
+    now = timezone.now()
+    if not date_from and not date_to:
+        qs = qs.filter(starts_at__gte=now)
+    if date_from:
+        start = timezone.make_aware(datetime.combine(date_from, time.min), timezone.get_current_timezone())
+        qs = qs.filter(starts_at__gte=start)
+    if date_to:
+        end = timezone.make_aware(datetime.combine(date_to + timedelta(days=1), time.min), timezone.get_current_timezone())
+        qs = qs.filter(starts_at__lt=end)
+    if sport_id:
+        if not str(sport_id).isdigit(): raise ValidationError({'sport_id': 'Must be a valid sport id.'})
+        qs = qs.filter(sport_id=sport_id)
+    if city: qs = qs.filter(venue__city__icontains=city)
+    event_type = request.query_params.get('event_type') or request.query_params.get('type')
+    if status and status not in Event.Status.values: raise ValidationError({'status':'Invalid event status.'})
+    if event_type and event_type not in Event.Type.values: raise ValidationError({'event_type':'Invalid event type.'})
+    if event_type: qs = qs.filter(event_type=event_type)
+    if status: qs = qs.filter(status=status)
+    else: qs = qs.exclude(status=Event.Status.DRAFT)
+    if registration_status:
+        mine = Q(participants__user=request.user, participants__status=registration_status)
+        qs = qs.filter(mine) if registration_status != 'not_registered' else qs.exclude(participants__user=request.user, participants__status__in=[EventParticipant.Status.REGISTERED, EventParticipant.Status.WAITLISTED])
+    return qs.distinct()
+
+
 class EventListCreateView(generics.ListCreateAPIView):
  permission_classes=[IsActiveAccount]; serializer_class=EventSerializer
- def get_queryset(self): return Event.objects.filter(status__in=[Event.Status.OPEN,Event.Status.FULL]).select_related('sport','venue','court','community').order_by('starts_at')
+ def get_queryset(self): return _calendar_filters(self.request)
  def create(self,request,*args,**kwargs):
   s=EventCreateSerializer(data=request.data);s.is_valid(raise_exception=True);d=s.validated_data
   d['venue']=get_object_or_404(Venue,public_id=d.pop('venue_id')); d['court']=get_object_or_404(Court,public_id=d.pop('court_id')) if d.get('court_id') else None; d.pop('court_id',None)
@@ -1314,11 +1870,15 @@ class EventListCreateView(generics.ListCreateAPIView):
   event=EventService.create(organizer=request.user,**d); return Response({'success':True,'data':EventSerializer(event).data},status=201)
 class EventDetailView(generics.RetrieveUpdateDestroyAPIView):
  permission_classes=[IsActiveAccount];serializer_class=EventSerializer;lookup_field='public_id'
- def get_queryset(self): return Event.objects.select_related('sport','venue','court','community')
+ def get_queryset(self):
+  return Event.objects.filter(Q(visibility=Event.Visibility.PUBLIC)|Q(organizer=self.request.user)|Q(participants__user=self.request.user)|Q(community__members__user=self.request.user,community__members__status=CommunityMember.Status.ACTIVE)).select_related('sport','venue','court','community').distinct()
+ def perform_update(self, serializer):
+  if self.get_object().organizer_id != self.request.user.id:
+   raise PermissionDenied('Only the event organizer can edit this event.')
+  serializer.save()
  def destroy(self,request,*args,**kwargs):
   e=self.get_object()
-  if e.organizer_id!=request.user.id and not request.user.is_staff: raise PermissionDenied('Only organizer can cancel.')
-  e.status=Event.Status.CANCELLED;e.save(update_fields=['status','updated_at']);e.participants.filter(status__in=['registered','waitlisted']).update(status=EventParticipant.Status.CANCELLED,left_at=timezone.now());return Response(status=204)
+  EventCancellationService.cancel(event=e,actor=request.user);return Response(status=204)
 class EventRegistrationView(APIView):
  permission_classes=[IsActiveAccount]
  throttle_classes=[ScopedRateThrottle]
@@ -1331,12 +1891,38 @@ class EventLeaveView(APIView):
 class EventCancelView(APIView):
  permission_classes=[IsActiveAccount]
  def post(self,request,public_id):
-  e=get_object_or_404(Event,public_id=public_id)
-  if e.organizer_id!=request.user.id and not request.user.is_staff: raise PermissionDenied('Only organizer can cancel.')
-  e.status=Event.Status.CANCELLED;e.save(update_fields=['status','updated_at']);e.participants.filter(status__in=['registered','waitlisted']).update(status=EventParticipant.Status.CANCELLED,left_at=timezone.now());return Response({'success':True,'data':EventSerializer(e).data})
+  e=EventCancellationService.cancel(event=get_object_or_404(Event,public_id=public_id),actor=request.user);return Response({'success':True,'data':EventSerializer(e,context={'request':request}).data})
 class EventParticipantsView(generics.ListAPIView):
  permission_classes=[IsActiveAccount];serializer_class=EventParticipantSerializer
  def get_queryset(self): return EventParticipant.objects.filter(event__public_id=self.kwargs['public_id']).select_related('user').order_by('joined_at')
+
+
+class EventReminderView(APIView):
+ permission_classes=[IsActiveAccount]
+ def post(self,request,public_id):
+  minutes=request.data.get('minutes_before',60)
+  try: minutes=int(minutes)
+  except (TypeError,ValueError) as exc: raise ValidationError({'minutes_before':'Must be an integer.'}) from exc
+  reminder=EventReminderService.set_reminder(event=get_object_or_404(Event,public_id=public_id),user=request.user,minutes_before=minutes)
+  return Response({'success':True,'data':EventReminderSerializer(reminder).data})
+ def delete(self,request,public_id):
+  event=get_object_or_404(Event,public_id=public_id)
+  reminder=EventReminderService.cancel_reminder(event=event,user=request.user)
+  return Response({'success':True,'cancelled':bool(reminder)})
+
+
+class SportsCalendarView(APIView):
+ permission_classes=[IsActiveAccount]
+ def get(self,request):
+  events=EventSerializer(_calendar_filters(request),many=True,context={'request':request}).data
+  tournaments=TournamentSerializer(_calendar_filters(request,tournaments=True),many=True,context={'request':request}).data
+  entries=[]
+  for item in events:
+   entries.append({'kind':'event',**item})
+  for item in tournaments:
+   entries.append({'kind':'tournament',**item})
+  entries.sort(key=lambda item: item.get('starts_at') or item.get('start_date') or '')
+  return Response({'success':True,'data':entries})
 class EventParticipantRemoveView(APIView):
  permission_classes=[IsActiveAccount]
  def post(self,request,public_id,user_id):
@@ -1345,12 +1931,27 @@ class EventParticipantRemoveView(APIView):
   return Response({'success':True,'data':EventParticipantSerializer(EventRegistrationService.leave(event=e,user=get_object_or_404(User,pk=user_id),removed=True)).data})
 class TournamentListCreateView(generics.ListCreateAPIView):
  permission_classes=[IsActiveAccount];serializer_class=TournamentSerializer
- def get_queryset(self): return Tournament.objects.select_related('sport','venue').order_by('start_date')
+ def get_queryset(self): return _calendar_filters(self.request,tournaments=True)
  def create(self,request,*args,**kwargs):
   s=TournamentCreateSerializer(data=request.data);s.is_valid(raise_exception=True);d=s.validated_data;d['venue']=get_object_or_404(Venue,public_id=d.pop('venue_id'))
   t=Tournament.objects.create(tournament_reference=EventService.ref('TR'),organizer=request.user,**d);return Response({'success':True,'data':TournamentSerializer(t).data},status=201)
 class TournamentDetailView(generics.RetrieveUpdateAPIView):
  permission_classes=[IsActiveAccount];serializer_class=TournamentSerializer;lookup_field='public_id';queryset=Tournament.objects.select_related('sport','venue')
+ def perform_update(self,serializer):
+  if self.get_object().organizer_id!=self.request.user.id: raise PermissionDenied('Only the tournament organizer can edit this tournament.')
+  serializer.save()
+
+class TournamentRegistrationView(APIView):
+ permission_classes=[IsActiveAccount]
+ def post(self,request,public_id):
+  serializer=TournamentRegistrationSerializer(data=request.data);serializer.is_valid(raise_exception=True)
+  tournament=get_object_or_404(Tournament,public_id=public_id)
+  team,created=TournamentRegistrationService.register(tournament=tournament,user=request.user,**serializer.validated_data)
+  return Response({'success':True,'created':created,'team':TournamentTeamSerializer(team).data},status=201 if created else 200)
+ def delete(self,request,public_id):
+  tournament=get_object_or_404(Tournament,public_id=public_id)
+  team=TournamentRegistrationService.leave(tournament=tournament,user=request.user)
+  return Response({'success':True,'team':TournamentTeamSerializer(team).data})
 class TournamentCancelView(APIView):
  permission_classes=[IsActiveAccount]
  def post(self,request,public_id):
@@ -1382,6 +1983,225 @@ class TournamentStandingsView(APIView):
   return Response({'success':True,'data':[{'team':r['team'].name,'played':r['played'],'wins':r['wins'],'losses':r['losses'],'draws':r['draws'],'points':r['points'],'difference':r['difference']} for r in TournamentStandingsService.standings(get_object_or_404(Tournament,public_id=public_id))]})
 
 
+class CollegeListCreateView(APIView):
+    permission_classes = [IsActiveAccount]
+
+    def get(self, request):
+        qs = College.objects.all().order_by('name')
+        status = request.query_params.get('status')
+        own = request.query_params.get('mine') == 'true'
+        if status == 'pending' and IsPlatformAdmin().has_permission(request, self):
+            qs = qs.filter(verification_status=College.VerificationStatus.PENDING)
+        else:
+            # Public discovery deliberately includes only verified colleges.
+            qs = qs.filter(verification_status=College.VerificationStatus.VERIFIED)
+        if own:
+            qs = qs.filter(memberships__user=request.user).distinct()
+        return Response({'success': True, 'data': CollegeSerializer(qs, many=True).data})
+
+    def post(self, request):
+        serializer = CollegeSubmitSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        college = CollegeService.submit(actor=request.user, **serializer.validated_data)
+        return Response({'success': True, 'data': CollegeSerializer(college).data}, status=201)
+
+
+class CollegeDetailView(APIView):
+    permission_classes = [IsActiveAccount]
+
+    def get(self, request, public_id):
+        college = get_object_or_404(College, public_id=public_id)
+        if college.verification_status != College.VerificationStatus.VERIFIED and not (college.submitted_by_id == request.user.id or IsPlatformAdmin().has_permission(request, self)):
+            from rest_framework.exceptions import NotFound
+            raise NotFound('College not found.')
+        return Response({'success': True, 'data': CollegeSerializer(college).data})
+
+
+class CollegeVerificationView(APIView):
+    permission_classes = [IsPlatformAdmin]
+
+    def post(self, request, public_id):
+        college = get_object_or_404(College, public_id=public_id)
+        approve = request.data.get('approve')
+        if not isinstance(approve, bool):
+            raise ValidationError({'approve': 'Must be true or false.'})
+        college = CollegeService.review(college=college, actor=request.user, approve=approve, reason=request.data.get('reason', ''))
+        return Response({'success': True, 'data': CollegeSerializer(college).data})
+
+
+class CollegeMembershipView(APIView):
+    permission_classes = [IsActiveAccount]
+
+    def get(self, request, public_id):
+        college = get_object_or_404(College, public_id=public_id)
+        admin = CollegeMembership.objects.filter(college=college, user=request.user, role=CollegeMembership.Role.ADMIN, status=CollegeMembership.Status.ACTIVE).exists()
+        if not admin and not IsPlatformAdmin().has_permission(request, self):
+            raise PermissionDenied('Only college administrators may view the membership roster.')
+        status = CollegeMembership.Status.PENDING if request.query_params.get('status') == 'pending' else CollegeMembership.Status.ACTIVE
+        return Response({'success': True, 'data': CollegeMembershipSerializer(college.memberships.filter(status=status).select_related('user'), many=True).data})
+
+    def post(self, request, public_id):
+        college = get_object_or_404(College, public_id=public_id)
+        member, changed = CollegeService.request_membership(college=college, user=request.user)
+        return Response({'success': True, 'changed': changed, 'data': CollegeMembershipSerializer(member).data}, status=201 if changed else 200)
+
+
+class CollegeMembershipDecisionView(APIView):
+    permission_classes = [IsActiveAccount]
+
+    def post(self, request, public_id, user_id, approve):
+        if approve not in ('approve', 'reject'):
+            raise ValidationError({'decision': 'Use approve or reject.'})
+        college = get_object_or_404(College, public_id=public_id)
+        member = CollegeService.decide_membership(college=college, actor=request.user, user_id=user_id, approve=approve == 'approve')
+        return Response({'success': True, 'data': CollegeMembershipSerializer(member).data})
+
+
+class CollegeClubListCreateView(APIView):
+    permission_classes = [IsActiveAccount]
+
+    def get(self, request, public_id):
+        college = get_object_or_404(College, public_id=public_id, verification_status=College.VerificationStatus.VERIFIED)
+        qs = Community.objects.filter(college=college, is_club=True, is_active=True).select_related('sport', 'owner')
+        return Response({'success': True, 'data': CommunitySerializer(qs, many=True, context={'request': request}).data})
+
+    def post(self, request, public_id):
+        college = get_object_or_404(College, public_id=public_id)
+        name = (request.data.get('name') or '').strip()
+        if not name:
+            raise ValidationError({'name': 'Required.'})
+        sport = get_object_or_404(Sport, pk=request.data.get('sport_id'), is_active=True)
+        community = CollegeService.create_club(college=college, actor=request.user, name=name, sport=sport, description=request.data.get('description', ''), visibility=request.data.get('visibility', 'public'))
+        return Response({'success': True, 'data': CommunitySerializer(community, context={'request': request}).data}, status=201)
+
+
+class CollegeChallengeListCreateView(APIView):
+    permission_classes = [IsActiveAccount]
+
+    def get(self, request):
+        memberships = CollegeMembership.objects.filter(user=request.user, role=CollegeMembership.Role.ADMIN, status=CollegeMembership.Status.ACTIVE).values('college_id')
+        qs = CollegeChallenge.objects.filter(Q(challenger_id__in=memberships) | Q(challenged_id__in=memberships)).select_related('challenger', 'challenged', 'sport', 'tournament').order_by('-created_at')
+        return Response({'success': True, 'data': CollegeChallengeSerializer(qs, many=True).data})
+
+    def post(self, request, public_id):
+        challenger = get_object_or_404(College, public_id=public_id)
+        serializer = CollegeChallengeCreateSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        challenged = get_object_or_404(College, public_id=serializer.validated_data['challenged_college_id'])
+        data = serializer.validated_data
+        challenge = CollegeService.create_challenge(challenger=challenger, challenged=challenged, actor=request.user, sport=data['sport'], message=data['message'])
+        return Response({'success': True, 'data': CollegeChallengeSerializer(challenge).data}, status=201)
+
+
+class CollegeChallengeAnswerView(APIView):
+    permission_classes = [IsActiveAccount]
+
+    def post(self, request, public_id):
+        challenge = get_object_or_404(CollegeChallenge, public_id=public_id)
+        serializer = ChallengeAnswerSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        args = serializer.validated_data
+        venue = None
+        if args.get('accept'):
+            for required in ('venue_id', 'start_date', 'end_date', 'registration_deadline'):
+                if required not in args:
+                    raise ValidationError({required: 'Required when accepting a challenge.'})
+            venue = get_object_or_404(Venue, public_id=args.pop('venue_id'), active=True)
+        challenge = CollegeService.answer_challenge(challenge=challenge, actor=request.user, venue=venue, **args)
+        return Response({'success': True, 'data': CollegeChallengeSerializer(challenge).data})
+
+
+class CollegeTeamsView(APIView):
+    permission_classes = [IsActiveAccount]
+
+    def post(self, request, public_id):
+        tournament = get_object_or_404(Tournament, public_id=public_id, is_inter_college=True)
+        serializer = CollegeTeamCreateSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        college = get_object_or_404(College, public_id=serializer.validated_data.pop('college_id'))
+        team = CollegeService.create_team(tournament=tournament, college=college, actor=request.user, **serializer.validated_data)
+        return Response({'success': True, 'data': TournamentTeamSerializer(team).data}, status=201)
+
+    def get(self, request, public_id):
+        tournament = get_object_or_404(Tournament, public_id=public_id, is_inter_college=True)
+        teams = tournament.teams.select_related('college', 'captain').all()
+        data = TournamentTeamSerializer(teams, many=True).data
+        for row, team in zip(data, teams):
+            row['college_name'] = team.college.name if team.college_id else None
+        return Response({'success': True, 'data': data})
+
+
+class CollegeRosterView(APIView):
+    permission_classes = [IsActiveAccount]
+
+    def post(self, request, public_id):
+        team = get_object_or_404(TournamentTeam, public_id=public_id, tournament__is_inter_college=True)
+        serializer = CollegeRosterAddSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        user = get_object_or_404(User, pk=serializer.validated_data['user_id'], is_active=True)
+        member = CollegeService.add_roster_member(team=team, actor=request.user, user=user)
+        return Response({'success': True, 'data': {'user_id': member.user_id, 'team_id': team.public_id.hex}}, status=201)
+
+
+class CollegeResultDisputeView(APIView):
+    permission_classes = [IsActiveAccount]
+
+    def get(self, request, public_id):
+        match = get_object_or_404(TournamentMatch, public_id=public_id, tournament__is_inter_college=True)
+        return Response({'success': True, 'data': CollegeResultDisputeSerializer(match.college_disputes.all(), many=True).data})
+
+    def post(self, request, public_id):
+        match = get_object_or_404(TournamentMatch, public_id=public_id, tournament__is_inter_college=True)
+        serializer = CollegeDisputeCreateSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        dispute = CollegeService.dispute_result(match=match, actor=request.user, **serializer.validated_data)
+        return Response({'success': True, 'data': CollegeResultDisputeSerializer(dispute).data}, status=201)
+
+
+class CollegeResultDisputeResolveView(APIView):
+    permission_classes = [IsPlatformAdmin]
+
+    def post(self, request, public_id):
+        dispute = get_object_or_404(CollegeResultDispute, public_id=public_id)
+        serializer = CollegeDisputeResolveSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        dispute = CollegeService.resolve_dispute(dispute=dispute, actor=request.user, **serializer.validated_data)
+        return Response({'success': True, 'data': CollegeResultDisputeSerializer(dispute).data})
+
+
+class CollegeTournamentResultView(APIView):
+    permission_classes = [IsActiveAccount]
+
+    def post(self, request, public_id, match_id):
+        match = get_object_or_404(TournamentMatch, public_id=match_id, tournament__public_id=public_id, tournament__is_inter_college=True)
+        updated = CollegeService.record_result(match=match, actor=request.user, score_a=request.data.get('score_a'), score_b=request.data.get('score_b'))
+        return Response({'success': True, 'data': TournamentMatchSerializer(updated).data})
+
+
+class CollegeTournamentBracketView(APIView):
+    permission_classes = [IsActiveAccount]
+
+    def post(self, request, public_id):
+        tournament = get_object_or_404(Tournament, public_id=public_id, is_inter_college=True)
+        # Any participating college administrator may create the fixture once
+        # both sides have registered eligible rosters. The generic organizer
+        # endpoint retains its original permission rule for other tournaments.
+        from .models import CollegeChallenge, CollegeMembership, TournamentTeamMember
+        challenge = getattr(tournament, 'college_challenge', None)
+        if not challenge or challenge.status != CollegeChallenge.Status.ACCEPTED:
+            raise ValidationError('An accepted inter-college challenge is required.')
+        if not CollegeMembership.objects.filter(user=request.user, role=CollegeMembership.Role.ADMIN, status=CollegeMembership.Status.ACTIVE, college__in=[challenge.challenger, challenge.challenged], college__verification_status=College.VerificationStatus.VERIFIED).exists():
+            raise PermissionDenied('Participating college administrator permission is required.')
+        teams = list(tournament.teams.filter(status=TournamentTeam.Status.ACTIVE).select_related('college').order_by('seed', 'created_at'))
+        if len(teams) != 2 or {team.college_id for team in teams} != {challenge.challenger_id, challenge.challenged_id}:
+            raise ValidationError('Both colleges must register exactly one eligible team before fixtures are created.')
+        for team in teams:
+            if not team.members.filter(status=TournamentTeamMember.Status.ACTIVE).exists() or team.members.filter(status=TournamentTeamMember.Status.ACTIVE).exclude(user__college_memberships__college=team.college, user__college_memberships__status=CollegeMembership.Status.ACTIVE).exists():
+                raise ValidationError('Every rostered player must have active membership at their represented college.')
+        matches = TournamentBracketService.generate(tournament=tournament, actor=tournament.organizer)
+        return Response({'success': True, 'data': TournamentMatchSerializer(matches, many=True).data})
+
+
 # ---------------- COMMUNITIES ----------------
 class CommunityListCreateView(generics.ListCreateAPIView):
     permission_classes = [IsActiveAccount]
@@ -1390,9 +2210,19 @@ class CommunityListCreateView(generics.ListCreateAPIView):
         return CommunityCreateSerializer if self.request.method == 'POST' else CommunitySerializer
 
     def get_queryset(self):
-        visible = Q(visibility=Community.Visibility.PUBLIC) | Q(owner=self.request.user) | Q(members__user=self.request.user, members__status=CommunityMember.Status.ACTIVE)
+        visible = (Q(visibility=Community.Visibility.PUBLIC, is_club=False)
+                   | Q(owner=self.request.user)
+                   | Q(members__user=self.request.user, members__status=CommunityMember.Status.ACTIVE)
+                   | Q(visibility=Community.Visibility.PUBLIC, is_club=True))
         queryset = Community.objects.filter(visible, is_active=True).select_related('sport', 'owner').distinct()
         sport = self.request.query_params.get('sport')
+        clubs_only = self.request.query_params.get('clubs') == 'true'
+        if clubs_only:
+            queryset = queryset.filter(is_club=True)
+            queryset = queryset.filter(
+                Q(visibility=Community.Visibility.PUBLIC)
+                | Q(members__user=self.request.user, members__status=CommunityMember.Status.ACTIVE)
+            )
         city = self.request.query_params.get('city')
         if sport:
             queryset = queryset.filter(sport_id=sport)
@@ -1411,8 +2241,9 @@ class CommunityListCreateView(generics.ListCreateAPIView):
     def create(self, request, *args, **kwargs):
         serializer = CommunityCreateSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
+        serializer.validated_data['is_club'] = True
         community = CommunityService.create(owner=request.user, **serializer.validated_data)
-        return Response({'success': True, 'data': CommunitySerializer(community).data}, status=201)
+        return Response({'success': True, 'data': CommunitySerializer(community, context={'request': request}).data}, status=201)
 
 
 class CommunityDetailView(APIView):
@@ -1420,22 +2251,26 @@ class CommunityDetailView(APIView):
 
     def get_community(self, public_id):
         community = get_object_or_404(Community, public_id=public_id, is_active=True)
-        if community.visibility == Community.Visibility.PRIVATE:
+        if community.visibility == Community.Visibility.PRIVATE or community.is_club:
             CommunityMembershipService.active_member(community=community, user=self.request.user)
         return community
 
     def get(self, request, public_id):
-        return Response({'success': True, 'data': CommunitySerializer(self.get_community(public_id)).data})
+        return Response({'success': True, 'data': CommunitySerializer(self.get_community(public_id), context={'request': request}).data})
 
     def patch(self, request, public_id):
         community = self.get_community(public_id)
         CommunityMembershipService.admin(community=community, user=request.user)
         serializer = CommunityUpdateSerializer(data=request.data, partial=True)
         serializer.is_valid(raise_exception=True)
+        if 'is_active' in serializer.validated_data and request.user.id != community.owner_id:
+            raise PermissionDenied('Only the owner can deactivate this club.')
+        if request.user.id != community.owner_id and {'visibility', 'membership_open', 'avatar', 'cover_image'} & set(serializer.validated_data):
+            raise PermissionDenied('Only the owner can change club visibility, membership rules, or branding.')
         for key, value in serializer.validated_data.items():
             setattr(community, key, value)
         community.save(update_fields=[*serializer.validated_data.keys(), 'updated_at'])
-        return Response({'success': True, 'data': CommunitySerializer(community).data})
+        return Response({'success': True, 'data': CommunitySerializer(community, context={'request': request}).data})
 
 
 class CommunityJoinLeaveView(APIView):
@@ -1456,9 +2291,15 @@ class CommunityMembersView(generics.ListAPIView):
 
     def get_queryset(self):
         community = get_object_or_404(Community, public_id=self.kwargs['public_id'], is_active=True)
-        if community.visibility == Community.Visibility.PRIVATE:
+        if community.visibility == Community.Visibility.PRIVATE or community.is_club:
             CommunityMembershipService.active_member(community=community, user=self.request.user)
         return CommunityMember.objects.filter(community=community, status=CommunityMember.Status.ACTIVE).select_related('user').order_by('joined_at')
+
+    def list(self, request, *args, **kwargs):
+        response = super().list(request, *args, **kwargs)
+        community = get_object_or_404(Community, public_id=self.kwargs['public_id'])
+        own = CommunityMember.objects.filter(community=community, user=request.user, status=CommunityMember.Status.ACTIVE).exists()
+        return Response({'success': True, 'data': response.data, 'can_manage': own and CommunityMember.objects.filter(community=community, user=request.user, status=CommunityMember.Status.ACTIVE, role__in=[CommunityMember.Role.OWNER, CommunityMember.Role.CAPTAIN, CommunityMember.Role.ADMIN]).exists()})
 
 
 class CommunityRequestsView(APIView):
@@ -1476,13 +2317,59 @@ class CommunityRequestsView(APIView):
         return Response({'success': True, 'data': CommunityMemberSerializer(member).data})
 
 
+class ClubInvitationsView(APIView):
+    permission_classes = [IsActiveAccount]
+
+    def post(self, request, public_id):
+        community = get_object_or_404(Community, public_id=public_id, is_active=True, is_club=True)
+        serializer = ClubInviteSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        member = CommunityService.invite(community=community, actor=request.user, user_id=serializer.validated_data['user_id'])
+        return Response({'success': True, 'data': CommunityMemberSerializer(member).data}, status=201)
+
+
+class ClubMemberRoleView(APIView):
+    permission_classes = [IsActiveAccount]
+
+    def patch(self, request, public_id, user_id):
+        community = get_object_or_404(Community, public_id=public_id, is_active=True, is_club=True)
+        serializer = ClubMemberRoleSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        member = CommunityService.set_role(community=community, actor=request.user, user_id=user_id, role=serializer.validated_data['role'])
+        return Response({'success': True, 'data': CommunityMemberSerializer(member).data})
+
+
+class ClubOwnershipTransferView(APIView):
+    permission_classes = [IsActiveAccount]
+
+    def post(self, request, public_id):
+        community = get_object_or_404(Community, public_id=public_id, is_active=True, is_club=True)
+        serializer = ClubInviteSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        member = CommunityService.transfer_ownership(community=community, actor=request.user, user_id=serializer.validated_data['user_id'])
+        return Response({'success': True, 'data': CommunityMemberSerializer(member).data})
+
+
+class ClubActivitiesView(APIView):
+    permission_classes = [IsActiveAccount]
+
+    def get(self, request, public_id):
+        community = get_object_or_404(Community, public_id=public_id, is_active=True, is_club=True)
+        if community.visibility == Community.Visibility.PRIVATE or community.is_club:
+            CommunityMembershipService.active_member(community=community, user=request.user)
+        events = community.events.filter(status__in=[Event.Status.OPEN, Event.Status.FULL, Event.Status.STARTED]).select_related('sport', 'venue').order_by('starts_at')
+        games = community.posts.filter(post_type=CommunityPost.Type.GAME, game__starts_at__gt=timezone.now()).select_related('game__sport', 'game__venue').order_by('game__starts_at')
+        return Response({'success': True, 'events': EventSerializer(events, many=True).data,
+            'games': [{'post': CommunityPostSerializer(post).data, 'game': GameSerializer(post.game, context={'request': request}).data} for post in games if post.game_id]})
+
+
 class CommunityPostsView(generics.ListCreateAPIView):
     serializer_class = CommunityPostSerializer
     permission_classes = [IsActiveAccount]
 
     def get_community(self):
         community = get_object_or_404(Community, public_id=self.kwargs['public_id'], is_active=True)
-        if community.visibility == Community.Visibility.PRIVATE:
+        if community.visibility == Community.Visibility.PRIVATE or community.is_club:
             CommunityMembershipService.active_member(community=community, user=self.request.user)
         return community
 
@@ -1501,7 +2388,7 @@ class CommunityPostDetailView(APIView):
 
     def get_post(self, public_id):
         post = get_object_or_404(CommunityPost.objects.select_related('community', 'author'), public_id=public_id)
-        if post.community.visibility == Community.Visibility.PRIVATE:
+        if post.community.visibility == Community.Visibility.PRIVATE or post.community.is_club:
             CommunityMembershipService.active_member(community=post.community, user=self.request.user)
         return post
 
@@ -1528,7 +2415,7 @@ class CommunityCommentsView(generics.ListCreateAPIView):
 
     def get_queryset(self):
         post = self.get_post()
-        if post.community.visibility == Community.Visibility.PRIVATE:
+        if post.community.visibility == Community.Visibility.PRIVATE or post.community.is_club:
             CommunityMembershipService.active_member(community=post.community, user=self.request.user)
         return CommunityComment.objects.filter(post=post).select_related('author').order_by('created_at')
 
@@ -1955,7 +2842,19 @@ class AccessManagementView(APIView):
 
     def get(self, request):
         users = User.objects.prefetch_related('groups').order_by('username')[:200]
-        return Response({'success': True, 'data': [{'public_id': str(user.public_id), 'username': user.username, 'email': user.email, 'account_status': user.account_status, 'roles': list(user.groups.values_list('name', flat=True))} for user in users]})
+        data = []
+        for user in users:
+            roles = list(user.groups.values_list('name', flat=True))
+            if (user.is_superuser or user.has_perm('my_app.view_user')) and 'SportMate Admins' not in roles:
+                roles.append('SportMate Admins')
+            data.append({
+                'public_id': str(user.public_id),
+                'username': user.username,
+                'email': user.email,
+                'account_status': user.account_status,
+                'roles': roles,
+            })
+        return Response({'success': True, 'data': data})
 
     def patch(self, request, public_id):
         user = get_object_or_404(User, public_id=public_id)
@@ -1973,21 +2872,93 @@ class VenueOwnerApplicationReviewView(APIView):
     permission_classes = [IsPlatformAdmin]
 
     def get(self, request):
-        items = VenueOwnerApplication.objects.select_related('applicant').order_by('-created_at')
-        return Response({'success': True, 'data': [{'public_id': str(item.public_id), 'business_name': item.business_name, 'phone': item.phone, 'city': item.city, 'address': item.address, 'status': item.status, 'applicant': item.applicant.username, 'review_note': item.review_note} for item in items]})
+        items = VenueOwnerApplication.objects.select_related('applicant').prefetch_related(
+            'applicant__owned_venues__source_ground'
+        ).order_by('-created_at')
+        return Response({'success': True, 'data': [{
+            'public_id': str(item.public_id),
+            'business_name': item.business_name,
+            'phone': item.phone,
+            'city': item.city,
+            'address': item.address,
+            'status': item.status,
+            'applicant': item.applicant.username,
+            'applicant_name': item.applicant.full_name,
+            'applicant_email': item.applicant.email,
+            'applicant_phone': item.applicant.phone,
+            'created_at': item.created_at,
+            'review_note': item.review_note,
+            'grounds': [{
+                'name': venue.source_ground.name if venue.source_ground_id else venue.name,
+                'venue_name': venue.name,
+                'city': venue.city,
+                'address': venue.address,
+            } for venue in item.applicant.owned_venues.all()],
+        } for item in items]})
 
     def patch(self, request, public_id):
         item = get_object_or_404(VenueOwnerApplication, public_id=public_id)
         status = request.data.get('status')
         if status not in {VenueOwnerApplication.Status.APPROVED, VenueOwnerApplication.Status.REJECTED}:
             raise ValidationError({'status': ['Use approved or rejected.']})
-        item.status, item.reviewed_by, item.review_note = status, request.user, str(request.data.get('review_note', '')).strip()
-        item.save(update_fields=['status', 'reviewed_by', 'review_note', 'updated_at'])
-        group, _ = Group.objects.get_or_create(name=VENUE_OWNER_GROUP)
-        if status == VenueOwnerApplication.Status.APPROVED:
-            item.applicant.groups.add(group)
-            RoleAuditLog.objects.create(actor=request.user, target_user=item.applicant, role=VENUE_OWNER_GROUP, action='grant', reason=item.review_note)
-        return Response({'success': True, 'status': item.status})
+        if item.status != VenueOwnerApplication.Status.PENDING:
+            raise ValidationError({'status': ['Only pending applications can be reviewed.']})
+
+        review_note = str(request.data.get('review_note', '')).strip()
+        if len(review_note) > 500:
+            raise ValidationError({'review_note': ['Use 500 characters or fewer.']})
+        applicant = item.applicant
+        applicant_name = applicant.full_name.strip() or applicant.username
+        decision = 'approved' if status == VenueOwnerApplication.Status.APPROVED else 'rejected'
+        default_message = (
+            'Your venue-owner application has been approved. You can now sign in using Venue login to manage your venue.'
+            if status == VenueOwnerApplication.Status.APPROVED else
+            'Your venue-owner application was not approved. The associated SportMate account has been removed. You may register again with corrected application details.'
+        )
+        email_body = (
+            f'Hello {applicant_name},\n\n'
+            f'Your SportMate venue-owner application for "{item.business_name}" has been {decision}.\n\n'
+            f'{default_message}\n\n'
+            + (f'Message from the SportMate admin team:\n{review_note}\n\n' if review_note else '')
+            + 'Thank you,\nSportMate Admin Team'
+        )
+
+        with transaction.atomic():
+            if status == VenueOwnerApplication.Status.APPROVED:
+                item.status = status
+                item.reviewed_by = request.user
+                item.review_note = review_note
+                item.save(update_fields=['status', 'reviewed_by', 'review_note', 'updated_at'])
+                group, _ = Group.objects.get_or_create(name=VENUE_OWNER_GROUP)
+                applicant.groups.add(group)
+                RoleAuditLog.objects.create(
+                    actor=request.user,
+                    target_user=applicant,
+                    role=VENUE_OWNER_GROUP,
+                    action='grant',
+                    reason=review_note or 'Venue-owner application approved.',
+                )
+            else:
+                # Delete the rejected applicant. The application is removed by
+                # its CASCADE relationship to the applicant account.
+                applicant.delete()
+
+            sent_count = send_mail(
+                subject=f'SportMate venue-owner application {decision}',
+                message=email_body,
+                from_email=settings.DEFAULT_FROM_EMAIL,
+                recipient_list=[applicant.email],
+                fail_silently=False,
+            )
+            if sent_count != 1:
+                raise APIException('The decision email could not be sent. No account or application changes were made.')
+
+        return Response({
+            'success': True,
+            'status': status,
+            'email_sent': True,
+            'account_deleted': status == VenueOwnerApplication.Status.REJECTED,
+        })
 
 
 class AdminDashboardView(APIView):
@@ -1996,6 +2967,9 @@ class AdminDashboardView(APIView):
     def get(self, request):
         return Response({'success': True, 'data': {
             'active_users': User.objects.filter(is_active=True, account_status=User.AccountStatus.ACTIVE).count(),
+            'players': PlayerProfile.objects.count(),
+            'venue_owners': User.objects.filter(groups__name=VENUE_OWNER_GROUP).distinct().count(),
+            'pending_venue_owner_applications': VenueOwnerApplication.objects.filter(status=VenueOwnerApplication.Status.PENDING).count(),
             'new_users': User.objects.filter(date_joined__date=timezone.localdate()).count(),
             'games': Game.objects.count(), 'bookings': CourtBooking.objects.count(),
             'communities': Community.objects.filter(is_active=True).count(), 'events': Event.objects.count(),
@@ -2075,6 +3049,78 @@ class GameRatingStatusView(APIView):
         ratings={rating.player_id:rating.public_id for rating in PlayerRating.objects.filter(game=game,reviewer=request.user,deleted_at__isnull=True)}
         participants=GamePlayer.objects.filter(game=game,status=GamePlayer.Status.CONFIRMED).exclude(user=request.user).select_related('user')
         return Response({'success':True,'data':[{'player_id':str(row.user.public_id),'username':row.user.username,'rating_id':str(ratings[row.user_id]) if row.user_id in ratings else None,'can_rate':row.user_id not in ratings} for row in participants]})
+
+
+class MyMatchReflectionsView(APIView):
+    """Private reflection history and personal-only trend summary."""
+    permission_classes = [IsActiveAccount]
+
+    def get(self, request):
+        reflections = MatchReflection.objects.filter(user=request.user).select_related('game__sport', 'game__venue').order_by('-created_at')
+        rows = list(reflections)
+        count = len(rows)
+        averages = {
+            key: round(sum(getattr(item, key) for item in rows) / count, 2) if count else None
+            for key in ('enjoyment', 'teamwork', 'improvement')
+        }
+        return Response({'success': True, 'data': {
+            'summary': {'count': count, 'averages': averages},
+            'results': MatchReflectionSerializer(rows, many=True).data,
+        }})
+
+
+class EligibleMatchReflectionsView(APIView):
+    permission_classes = [IsActiveAccount]
+
+    def get(self, request):
+        completed = Game.objects.filter(
+            status=Game.Status.COMPLETED,
+            game_players__user=request.user,
+            game_players__status=GamePlayer.Status.CONFIRMED,
+        ).exclude(reflections__user=request.user).select_related('sport', 'venue').distinct().order_by('-game_date')
+        return Response({'success': True, 'data': [
+            {'game_id': str(game.public_id), 'game_reference': game.game_reference,
+             'sport': game.sport.name, 'game_date': game.game_date, 'venue': game.venue.name}
+            for game in completed
+        ]})
+
+
+class MatchReflectionCreateView(APIView):
+    permission_classes = [IsActiveAccount]
+
+    def post(self, request, public_id):
+        game = get_object_or_404(Game, public_id=public_id)
+        if game.status != Game.Status.COMPLETED or not GamePlayer.objects.filter(
+            game=game, user=request.user, status=GamePlayer.Status.CONFIRMED
+        ).exists():
+            raise PermissionDenied('Reflections are available only to confirmed participants of completed games.')
+        serializer = MatchReflectionInputSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        try:
+            with transaction.atomic():
+                reflection = MatchReflection.objects.create(game=game, user=request.user, **serializer.validated_data)
+        except IntegrityError as exc:
+            raise ValidationError({'detail': 'You have already reflected on this game.'}) from exc
+        return Response({'success': True, 'data': MatchReflectionSerializer(reflection).data}, status=201)
+
+
+class MatchReflectionDetailView(APIView):
+    permission_classes = [IsActiveAccount]
+
+    def patch(self, request, public_id):
+        reflection = get_object_or_404(MatchReflection, public_id=public_id)
+        if reflection.user_id != request.user.id:
+            raise PermissionDenied('Only the reflection owner can edit it.')
+        if timezone.now() > reflection.created_at + timedelta(hours=24):
+            raise ValidationError({'detail': 'Reflections can only be edited within 24 hours of submission.'})
+        serializer = MatchReflectionInputSerializer(data=request.data, partial=True)
+        serializer.is_valid(raise_exception=True)
+        for key, value in serializer.validated_data.items():
+            setattr(reflection, key, value)
+        reflection.save(update_fields=[*serializer.validated_data.keys(), 'updated_at'])
+        return Response({'success': True, 'data': MatchReflectionSerializer(reflection).data})
+
+
 class PlayerStatisticsView(APIView):
     permission_classes=[IsActiveAccount]
     def get(self,request,public_id,sport_id=None):

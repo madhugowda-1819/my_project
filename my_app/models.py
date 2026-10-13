@@ -30,6 +30,7 @@ class User(AbstractUser):
     public_id = models.UUIDField(default=uuid.uuid4, unique=True, editable=False, db_index=True)
     full_name = models.CharField(max_length=150, blank=True)
     email = models.EmailField(unique=True)
+    referral_code = models.CharField(max_length=20, unique=True, null=True, blank=True, db_index=True)
     phone = models.CharField(max_length=20, blank=True)
     avatar = models.ImageField(upload_to='avatars/', null=True, blank=True)
 
@@ -121,6 +122,12 @@ class PlayerProfile(TimestampedPublicModel):
         ('advanced', 'Advanced'),
         ('pro', 'Pro'),
     ]
+    MOOD_CHOICES = [
+        ('relaxed', 'Relaxed'),
+        ('energetic', 'Energetic'),
+        ('learning', 'Learning'),
+        ('social', 'Social'),
+    ]
 
     user = models.OneToOneField(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='profile')
 
@@ -129,6 +136,7 @@ class PlayerProfile(TimestampedPublicModel):
     availability = models.JSONField(default=dict, blank=True)
     preferred_distance = models.PositiveIntegerField(default=15)
     preferred_play_times = models.JSONField(default=list, blank=True)
+    matching_mood = models.CharField(max_length=16, choices=MOOD_CHOICES, blank=True, default='')
     profile_visibility = models.CharField(
         max_length=16,
         choices=[('public', 'Public'), ('sports_only', 'Sports only'), ('private', 'Private')],
@@ -542,6 +550,98 @@ class Match(TimestampedPublicModel):
         ]
 
 
+class MatchTimePoll(TimestampedPublicModel):
+    class Status(models.TextChoices):
+        OPEN = 'open', 'Open'
+        TIE = 'tie', 'Tie - organizer decision required'
+        FINALIZED = 'finalized', 'Finalized'
+        CLOSED = 'closed', 'Closed'
+
+    match = models.ForeignKey(Match, on_delete=models.CASCADE, related_name='time_polls')
+    creator = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.PROTECT, related_name='created_match_time_polls')
+    deadline = models.DateTimeField(db_index=True)
+    status = models.CharField(max_length=12, choices=Status.choices, default=Status.OPEN, db_index=True)
+    finalized_option = models.ForeignKey('MatchTimePollOption', null=True, blank=True, on_delete=models.PROTECT, related_name='finalized_polls')
+    finalized_by = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.SET_NULL, related_name='finalized_match_time_polls')
+    finalized_at = models.DateTimeField(null=True, blank=True)
+    version = models.PositiveIntegerField(default=1)
+
+    class Meta:
+        indexes = [models.Index(fields=['match', 'status'], name='match_timepoll_status_idx')]
+
+
+class MatchTimePollOption(TimestampedPublicModel):
+    poll = models.ForeignKey(MatchTimePoll, on_delete=models.CASCADE, related_name='options')
+    starts_at = models.DateTimeField()
+    ends_at = models.DateTimeField()
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(fields=['poll', 'starts_at'], name='unique_match_poll_option_start'),
+            models.CheckConstraint(check=models.Q(ends_at__gt=models.F('starts_at')), name='match_poll_option_end_after_start'),
+        ]
+        ordering = ['starts_at', 'id']
+
+
+class MatchTimePollVoter(TimestampedPublicModel):
+    poll = models.ForeignKey(MatchTimePoll, on_delete=models.CASCADE, related_name='eligible_voters')
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='eligible_match_time_polls')
+
+    class Meta:
+        constraints = [models.UniqueConstraint(fields=['poll', 'user'], name='unique_match_poll_voter')]
+
+
+class MatchTimePollVote(TimestampedPublicModel):
+    poll = models.ForeignKey(MatchTimePoll, on_delete=models.CASCADE, related_name='votes')
+    voter = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='match_time_poll_votes')
+    option = models.ForeignKey(MatchTimePollOption, on_delete=models.CASCADE, related_name='votes')
+    is_active = models.BooleanField(default=True, db_index=True)
+    changed_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(fields=['poll', 'voter'], condition=models.Q(is_active=True), name='unique_active_match_poll_vote'),
+        ]
+        indexes = [models.Index(fields=['poll', 'is_active'], name='match_poll_vote_count_idx')]
+
+
+class MatchReplacementOpportunity(TimestampedPublicModel):
+    """A time-limited request to refill a slot opened in an upcoming match."""
+    match = models.ForeignKey(Match, on_delete=models.CASCADE, related_name='replacement_opportunities')
+    withdrawn_user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, related_name='opened_match_rescues')
+    expires_at = models.DateTimeField(db_index=True)
+    closed_at = models.DateTimeField(null=True, blank=True)
+    replacement_user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True, related_name='accepted_match_rescues')
+
+    class Meta:
+        indexes = [models.Index(fields=['match', 'closed_at', 'expires_at'], name='match_rescue_open_idx')]
+
+
+class MatchReplacementInvitation(TimestampedPublicModel):
+    class Status(models.TextChoices):
+        PENDING = 'pending', 'Pending'
+        ACCEPTED = 'accepted', 'Accepted'
+        DECLINED = 'declined', 'Declined'
+        EXPIRED = 'expired', 'Expired'
+        UNAVAILABLE = 'unavailable', 'Unavailable'
+
+    opportunity = models.ForeignKey(MatchReplacementOpportunity, on_delete=models.CASCADE, related_name='invitations')
+    candidate = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='match_replacement_invitations')
+    status = models.CharField(max_length=16, choices=Status.choices, default=Status.PENDING, db_index=True)
+    responded_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        constraints = [models.UniqueConstraint(fields=['opportunity', 'candidate'], name='unique_match_rescue_candidate')]
+        indexes = [models.Index(fields=['candidate', 'status', 'created_at'], name='rescue_candidate_state_idx')]
+
+
+class MatchReplacementHistory(TimestampedPublicModel):
+    opportunity = models.OneToOneField(MatchReplacementOpportunity, on_delete=models.PROTECT, related_name='history')
+    match = models.ForeignKey(Match, on_delete=models.PROTECT, related_name='replacement_history')
+    withdrawn_user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, related_name='match_replacement_history_left')
+    replacement_user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.PROTECT, related_name='match_replacement_history_joined')
+
+
 # ---------------------------------------------------------------------------
 # GAMES
 # ---------------------------------------------------------------------------
@@ -640,6 +740,9 @@ class Community(TimestampedPublicModel):
     visibility = models.CharField(max_length=10, choices=Visibility.choices, default=Visibility.PUBLIC, db_index=True)
     avatar = models.ImageField(upload_to='communities/avatars/', null=True, blank=True)
     cover_image = models.ImageField(upload_to='communities/covers/', null=True, blank=True)
+    is_club = models.BooleanField(default=False, db_index=True)
+    membership_open = models.BooleanField(default=True)
+    college = models.ForeignKey('College', null=True, blank=True, on_delete=models.SET_NULL, related_name='clubs')
     member_count = models.PositiveIntegerField(default=0)
     is_active = models.BooleanField(default=True, db_index=True)
 
@@ -657,6 +760,7 @@ class Community(TimestampedPublicModel):
 class CommunityMember(TimestampedPublicModel):
     class Role(models.TextChoices):
         OWNER = 'owner', 'Owner'
+        CAPTAIN = 'captain', 'Captain'
         ADMIN = 'admin', 'Admin'
         MODERATOR = 'moderator', 'Moderator'
         MEMBER = 'member', 'Member'
@@ -718,6 +822,81 @@ class CommunityPostLike(TimestampedPublicModel):
         indexes = [models.Index(fields=['post', 'created_at'], name='community_like_post_idx')]
 
 
+class College(TimestampedPublicModel):
+    """A college/institution whose official status is explicitly reviewed."""
+    class VerificationStatus(models.TextChoices):
+        PENDING = 'pending', 'Pending'
+        VERIFIED = 'verified', 'Verified'
+        REJECTED = 'rejected', 'Rejected'
+
+    name = models.CharField(max_length=180)
+    slug = models.SlugField(max_length=200, unique=True)
+    city = models.CharField(max_length=100, db_index=True)
+    state = models.CharField(max_length=100, blank=True)
+    country = models.CharField(max_length=100, default='India')
+    description = models.TextField(blank=True)
+    approved_email_domain = models.CharField(max_length=255, blank=True)
+    verification_evidence = models.URLField(max_length=500, blank=True)
+    verification_status = models.CharField(max_length=12, choices=VerificationStatus.choices, default=VerificationStatus.PENDING, db_index=True)
+    submitted_by = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.PROTECT, related_name='college_submissions')
+    reviewed_by = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.SET_NULL, related_name='college_reviews')
+    reviewed_at = models.DateTimeField(null=True, blank=True)
+    rejection_reason = models.CharField(max_length=500, blank=True)
+
+
+class CollegeMembership(TimestampedPublicModel):
+    class Role(models.TextChoices):
+        ADMIN = 'admin', 'College administrator'
+        PLAYER = 'player', 'Player'
+    class Status(models.TextChoices):
+        PENDING = 'pending', 'Pending'
+        ACTIVE = 'active', 'Active'
+        REJECTED = 'rejected', 'Rejected'
+        LEFT = 'left', 'Left'
+
+    college = models.ForeignKey(College, on_delete=models.CASCADE, related_name='memberships')
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='college_memberships')
+    role = models.CharField(max_length=10, choices=Role.choices, default=Role.PLAYER)
+    status = models.CharField(max_length=10, choices=Status.choices, default=Status.PENDING, db_index=True)
+
+    class Meta:
+        constraints = [models.UniqueConstraint(fields=['college', 'user'], name='unique_college_membership')]
+
+
+class CollegeChallenge(TimestampedPublicModel):
+    class Status(models.TextChoices):
+        PENDING = 'pending', 'Pending'
+        ACCEPTED = 'accepted', 'Accepted'
+        DECLINED = 'declined', 'Declined'
+        CANCELLED = 'cancelled', 'Cancelled'
+
+    challenger = models.ForeignKey(College, on_delete=models.PROTECT, related_name='challenges_sent')
+    challenged = models.ForeignKey(College, on_delete=models.PROTECT, related_name='challenges_received')
+    sport = models.ForeignKey(Sport, on_delete=models.PROTECT, related_name='college_challenges')
+    message = models.CharField(max_length=500, blank=True)
+    status = models.CharField(max_length=12, choices=Status.choices, default=Status.PENDING, db_index=True)
+    tournament = models.OneToOneField('Tournament', null=True, blank=True, on_delete=models.SET_NULL, related_name='college_challenge')
+    created_by = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.PROTECT, related_name='created_college_challenges')
+
+    class Meta:
+        constraints = [models.UniqueConstraint(fields=['challenger', 'challenged', 'sport'], condition=models.Q(status='pending'), name='unique_pending_college_challenge')]
+
+
+class CollegeResultDispute(TimestampedPublicModel):
+    class Status(models.TextChoices):
+        OPEN = 'open', 'Open'
+        RESOLVED = 'resolved', 'Resolved'
+        DISMISSED = 'dismissed', 'Dismissed'
+
+    match = models.ForeignKey('TournamentMatch', on_delete=models.CASCADE, related_name='college_disputes')
+    raised_by = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.PROTECT, related_name='college_result_disputes')
+    reason = models.TextField(max_length=2000)
+    status = models.CharField(max_length=12, choices=Status.choices, default=Status.OPEN, db_index=True)
+    resolution = models.TextField(blank=True, max_length=2000)
+    resolved_by = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.SET_NULL, related_name='resolved_college_disputes')
+    resolved_at = models.DateTimeField(null=True, blank=True)
+
+
 # ---------------------------------------------------------------------------
 # EVENTS & TOURNAMENTS
 # ---------------------------------------------------------------------------
@@ -755,10 +934,23 @@ class EventParticipant(TimestampedPublicModel):
         indexes=[models.Index(fields=['event','status','joined_at'],name='event_participant_waitlist_idx'),models.Index(fields=['user','status'],name='event_participant_user_idx')]
 
 
+class EventReminder(TimestampedPublicModel):
+    event = models.ForeignKey(Event, on_delete=models.CASCADE, related_name='reminders')
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='event_reminders')
+    remind_at = models.DateTimeField(db_index=True)
+    sent_at = models.DateTimeField(null=True, blank=True)
+    cancelled_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        constraints = [models.UniqueConstraint(fields=['event', 'user'], name='unique_event_reminder')]
+        indexes = [models.Index(fields=['sent_at', 'cancelled_at', 'remind_at'], name='event_reminder_due_idx')]
+
+
 class Tournament(TimestampedPublicModel):
     class Format(models.TextChoices): SINGLE_ELIMINATION='single_elimination','Single elimination'; DOUBLE_ELIMINATION='double_elimination','Double elimination'; ROUND_ROBIN='round_robin','Round robin'; LEAGUE='league','League'
     class Status(models.TextChoices): DRAFT='draft','Draft'; OPEN='open','Open'; FULL='full','Full'; STARTED='started','Started'; COMPLETED='completed','Completed'; CANCELLED='cancelled','Cancelled'
     tournament_reference=models.CharField(max_length=20,unique=True,db_index=True); name=models.CharField(max_length=200)
+    is_inter_college = models.BooleanField(default=False, db_index=True)
     organizer=models.ForeignKey(settings.AUTH_USER_MODEL,on_delete=models.PROTECT,related_name='organized_tournaments'); sport=models.ForeignKey(Sport,on_delete=models.PROTECT,related_name='tournaments')
     community=models.ForeignKey(Community,null=True,blank=True,on_delete=models.SET_NULL,related_name='tournaments'); venue=models.ForeignKey(Venue,on_delete=models.PROTECT,related_name='tournaments'); event=models.OneToOneField(Event,null=True,blank=True,on_delete=models.SET_NULL,related_name='tournament')
     start_date=models.DateField(); end_date=models.DateField(); registration_deadline=models.DateTimeField(); maximum_teams=models.PositiveIntegerField(); format=models.CharField(max_length=24,choices=Format.choices,default=Format.SINGLE_ELIMINATION); skill_level=models.CharField(max_length=16,choices=UserSport.SkillLevel.choices,blank=True); status=models.CharField(max_length=12,choices=Status.choices,default=Status.OPEN,db_index=True)
@@ -769,7 +961,7 @@ class Tournament(TimestampedPublicModel):
 
 class TournamentTeam(TimestampedPublicModel):
     class Status(models.TextChoices): ACTIVE='active','Active'; ELIMINATED='eliminated','Eliminated'; WITHDRAWN='withdrawn','Withdrawn'; CHAMPION='champion','Champion'
-    tournament=models.ForeignKey(Tournament,on_delete=models.CASCADE,related_name='teams'); name=models.CharField(max_length=120); captain=models.ForeignKey(settings.AUTH_USER_MODEL,on_delete=models.PROTECT,related_name='captained_tournament_teams'); created_by=models.ForeignKey(settings.AUTH_USER_MODEL,on_delete=models.PROTECT,related_name='created_tournament_teams'); seed=models.PositiveIntegerField(null=True,blank=True); status=models.CharField(max_length=12,choices=Status.choices,default=Status.ACTIVE)
+    tournament=models.ForeignKey(Tournament,on_delete=models.CASCADE,related_name='teams'); college=models.ForeignKey('College',null=True,blank=True,on_delete=models.PROTECT,related_name='tournament_teams'); name=models.CharField(max_length=120); captain=models.ForeignKey(settings.AUTH_USER_MODEL,on_delete=models.PROTECT,related_name='captained_tournament_teams'); created_by=models.ForeignKey(settings.AUTH_USER_MODEL,on_delete=models.PROTECT,related_name='created_tournament_teams'); seed=models.PositiveIntegerField(null=True,blank=True); status=models.CharField(max_length=12,choices=Status.choices,default=Status.ACTIVE)
     class Meta: constraints=[models.UniqueConstraint(fields=['tournament','name'],name='unique_tournament_team_name')]
 
 
@@ -888,6 +1080,7 @@ class Notification(TimestampedPublicModel):
         ('moderation_warning', 'Moderation Warning'),
         ('moderation_outcome', 'Moderation Outcome'),
         ('report_resolved', 'Report Resolved'),
+        ('referral', 'Referral'),
     ]
 
     user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='notifications')
@@ -955,6 +1148,42 @@ class PlayerRating(TimestampedPublicModel):
         indexes=[models.Index(fields=['player','created_at'],name='player_rating_created_idx')]
 
 
+class MatchReflection(TimestampedPublicModel):
+    """Private post-game self-reflection; intentionally separate from ratings."""
+    game = models.ForeignKey(Game, on_delete=models.CASCADE, related_name='reflections')
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='match_reflections')
+    enjoyment = models.PositiveSmallIntegerField()
+    teamwork = models.PositiveSmallIntegerField()
+    improvement = models.PositiveSmallIntegerField()
+    note = models.CharField(max_length=280, blank=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(fields=['game', 'user'], name='unique_game_user_reflection'),
+            models.CheckConstraint(check=models.Q(enjoyment__gte=1, enjoyment__lte=5), name='reflection_enjoyment_valid'),
+            models.CheckConstraint(check=models.Q(teamwork__gte=1, teamwork__lte=5), name='reflection_teamwork_valid'),
+            models.CheckConstraint(check=models.Q(improvement__gte=1, improvement__lte=5), name='reflection_improvement_valid'),
+        ]
+        indexes = [models.Index(fields=['user', '-created_at'], name='reflection_user_created_idx')]
+
+
+class ReferralAttribution(TimestampedPublicModel):
+    """Private attribution for a qualifying new player registration."""
+    class Status(models.TextChoices):
+        SUCCESSFUL = 'successful', 'Successful'
+
+    referrer = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.PROTECT, related_name='referrals_made')
+    referred_user = models.OneToOneField(settings.AUTH_USER_MODEL, on_delete=models.PROTECT, related_name='referral_attribution')
+    referral_code = models.CharField(max_length=20)
+    status = models.CharField(max_length=16, choices=Status.choices, default=Status.SUCCESSFUL, db_index=True)
+
+    class Meta:
+        constraints = [
+            models.CheckConstraint(check=~models.Q(referrer=models.F('referred_user')), name='referral_no_self_attribution'),
+        ]
+        indexes = [models.Index(fields=['referrer', 'status', '-created_at'], name='referrer_status_created_idx')]
+
+
 class PlayerSportStatistics(TimestampedPublicModel):
     user=models.ForeignKey(settings.AUTH_USER_MODEL,on_delete=models.CASCADE,related_name='sport_statistics')
     sport=models.ForeignKey(Sport,on_delete=models.CASCADE,related_name='player_statistics')
@@ -973,10 +1202,169 @@ class UserAchievement(TimestampedPublicModel):
     progress=models.PositiveIntegerField(default=0); unlocked=models.BooleanField(default=False); unlocked_at=models.DateTimeField(null=True,blank=True)
     class Meta: constraints=[models.UniqueConstraint(fields=['user','achievement'],name='unique_user_achievement')]
 
+
+class SportChallenge(TimestampedPublicModel):
+    """Time-bounded arena rules; all score values are calculated from server records."""
+    class Kind(models.TextChoices):
+        INDIVIDUAL = 'individual', 'Individual'
+        TEAM = 'team', 'Team'
+
+    class Metric(models.TextChoices):
+        MATCHES_COMPLETED = 'matches_completed', 'Completed matches'
+        PRACTICE_DAYS = 'practice_days', 'Practice days'
+        CHECKLIST_COMPLETIONS = 'checklist_completions', 'Checklist completions'
+        TOURNAMENT_WINS = 'tournament_wins', 'Tournament match wins'
+        CALCULATED_GOALS_COMPLETED = 'calculated_goals_completed', 'Verified goals completed'
+
+    name = models.CharField(max_length=120)
+    description = models.TextField(blank=True)
+    sport = models.ForeignKey(Sport, null=True, blank=True, on_delete=models.PROTECT, related_name='challenges')
+    kind = models.CharField(max_length=12, choices=Kind.choices, default=Kind.INDIVIDUAL, db_index=True)
+    metric = models.CharField(max_length=32, choices=Metric.choices, db_index=True)
+    target = models.PositiveIntegerField()
+    eligibility_min_skill = models.CharField(max_length=16, choices=UserSport.SkillLevel.choices, blank=True)
+    starts_on = models.DateField(db_index=True)
+    ends_on = models.DateField(db_index=True)
+    reward_points = models.PositiveIntegerField(default=0)
+    reward_achievement = models.ForeignKey(Achievement, null=True, blank=True, on_delete=models.SET_NULL, related_name='challenges')
+    created_by = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.PROTECT, related_name='created_challenges')
+    is_active = models.BooleanField(default=True, db_index=True)
+
+    class Meta:
+        ordering = ['starts_on', 'name']
+        constraints = [
+            models.CheckConstraint(check=models.Q(target__gt=0), name='sport_challenge_target_positive'),
+            models.CheckConstraint(check=models.Q(ends_on__gte=models.F('starts_on')), name='sport_challenge_date_range_valid'),
+            models.CheckConstraint(check=models.Q(reward_points__lte=1000), name='sport_challenge_points_capped'),
+        ]
+
+
+class ChallengeEntry(TimestampedPublicModel):
+    """One individual or club team entry. Progress and points are always derived."""
+    challenge = models.ForeignKey(SportChallenge, on_delete=models.CASCADE, related_name='entries')
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.CASCADE, related_name='challenge_entries')
+    team = models.ForeignKey('my_app.Community', null=True, blank=True, on_delete=models.CASCADE, related_name='challenge_entries')
+    joined_at = models.DateTimeField(auto_now_add=True)
+    left_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        constraints = [
+            models.CheckConstraint(
+                check=(models.Q(user__isnull=False, team__isnull=True) | models.Q(user__isnull=True, team__isnull=False)),
+                name='challenge_entry_has_user_or_team',
+            ),
+            models.UniqueConstraint(fields=['challenge', 'user'], condition=models.Q(user__isnull=False), name='unique_challenge_user_entry'),
+            models.UniqueConstraint(fields=['challenge', 'team'], condition=models.Q(team__isnull=False), name='unique_challenge_team_entry'),
+        ]
+        indexes = [models.Index(fields=['challenge', 'left_at'], name='challenge_entry_active_idx')]
+
+
+class ChallengeEntryMember(TimestampedPublicModel):
+    """Eligible club roster frozen when the team first enters a challenge."""
+    entry = models.ForeignKey(ChallengeEntry, on_delete=models.CASCADE, related_name='roster')
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='challenge_team_entries')
+    joined_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        constraints = [models.UniqueConstraint(fields=['entry', 'user'], name='unique_challenge_entry_member')]
+
 class RecommendationProfile(TimestampedPublicModel):
     user=models.OneToOneField(settings.AUTH_USER_MODEL,on_delete=models.CASCADE,related_name='recommendation_profile')
     preferences=models.JSONField(default=dict,blank=True)
     last_evaluated_at=models.DateTimeField(null=True,blank=True)
+
+
+class PracticeActivity(TimestampedPublicModel):
+    """A user's reusable checklist item; completion rows retain their snapshots."""
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='practice_activities')
+    name = models.CharField(max_length=100)
+    description = models.CharField(max_length=240, blank=True)
+    sort_order = models.PositiveIntegerField(default=0)
+    is_active = models.BooleanField(default=True, db_index=True)
+    is_default = models.BooleanField(default=False)
+
+    class Meta:
+        ordering = ['sort_order', 'id']
+        constraints = [models.UniqueConstraint(fields=['user', 'name'], name='unique_practice_activity_name')]
+
+
+class PracticeCompletion(TimestampedPublicModel):
+    """Immutable daily completion event, including an activity-name snapshot."""
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='practice_completions')
+    activity = models.ForeignKey(PracticeActivity, null=True, on_delete=models.SET_NULL, related_name='completions')
+    activity_name = models.CharField(max_length=100)
+    practice_date = models.DateField(db_index=True)
+    completed_at = models.DateTimeField(default=timezone.now)
+
+    class Meta:
+        constraints = [models.UniqueConstraint(fields=['user', 'practice_date', 'activity'], name='unique_daily_practice_completion')]
+        indexes = [models.Index(fields=['user', 'practice_date'], name='practice_user_date_idx')]
+
+
+class SportsGoal(TimestampedPublicModel):
+    class Source(models.TextChoices):
+        PRACTICE_DAYS = 'practice_days', 'Practice days'
+        MATCHES_COMPLETED = 'matches_completed', 'Matches completed'
+        CHECKLIST_COMPLETIONS = 'checklist_completions', 'Checklist completions'
+        MANUAL = 'manual', 'Manual progress'
+
+    class Status(models.TextChoices):
+        ACTIVE = 'active', 'Active'
+        PAUSED = 'paused', 'Paused'
+        COMPLETED = 'completed', 'Completed'
+        ARCHIVED = 'archived', 'Archived'
+
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='sports_goals')
+    title = models.CharField(max_length=120)
+    target = models.PositiveIntegerField()
+    unit = models.CharField(max_length=32)
+    start_date = models.DateField(db_index=True)
+    end_date = models.DateField(db_index=True)
+    progress_source = models.CharField(max_length=24, choices=Source.choices)
+    manual_progress = models.PositiveIntegerField(default=0)
+    status = models.CharField(max_length=16, choices=Status.choices, default=Status.ACTIVE, db_index=True)
+    reminder_enabled = models.BooleanField(default=False)
+    reminder_time = models.TimeField(null=True, blank=True)
+    reminder_timezone = models.CharField(max_length=64, default='Asia/Kolkata')
+    reminder_last_sent_date = models.DateField(null=True, blank=True)
+
+    class Meta:
+        constraints = [
+            models.CheckConstraint(check=models.Q(target__gt=0), name='sports_goal_target_positive'),
+            models.CheckConstraint(check=models.Q(end_date__gte=models.F('start_date')), name='sports_goal_dates_valid'),
+            models.CheckConstraint(check=models.Q(manual_progress__lte=models.F('target')), name='sports_goal_manual_progress_lte_target'),
+        ]
+        indexes = [models.Index(fields=['user', 'status', 'end_date'], name='sports_goal_user_state_idx')]
+
+
+class HealthActivityRecord(TimestampedPublicModel):
+    class Metric(models.TextChoices):
+        STEPS = 'steps', 'Steps'
+        DURATION = 'activity_duration', 'Activity duration'
+        CALORIES = 'active_calories', 'Active calories'
+
+    class Source(models.TextChoices):
+        MANUAL = 'manual', 'Manual entry'
+        APPLE_HEALTH = 'apple_health', 'Apple Health'
+        HEALTH_CONNECT = 'health_connect', 'Health Connect'
+
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='health_activity_records')
+    metric = models.CharField(max_length=24, choices=Metric.choices, db_index=True)
+    value = models.DecimalField(max_digits=12, decimal_places=2)
+    unit = models.CharField(max_length=16)
+    recorded_date = models.DateField(db_index=True)
+    recorded_timezone = models.CharField(max_length=64, default='Asia/Kolkata')
+    source = models.CharField(max_length=20, choices=Source.choices, default=Source.MANUAL, db_index=True)
+    synced_at = models.DateTimeField(default=timezone.now)
+    external_record_id = models.CharField(max_length=255, blank=True)
+    is_estimated = models.BooleanField(default=False)
+
+    class Meta:
+        constraints = [
+            models.CheckConstraint(check=models.Q(value__gt=0), name='health_activity_value_positive'),
+            models.UniqueConstraint(fields=['user', 'source', 'external_record_id'], condition=~models.Q(external_record_id=''), name='unique_health_external_record'),
+        ]
+        indexes = [models.Index(fields=['user', 'recorded_date', 'metric'], name='health_user_date_metric_idx')]
 
 
 # ---------------------------------------------------------------------------

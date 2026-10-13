@@ -27,14 +27,14 @@ class CommunityMembershipService:
     @staticmethod
     def moderator(*, community, user):
         member = CommunityMembershipService.active_member(community=community, user=user)
-        if member.role not in (CommunityMember.Role.OWNER, CommunityMember.Role.ADMIN, CommunityMember.Role.MODERATOR):
+        if member.role not in (CommunityMember.Role.OWNER, CommunityMember.Role.CAPTAIN, CommunityMember.Role.ADMIN, CommunityMember.Role.MODERATOR):
             raise PermissionDenied('Community moderator permission is required.')
         return member
 
     @staticmethod
     def admin(*, community, user):
         member = CommunityMembershipService.active_member(community=community, user=user)
-        if member.role not in (CommunityMember.Role.OWNER, CommunityMember.Role.ADMIN):
+        if member.role not in (CommunityMember.Role.OWNER, CommunityMember.Role.CAPTAIN, CommunityMember.Role.ADMIN):
             raise PermissionDenied('Community administrator permission is required.')
         return member
 
@@ -49,7 +49,7 @@ class CommunityMembershipService:
 class CommunityService:
     @classmethod
     @transaction.atomic
-    def create(cls, *, owner, name, description='', sport=None, city='', latitude=None, longitude=None, visibility='public'):
+    def create(cls, *, owner, name, description='', sport=None, city='', latitude=None, longitude=None, visibility='public', is_club=False, membership_open=True, avatar=None, cover_image=None):
         base = slugify(name)[:160] or 'community'
         slug = base
         suffix = 2
@@ -60,6 +60,7 @@ class CommunityService:
         community = Community.objects.create(
             name=name.strip(), slug=slug, description=description.strip(), owner=owner, sport=sport,
             city=city.strip(), latitude=latitude, longitude=longitude, visibility=visibility,
+            is_club=is_club, membership_open=membership_open, avatar=avatar, cover_image=cover_image,
         )
         CommunityMember.objects.create(community=community, user=owner, role=CommunityMember.Role.OWNER, status=CommunityMember.Status.ACTIVE, joined_at=timezone.now())
         CommunityMembershipService.recalculate_count(community)
@@ -70,11 +71,14 @@ class CommunityService:
     def join(cls, *, community, user):
         if not community.is_active:
             raise CommunityError('This community is inactive.')
+        community = Community.objects.select_for_update().get(pk=community.pk)
         member = CommunityMember.objects.select_for_update().filter(community=community, user=user).first()
         if member and member.status == CommunityMember.Status.BANNED:
             raise PermissionDenied('You are banned from this community.')
         if member and member.status in (CommunityMember.Status.ACTIVE, CommunityMember.Status.PENDING):
             return member, False
+        if not community.membership_open and community.visibility == Community.Visibility.PUBLIC:
+            raise PermissionDenied('This club is not accepting new members.')
         target_status = CommunityMember.Status.ACTIVE if community.visibility == Community.Visibility.PUBLIC else CommunityMember.Status.PENDING
         if member:
             member.status, member.role, member.joined_at = target_status, CommunityMember.Role.MEMBER, (timezone.now() if target_status == CommunityMember.Status.ACTIVE else None)
@@ -90,6 +94,7 @@ class CommunityService:
     @classmethod
     @transaction.atomic
     def leave(cls, *, community, user):
+        community = Community.objects.select_for_update().get(pk=community.pk)
         member = CommunityMembershipService.active_member(community=community, user=user)
         if member.role == CommunityMember.Role.OWNER:
             raise CommunityError('The owner cannot leave without transferring ownership.')
@@ -101,6 +106,7 @@ class CommunityService:
     @classmethod
     @transaction.atomic
     def decide_request(cls, *, community, actor, user_id, approve):
+        community = Community.objects.select_for_update().get(pk=community.pk)
         CommunityMembershipService.admin(community=community, user=actor)
         try:
             member = CommunityMember.objects.select_for_update().select_related('user').get(community=community, user_id=user_id, status=CommunityMember.Status.PENDING)
@@ -111,8 +117,73 @@ class CommunityService:
         member.save(update_fields=['status', 'joined_at', 'updated_at'])
         if approve:
             CommunityMembershipService.recalculate_count(community)
-        create_notification(user=member.user, type='message', title='Community request updated', body=(f'You joined {community.name}.' if approve else f'Your request to join {community.name} was declined.'), data={'community_id': community.public_id.hex})
+        action = 'accepted' if approve else 'rejected'
+        create_notification(user=member.user, type='message', title=f'Club request {action}', body=(f'Your request to join {community.name} was accepted.' if approve else f'Your request to join {community.name} was rejected.'), data={'community_id': community.public_id.hex})
         return member
+
+    @classmethod
+    @transaction.atomic
+    def invite(cls, *, community, actor, user_id):
+        CommunityMembershipService.admin(community=community, user=actor)
+        from my_app.models import User
+        user = User.objects.filter(pk=user_id, is_active=True, account_status=User.AccountStatus.ACTIVE).first()
+        if not user:
+            raise NotFound('Player not found.')
+        membership = CommunityMember.objects.select_for_update().filter(community=community, user=user).first()
+        if membership and membership.status in (CommunityMember.Status.ACTIVE, CommunityMember.Status.PENDING):
+            raise CommunityError('This player is already a member or has a pending request.')
+        if membership and membership.status == CommunityMember.Status.BANNED:
+            raise PermissionDenied('Banned players cannot be invited.')
+        if membership:
+            membership.status = CommunityMember.Status.ACTIVE
+            membership.role = CommunityMember.Role.MEMBER
+            membership.joined_at = timezone.now()
+            membership.save(update_fields=['status', 'role', 'joined_at', 'updated_at'])
+        else:
+            membership = CommunityMember.objects.create(community=community, user=user, status=CommunityMember.Status.ACTIVE, joined_at=timezone.now())
+        CommunityMembershipService.recalculate_count(community)
+        create_notification(user=user, type='message', title=f'Invitation to {community.name}', body=f'{actor.username} invited you to join {community.name}.', data={'community_id': community.public_id.hex})
+        return membership
+
+    @classmethod
+    @transaction.atomic
+    def set_role(cls, *, community, actor, user_id, role):
+        community = Community.objects.select_for_update().get(pk=community.pk)
+        actor_member = CommunityMembershipService.admin(community=community, user=actor)
+        target = CommunityMember.objects.select_for_update().get(community=community, user_id=user_id, status=CommunityMember.Status.ACTIVE)
+        if target.user_id == actor.id and target.role == CommunityMember.Role.OWNER:
+            raise CommunityError('Transfer ownership before changing your owner role.')
+        if actor_member.role != CommunityMember.Role.OWNER:
+            if role == CommunityMember.Role.OWNER or target.role in (CommunityMember.Role.OWNER, CommunityMember.Role.CAPTAIN):
+                raise PermissionDenied('Only the owner can assign or manage the owner and captain roles.')
+        if target.role == CommunityMember.Role.OWNER:
+            raise CommunityError('Transfer ownership using the ownership transfer action.')
+        if role == CommunityMember.Role.OWNER:
+            raise CommunityError('Use the ownership transfer action to assign the owner role.')
+        target.role = role
+        target.save(update_fields=['role', 'updated_at'])
+        return target
+
+    @classmethod
+    @transaction.atomic
+    def transfer_ownership(cls, *, community, actor, user_id):
+        community = Community.objects.select_for_update().get(pk=community.pk)
+        owner_membership = CommunityMembershipService.admin(community=community, user=actor)
+        if owner_membership.role != CommunityMember.Role.OWNER or community.owner_id != actor.id:
+            raise PermissionDenied('Only the current owner can transfer ownership.')
+        target = CommunityMember.objects.select_for_update().filter(community=community, user_id=user_id, status=CommunityMember.Status.ACTIVE).first()
+        if not target:
+            raise NotFound('The new owner must be an active club member.')
+        if target.user_id == actor.id:
+            raise CommunityError('You are already the owner.')
+        old_owner = CommunityMember.objects.select_for_update().get(community=community, user=actor, status=CommunityMember.Status.ACTIVE)
+        old_owner.role = CommunityMember.Role.CAPTAIN
+        old_owner.save(update_fields=['role', 'updated_at'])
+        target.role = CommunityMember.Role.OWNER
+        target.save(update_fields=['role', 'updated_at'])
+        community.owner = target.user
+        community.save(update_fields=['owner', 'updated_at'])
+        return target
 
 
 class CommunityPostService:
@@ -129,7 +200,7 @@ class CommunityPostService:
     @transaction.atomic
     def create(cls, *, community, author, content, post_type='text', game_id=None):
         member = CommunityMembershipService.active_member(community=community, user=author)
-        if post_type == CommunityPost.Type.ANNOUNCEMENT and member.role not in (CommunityMember.Role.OWNER, CommunityMember.Role.ADMIN, CommunityMember.Role.MODERATOR):
+        if post_type == CommunityPost.Type.ANNOUNCEMENT and member.role not in (CommunityMember.Role.OWNER, CommunityMember.Role.CAPTAIN, CommunityMember.Role.ADMIN, CommunityMember.Role.MODERATOR):
             raise PermissionDenied('Only moderators can create announcements.')
         game = None
         if game_id:
@@ -147,7 +218,7 @@ class CommunityPostService:
     @transaction.atomic
     def edit(cls, *, post, actor, content):
         member = CommunityMembershipService.active_member(community=post.community, user=actor)
-        if post.author_id != actor.id and member.role not in (CommunityMember.Role.OWNER, CommunityMember.Role.ADMIN, CommunityMember.Role.MODERATOR):
+        if post.author_id != actor.id and member.role not in (CommunityMember.Role.OWNER, CommunityMember.Role.CAPTAIN, CommunityMember.Role.ADMIN, CommunityMember.Role.MODERATOR):
             raise PermissionDenied('You cannot edit this post.')
         if post.deleted_at:
             raise CommunityError('Deleted posts cannot be edited.')
@@ -177,7 +248,7 @@ class CommunityCommentService:
     @classmethod
     def change(cls, *, comment, actor, content=None, delete=False):
         member = CommunityMembershipService.active_member(community=comment.post.community, user=actor)
-        if comment.author_id != actor.id and member.role not in (CommunityMember.Role.OWNER, CommunityMember.Role.ADMIN, CommunityMember.Role.MODERATOR):
+        if comment.author_id != actor.id and member.role not in (CommunityMember.Role.OWNER, CommunityMember.Role.CAPTAIN, CommunityMember.Role.ADMIN, CommunityMember.Role.MODERATOR):
             raise PermissionDenied('You cannot moderate this comment.')
         if delete:
             comment.deleted_at, comment.content = timezone.now(), ''
@@ -194,10 +265,15 @@ class CommunityModerationService:
     @classmethod
     @transaction.atomic
     def member_action(cls, *, community, actor, user_id, ban=False):
+        community = Community.objects.select_for_update().get(pk=community.pk)
         actor_member = CommunityMembershipService.moderator(community=community, user=actor)
         member = CommunityMember.objects.select_for_update().select_related('user').get(community=community, user_id=user_id)
-        if member.role == CommunityMember.Role.OWNER and actor_member.role != CommunityMember.Role.OWNER:
+        if member.user_id == community.owner_id:
+            raise CommunityError('The last owner cannot be removed. Transfer ownership first.')
+        if member.role == CommunityMember.Role.OWNER or member.user_id == community.owner_id:
             raise PermissionDenied('Only the owner can manage the owner membership.')
+        if member.role == CommunityMember.Role.CAPTAIN and actor_member.role != CommunityMember.Role.OWNER:
+            raise PermissionDenied('Only the owner can manage captains.')
         if member.role in (CommunityMember.Role.ADMIN, CommunityMember.Role.MODERATOR) and actor_member.role == CommunityMember.Role.MODERATOR:
             raise PermissionDenied('Moderators cannot manage administrators or moderators.')
         member.status = CommunityMember.Status.BANNED if ban else CommunityMember.Status.LEFT

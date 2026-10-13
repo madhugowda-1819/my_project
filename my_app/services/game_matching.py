@@ -6,11 +6,12 @@ the database; only a bounded compatible set is scored in Python.
 from dataclasses import dataclass
 from datetime import time
 
+from django.conf import settings
 from django.db.models import Count, F, Q
 from django.utils import timezone
 from rest_framework.exceptions import ValidationError
 
-from my_app.models import AvailabilitySlot, Game, GamePlayer, UserSport
+from my_app.models import AvailabilitySlot, Game, GamePlayer, UserBlock, UserSport
 from my_app.services.locations import nearby_queryset, validate_coordinates
 
 
@@ -129,6 +130,9 @@ class GameMatchingService:
         if not sport_by_id:
             return [], sport_by_id
 
+        blocked_ids = UserBlock.objects.filter(user=user).values('blocked_user_id')
+        blocked_by_ids = UserBlock.objects.filter(blocked_user=user).values('user_id')
+
         queryset = Game.objects.filter(
             visibility=Game.Visibility.PUBLIC,
             status__in=(Game.Status.OPEN, Game.Status.ALMOST_FULL),
@@ -137,7 +141,7 @@ class GameMatchingService:
             venue__active=True,
             court__active=True,
             sport_id__in=sport_by_id,
-        ).exclude(host=user).exclude(
+        ).exclude(host=user).exclude(host_id__in=blocked_ids).exclude(host_id__in=blocked_by_ids).exclude(
             game_players__user=user, game_players__status=GamePlayer.Status.CONFIRMED,
         ).select_related('sport', 'venue', 'court__sport', 'host').annotate(
             confirmed_player_count=Count(
@@ -244,3 +248,43 @@ class GameMatchingService:
                 -item['available_slots'],
             ),
         )[:limit]
+
+
+def mood_compatibility(requester_mood, candidate_mood):
+    """Return a conservative 0..100 affinity; missing mood is neutral."""
+    if not requester_mood or not candidate_mood:
+        return 0
+    if requester_mood == candidate_mood:
+        return 100
+    adjacent = {
+        'relaxed': {'social'},
+        'energetic': {'social'},
+        'learning': {'relaxed'},
+        'social': {'relaxed', 'energetic'},
+    }
+    return 50 if candidate_mood in adjacent.get(requester_mood, set()) or requester_mood in adjacent.get(candidate_mood, set()) else 0
+
+
+def apply_mood_ranking(results, *, requester_mood, mood_getter, base_key, reasons_key):
+    """Blend mood as a bounded ranking signal, without altering eligibility.
+
+    Formula: final = round(base * (100 - w) / 100 + affinity * w / 100),
+    with base and affinity in 0..100 and w configurable (default 10,
+    clamped to 0..20). All candidates have already passed eligibility checks.
+    """
+    weights = getattr(settings, 'MATCH_MOOD_RANKING_WEIGHTS', {})
+    try:
+        weight = max(0, min(20, int(weights.get('mood', 10))))
+    except (TypeError, ValueError):
+        weight = 10
+    for item in results:
+        affinity = mood_compatibility(requester_mood, mood_getter(item))
+        base = item[base_key]
+        item['base_score'] = base
+        item['mood_compatibility'] = affinity
+        item[base_key] = round(base * (100 - weight) / 100 + affinity * weight / 100)
+        if affinity:
+            item[reasons_key].append(
+                'You share the same play mood' if affinity == 100 else 'Your play moods are compatible'
+            )
+    return sorted(results, key=lambda item: (-item[base_key], item.get('distance_km') if item.get('distance_km') is not None else float('inf')))

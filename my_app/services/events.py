@@ -1,9 +1,10 @@
 """Transactional event registration and deterministic tournament operations."""
 import math, secrets
+from datetime import timedelta
 from django.db import transaction
 from django.utils import timezone
 from rest_framework.exceptions import APIException, NotFound, PermissionDenied, ValidationError
-from my_app.models import Event, EventParticipant, Tournament, TournamentTeam, TournamentTeamMember, TournamentMatch, UserSport
+from my_app.models import Event, EventParticipant, EventReminder, Tournament, TournamentTeam, TournamentTeamMember, TournamentMatch, UserSport
 from my_app.services.bookings import BookingService
 from my_app.utils import create_notification
 
@@ -34,6 +35,8 @@ class EventRegistrationService:
  def register(cls,*,event,user):
   event=Event.objects.select_for_update().get(pk=event.pk)
   if event.status not in (Event.Status.OPEN,Event.Status.FULL) or event.registration_deadline<=timezone.now(): raise EventError('Registration is closed.')
+  if event.visibility==Event.Visibility.PRIVATE and event.organizer_id!=user.id: raise PermissionDenied('This event is private.')
+  if event.visibility==Event.Visibility.COMMUNITY and (not event.community_id or not event.community.members.filter(user=user,status='active').exists()): raise PermissionDenied('Join the event community before registering.')
   existing=EventParticipant.objects.select_for_update().filter(event=event,user=user).first()
   if existing and existing.status in (EventParticipant.Status.REGISTERED,EventParticipant.Status.WAITLISTED,EventParticipant.Status.REMOVED): return existing,False
   if event.skill_level:
@@ -48,19 +51,119 @@ class EventRegistrationService:
  @classmethod
  @transaction.atomic
  def leave(cls,*,event,user,removed=False):
-  event=Event.objects.select_for_update().get(pk=event.pk); p=EventParticipant.objects.select_for_update().get(event=event,user=user)
+  event=Event.objects.select_for_update().get(pk=event.pk)
+  if event.starts_at<=timezone.now() or event.status in (Event.Status.CANCELLED,Event.Status.STARTED,Event.Status.COMPLETED): raise EventError('Event registration can no longer be cancelled.')
+  p=EventParticipant.objects.select_for_update().filter(event=event,user=user).first()
+  if not p or p.status not in (EventParticipant.Status.REGISTERED,EventParticipant.Status.WAITLISTED): raise NotFound('Active event registration not found.')
   p.status=EventParticipant.Status.REMOVED if removed else EventParticipant.Status.CANCELLED; p.left_at=timezone.now(); p.save(update_fields=['status','left_at','updated_at'])
+  if not removed: EventReminder.objects.filter(event=event,user=user,sent_at__isnull=True,cancelled_at__isnull=True).update(cancelled_at=timezone.now(),updated_at=timezone.now())
   if not removed:
    nxt=EventParticipant.objects.select_for_update().filter(event=event,status=EventParticipant.Status.WAITLISTED).order_by('joined_at','id').first()
    if nxt: nxt.status=EventParticipant.Status.REGISTERED; nxt.save(update_fields=['status','updated_at']); create_notification(user=nxt.user,type='message',title='Event waitlist promotion',body=f'You are registered for {event.title}.',data={'event_id':event.public_id.hex})
   EventCapacityService.refresh(event); return p
+
+
+class EventReminderService:
+ @classmethod
+ @transaction.atomic
+ def set_reminder(cls,*,event,user,minutes_before=60):
+  event=Event.objects.select_for_update().get(pk=event.pk)
+  if minutes_before not in (15,60,1440): raise ValidationError('Reminder must be 15 minutes, 1 hour, or 1 day before the event.')
+  if event.status not in (Event.Status.OPEN,Event.Status.FULL) or event.starts_at<=timezone.now(): raise EventError('Reminders are available only for upcoming events.')
+  if not EventParticipant.objects.filter(event=event,user=user,status=EventParticipant.Status.REGISTERED).exists(): raise PermissionDenied('Register for the event before setting a reminder.')
+  remind_at=event.starts_at-timedelta(minutes=minutes_before)
+  if remind_at<=timezone.now(): remind_at=timezone.now()
+  reminder,created=EventReminder.objects.get_or_create(event=event,user=user,defaults={'remind_at':remind_at})
+  if not created:
+   reminder.remind_at=remind_at; reminder.sent_at=None; reminder.cancelled_at=None
+   reminder.save(update_fields=['remind_at','sent_at','cancelled_at','updated_at'])
+  return reminder
+
+ @classmethod
+ @transaction.atomic
+ def cancel_reminder(cls,*,event,user):
+  reminder=EventReminder.objects.select_for_update().filter(event=event,user=user,cancelled_at__isnull=True,sent_at__isnull=True).first()
+  if reminder:
+   reminder.cancelled_at=timezone.now();reminder.save(update_fields=['cancelled_at','updated_at'])
+  return reminder
+
+ @classmethod
+ @transaction.atomic
+ def deliver_due(cls,*,now=None,limit=500):
+  now=now or timezone.now(); sent=0
+  reminders=list(EventReminder.objects.select_for_update(skip_locked=True).filter(sent_at__isnull=True,cancelled_at__isnull=True,remind_at__lte=now,event__status__in=[Event.Status.OPEN,Event.Status.FULL]).select_related('event','user').order_by('remind_at')[:limit])
+  for reminder in reminders:
+   if not EventParticipant.objects.filter(event=reminder.event,user=reminder.user,status=EventParticipant.Status.REGISTERED).exists():
+    reminder.cancelled_at=now;reminder.save(update_fields=['cancelled_at','updated_at']);continue
+   create_notification(user=reminder.user,type='reminder',title='Event reminder',body=f'{reminder.event.title} starts at {reminder.event.starts_at:%b %d, %Y %I:%M %p}.',data={'event_id':reminder.event.public_id.hex,'starts_at':reminder.event.starts_at.isoformat()},priority=2)
+   reminder.sent_at=now;reminder.save(update_fields=['sent_at','updated_at']);sent+=1
+  return sent
+
+
+class EventCancellationService:
+ @classmethod
+ @transaction.atomic
+ def cancel(cls,*,event,actor):
+  event=Event.objects.select_for_update().get(pk=event.pk)
+  if event.organizer_id!=actor.id and not actor.is_staff: raise PermissionDenied('Only the event organizer can cancel.')
+  if event.status in (Event.Status.STARTED,Event.Status.COMPLETED): raise EventError('Started or completed events cannot be cancelled.')
+  if event.status==Event.Status.CANCELLED:return event
+  event.status=Event.Status.CANCELLED;event.save(update_fields=['status','updated_at'])
+  participants=EventParticipant.objects.select_for_update().filter(event=event,status__in=[EventParticipant.Status.REGISTERED,EventParticipant.Status.WAITLISTED]).select_related('user')
+  for participant in participants:
+   create_notification(user=participant.user,type='message',title='Event cancelled',body=f'{event.title} has been cancelled by its organizer.',data={'event_id':event.public_id.hex})
+   participant.status=EventParticipant.Status.CANCELLED;participant.left_at=timezone.now();participant.save(update_fields=['status','left_at','updated_at'])
+  EventReminder.objects.filter(event=event,sent_at__isnull=True,cancelled_at__isnull=True).update(cancelled_at=timezone.now(),updated_at=timezone.now())
+  return event
 class TournamentService:
  @classmethod
  @transaction.atomic
  def create_team(cls,*,tournament,creator,name):
   if tournament.organizer_id!=creator.id and not creator.is_staff: raise PermissionDenied('Only organizer can create teams.')
-  team=TournamentTeam.objects.create(tournament=tournament,name=name.strip(),captain=creator,created_by=creator,seed=tournament.teams.count()+1)
+  tournament=Tournament.objects.select_for_update().get(pk=tournament.pk)
+  if tournament.status not in (Tournament.Status.OPEN,Tournament.Status.FULL) or tournament.registration_deadline<=timezone.now(): raise EventError('Tournament registration is closed.')
+  active_count=tournament.teams.filter(status=TournamentTeam.Status.ACTIVE).count()
+  if active_count>=tournament.maximum_teams: raise EventError('Tournament team capacity is full.')
+  team=TournamentTeam.objects.create(tournament=tournament,name=name.strip(),captain=creator,created_by=creator,seed=active_count+1)
   TournamentTeamMember.objects.create(team=team,user=creator,role=TournamentTeamMember.Role.CAPTAIN); return team
+
+class TournamentRegistrationService:
+ @classmethod
+ @transaction.atomic
+ def register(cls,*,tournament,user,team_name):
+  tournament=Tournament.objects.select_for_update().get(pk=tournament.pk)
+  if tournament.is_inter_college: raise PermissionDenied('Register college teams through the college competition flow.')
+  if tournament.status not in (Tournament.Status.OPEN,Tournament.Status.FULL) or tournament.registration_deadline<=timezone.now(): raise EventError('Tournament registration is closed.')
+  existing=TournamentTeamMember.objects.select_for_update().filter(team__tournament=tournament,user=user,status=TournamentTeamMember.Status.ACTIVE).first()
+  if existing: return existing.team,False
+  if tournament.teams.filter(status=TournamentTeam.Status.ACTIVE).count()>=tournament.maximum_teams: raise EventError('Tournament team capacity is full.')
+  if tournament.skill_level:
+   try: level=UserSport.objects.get(user=user,sport=tournament.sport).skill_level
+   except UserSport.DoesNotExist as exc: raise EventError('Add this sport before registering.') from exc
+   if level!=tournament.skill_level: raise EventError('Skill level is not eligible.')
+  name=team_name.strip()
+  if not name: name=f'{user.full_name or user.username} Team'[:120]
+  active_count=tournament.teams.filter(status=TournamentTeam.Status.ACTIVE).count()
+  team=TournamentTeam.objects.create(tournament=tournament,name=name,captain=user,created_by=user,seed=active_count+1)
+  TournamentTeamMember.objects.create(team=team,user=user,role=TournamentTeamMember.Role.CAPTAIN)
+  if tournament.teams.filter(status=TournamentTeam.Status.ACTIVE).count()>=tournament.maximum_teams:
+   tournament.status=Tournament.Status.FULL;tournament.save(update_fields=['status','updated_at'])
+  return team,True
+
+ @classmethod
+ @transaction.atomic
+ def leave(cls,*,tournament,user):
+  tournament=Tournament.objects.select_for_update().get(pk=tournament.pk)
+  if tournament.is_inter_college: raise PermissionDenied('College team membership must be managed by the college administrator.')
+  if tournament.status not in (Tournament.Status.OPEN,Tournament.Status.FULL) or tournament.registration_deadline<=timezone.now(): raise EventError('Tournament registration is closed.')
+  member=TournamentTeamMember.objects.select_for_update().filter(team__tournament=tournament,user=user,status=TournamentTeamMember.Status.ACTIVE).select_related('team').first()
+  if not member: raise NotFound('Tournament registration not found.')
+  team=member.team
+  member.status=TournamentTeamMember.Status.LEFT;member.save(update_fields=['status','updated_at'])
+  if team.captain_id==user.id and not team.members.filter(status=TournamentTeamMember.Status.ACTIVE).exists(): team.status=TournamentTeam.Status.WITHDRAWN;team.save(update_fields=['status','updated_at'])
+  if tournament.status==Tournament.Status.FULL:
+   tournament.status=Tournament.Status.OPEN;tournament.save(update_fields=['status','updated_at'])
+  return team
 class TournamentBracketService:
  @classmethod
  @transaction.atomic

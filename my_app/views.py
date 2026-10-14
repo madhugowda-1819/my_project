@@ -2167,7 +2167,13 @@ class TournamentListCreateView(generics.ListCreateAPIView):
  permission_classes=[IsActiveAccount];serializer_class=TournamentSerializer
  def get_queryset(self): return _calendar_filters(self.request,tournaments=True)
  def create(self,request,*args,**kwargs):
-  s=TournamentCreateSerializer(data=request.data);s.is_valid(raise_exception=True);d=s.validated_data;d['venue']=get_object_or_404(Venue,public_id=d.pop('venue_id'))
+  s=TournamentCreateSerializer(data=request.data);s.is_valid(raise_exception=True);d=s.validated_data
+  if d.get('nearby_ground_id'):
+   ground=get_object_or_404(SportsGround,pk=d.pop('nearby_ground_id'))
+   venue,_=Venue.objects.get_or_create(source_nearby_ground=ground,defaults={'name':ground.name,'address':'','city':'Nearby','latitude':ground.latitude,'longitude':ground.longitude,'opening_time':time(0,0),'closing_time':time(23,59),'active':True})
+   VenueSport.objects.get_or_create(venue=venue,sport=d['sport'])
+   d['venue']=venue
+  else: d['venue']=get_object_or_404(Venue,public_id=d.pop('venue_id'))
   t=Tournament.objects.create(tournament_reference=EventService.ref('TR'),organizer=request.user,**d);return Response({'success':True,'data':TournamentSerializer(t,context={'request':request}).data},status=201)
 class TournamentDetailView(generics.RetrieveUpdateDestroyAPIView):
  permission_classes=[IsActiveAccount];serializer_class=TournamentSerializer;lookup_field='public_id';queryset=Tournament.objects.select_related('sport','venue')

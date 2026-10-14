@@ -219,6 +219,13 @@ class Venue(TimestampedPublicModel):
         'Ground', null=True, blank=True, on_delete=models.SET_NULL,
         related_name='verified_venue',
     )
+    # Nearby map grounds can host a tournament even before they become a
+    # bookable venue with courts.  Keep the source link to avoid generating a
+    # new Venue every time the same ground is selected.
+    source_nearby_ground = models.OneToOneField(
+        'SportsGround', null=True, blank=True, on_delete=models.SET_NULL,
+        related_name='tournament_venue',
+    )
     owner = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.SET_NULL, related_name='owned_venues')
     name = models.CharField(max_length=200)
     description = models.TextField(blank=True)

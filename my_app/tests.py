@@ -8,7 +8,7 @@ from unittest.mock import patch
 from rest_framework.test import APITestCase
 from rest_framework.exceptions import ValidationError
 
-from .models import Ground, Match, MatchReplacementOpportunity, MatchReplacementInvitation, MatchReplacementHistory, PracticeActivity, PracticeCompletion, SportsGoal, HealthActivityRecord, NotificationPreference, PlayerProfile, Sport, AvailabilitySlot, UserSport, UserBlock, Venue, VenueSport, Court, VenueAmenity, CourtBooking, VenueReview, CourtBlockedPeriod, Game, GamePlayer, Conversation, ConversationMember, Message, Community, CommunityMember, CommunityPostLike, Event, EventParticipant, EventReminder, Tournament, Notification, UserDevice, RecommendationProfile, Report, ModerationAction, PlayerRating, MatchReflection, ReferralAttribution, College, CollegeMembership, CollegeChallenge, TournamentTeam, TournamentTeamMember, TournamentMatch, CollegeResultDispute, MatchTimePoll, MatchTimePollOption, MatchTimePollVote, Achievement, UserAchievement
+from .models import Ground, SportsGround, Match, MatchReplacementOpportunity, MatchReplacementInvitation, MatchReplacementHistory, PracticeActivity, PracticeCompletion, SportsGoal, HealthActivityRecord, NotificationPreference, PlayerProfile, Sport, AvailabilitySlot, UserSport, UserBlock, Venue, VenueSport, Court, VenueAmenity, CourtBooking, VenueReview, CourtBlockedPeriod, Game, GamePlayer, Conversation, ConversationMember, Message, Community, CommunityMember, CommunityPostLike, Event, EventParticipant, EventReminder, Tournament, Notification, UserDevice, RecommendationProfile, Report, ModerationAction, PlayerRating, MatchReflection, ReferralAttribution, College, CollegeMembership, CollegeChallenge, TournamentTeam, TournamentTeamMember, TournamentMatch, CollegeResultDispute, MatchTimePoll, MatchTimePollOption, MatchTimePollVote, Achievement, UserAchievement
 from .services.matches import accept_rescue_invitation
 from .services.locations import nearby_queryset
 from .services.ground_ingestion import GroundIngestionService
@@ -818,6 +818,8 @@ class NearbySearchApiTests(APITestCase):
         missing = self.client.get('/api/v1/venues/nearby/', {'latitude': 12.9})
         self.assertEqual(venues.status_code, 200)
         self.assertEqual(venues.data['results'][0]['name'], 'Near Venue')
+        self.assertEqual(venues.data['results'][0]['latitude'], 12.9721)
+        self.assertEqual(venues.data['results'][0]['longitude'], 77.5949)
         self.assertEqual(invalid.status_code, 400)
         self.assertEqual(missing.status_code, 400)
 
@@ -1945,6 +1947,24 @@ class EventTournamentTests(APITestCase):
         self.assertEqual(deleted.status_code, 204)
         self.assertEqual(Tournament.objects.get(public_id=tournament_id).status, Tournament.Status.CANCELLED)
 
+    def test_tournament_can_use_a_nearby_ground(self):
+        nearby = SportsGround.objects.create(
+            osm_id='nearby-tournament-ground', name='Community Cricket Ground',
+            ground_type='pitch', sport='cricket', latitude=12.9716,
+            longitude=77.5946,
+        )
+        start = timezone.localdate() + timedelta(days=7)
+        response = self.client.post('/api/v1/tournaments/', {
+            'name': 'Ground Cup', 'sport_id': self.sport.id,
+            'nearby_ground_id': nearby.id, 'start_date': start.isoformat(),
+            'end_date': (start + timedelta(days=1)).isoformat(),
+            'registration_deadline': (timezone.now() + timedelta(days=2)).isoformat(),
+            'maximum_teams': 4,
+        }, format='json')
+        self.assertEqual(response.status_code, 201, response.data)
+        tournament = Tournament.objects.get(public_id=response.data['data']['public_id'])
+        self.assertEqual(tournament.venue.source_nearby_ground, nearby)
+
     def test_tournament_registration_uses_team_records_and_enforces_deadline_capacity(self):
         start=timezone.localdate()+timedelta(days=5)
         tournament=Tournament.objects.create(tournament_reference='TR-REG',name='Open Tournament',organizer=self.organizer,sport=self.sport,venue=self.venue,start_date=start,end_date=start+timedelta(days=1),registration_deadline=timezone.now()+timedelta(days=3),maximum_teams=2)
@@ -2120,6 +2140,45 @@ class RecommendationEngineTests(APITestCase):
     def test_ranking_is_deterministic_and_bounded(self):
         self.assertEqual(RecommendationRankingService.venue_score(supports_sport=True, rating=5, distance_km=1), 100)
         self.assertEqual(RecommendationRankingService.venue_score(supports_sport=False, rating=0, distance_km=100), 0)
+
+    def test_dashboard_serializes_real_recommendation_results(self):
+        sport = Sport.objects.get(name='Badminton')
+        UserSport.objects.create(user=self.user, sport=sport, preferred=True)
+        venue = Venue.objects.create(
+            name='Recommendation Arena', address='1 Sports Road', city='Bengaluru',
+            latitude=12.9716, longitude=77.5946, rating=4.5,
+            opening_time='06:00', closing_time='22:00',
+        )
+        Court.objects.create(venue=venue, sport=sport, name='Court 1', price_per_hour=300)
+        community = Community.objects.create(
+            name='Badminton Players', slug='recommendation-badminton-players',
+            owner=self.user, sport=sport, city='Bengaluru',
+        )
+        now = timezone.now()
+        local_start = (now + timedelta(days=2)).replace(hour=10, minute=0, second=0, microsecond=0)
+        local_end = local_start + timedelta(hours=1)
+        Event.objects.create(
+            event_reference='REC-EVENT-1', title='Community Badminton', organizer=self.user,
+            sport=sport, venue=venue, event_date=local_start.date(), start_time=local_start.time(),
+            end_time=local_end.time(), starts_at=local_start, ends_at=local_end,
+            maximum_participants=12, minimum_participants=1, registration_deadline=now + timedelta(days=1),
+        )
+        Tournament.objects.create(
+            tournament_reference='REC-TOURNAMENT-1', name='Bengaluru Open', organizer=self.user,
+            sport=sport, venue=venue, start_date=local_start.date(), end_date=local_end.date(),
+            registration_deadline=now + timedelta(days=1), maximum_teams=8,
+        )
+
+        response = self.client.get('/api/v1/recommendations/')
+
+        self.assertEqual(response.status_code, 200, response.data)
+        data = response.data['data']
+        self.assertEqual([item['id'] for item in data['venues']], [str(venue.public_id)])
+        self.assertEqual([item['id'] for item in data['communities']], [str(community.public_id)])
+        self.assertEqual(len(data['events']), 1)
+        self.assertEqual(data['events'][0]['metadata']['venue'], venue.name)
+        self.assertEqual(len(data['tournaments']), 1)
+        self.assertEqual(data['tournaments'][0]['metadata']['venue'], venue.name)
 
 
 class ModerationApiTests(APITestCase):

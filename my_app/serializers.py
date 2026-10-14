@@ -134,6 +134,10 @@ class GroundSerializer(serializers.ModelSerializer):
             'name',
             'city',
             'address',
+            # The mobile client uses these coordinates to open the exact
+            # ground location in the user's maps application.
+            'latitude',
+            'longitude',
             'price_per_hour',
             'pitch_type',
             'size',
@@ -1306,8 +1310,10 @@ class EventReminderSerializer(serializers.ModelSerializer):
         fields=['public_id','remind_at','sent_at','cancelled_at']
         read_only_fields=fields
 class TournamentCreateSerializer(serializers.Serializer):
-    name=serializers.CharField(max_length=200); sport_id=serializers.PrimaryKeyRelatedField(source='sport',queryset=Sport.objects.filter(is_active=True)); venue_id=serializers.UUIDField(); start_date=serializers.DateField(); end_date=serializers.DateField(); registration_deadline=serializers.DateTimeField(); maximum_teams=serializers.IntegerField(min_value=2); format=serializers.ChoiceField(choices=Tournament.Format.choices,default=Tournament.Format.SINGLE_ELIMINATION); skill_level=serializers.ChoiceField(choices=UserSport.SkillLevel.choices,required=False,allow_blank=True,default='')
+    name=serializers.CharField(max_length=200); sport_id=serializers.PrimaryKeyRelatedField(source='sport',queryset=Sport.objects.filter(is_active=True)); venue_id=serializers.UUIDField(required=False); nearby_ground_id=serializers.IntegerField(min_value=1,required=False); start_date=serializers.DateField(); end_date=serializers.DateField(); registration_deadline=serializers.DateTimeField(); maximum_teams=serializers.IntegerField(min_value=2); format=serializers.ChoiceField(choices=Tournament.Format.choices,default=Tournament.Format.SINGLE_ELIMINATION); skill_level=serializers.ChoiceField(choices=UserSport.SkillLevel.choices,required=False,allow_blank=True,default='')
     def validate(self, attrs):
+        if ('venue_id' in attrs) == ('nearby_ground_id' in attrs):
+            raise serializers.ValidationError('Select one approved venue or one nearby ground.')
         raw=self.initial_data.get('registration_deadline')
         if not isinstance(raw,str) or not (raw.endswith('Z') or '+' in raw[10:] or '-' in raw[10:]):
             raise serializers.ValidationError({'registration_deadline':'Include a timezone offset, such as +05:30 or Z.'})

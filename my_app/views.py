@@ -31,7 +31,7 @@ from datetime import date, datetime, time, timedelta
 import requests
 
 from .models import (
-    Sport, AvailabilitySlot, Match, Message, Notification, Ground, SportsGround, PlayerProfile,
+    Sport, UserSport, AvailabilitySlot, Match, Message, Notification, Ground, SportsGround, PlayerProfile,
     Venue, VenueSport, Court, CourtBlockedPeriod, VenueReview, CourtBooking, Game, GamePlayer, Conversation, ConversationMember,
     Community, CommunityMember, CommunityPost, CommunityComment, CommunityPostLike,
     Event, EventParticipant, EventReminder, Tournament, TournamentTeam, TournamentTeamMember, TournamentMatch, NotificationPreference, UserDevice, PlayerRating, Achievement, UserAchievement, Report, ModerationAction, VenueOwnerApplication, RoleAuditLog,
@@ -472,11 +472,17 @@ class PlayerListView(generics.ListAPIView):
             is_available=True, profile__profile_visibility='public',
         ).exclude(pk=self.request.user.pk)
         sport = params.get('sport')
+        skill_level = params.get('skill_level', '').strip().lower()
         if sport:
             queryset = queryset.filter(
                 Q(user_sports__sport__slug__iexact=sport)
                 | Q(user_sports__sport__name__iexact=sport)
             )
+        if skill_level:
+            valid_skill_levels = {value for value, _ in UserSport.SkillLevel.choices}
+            if skill_level not in valid_skill_levels:
+                raise ValidationError({'skill_level': ['Select a valid skill level.']})
+            queryset = queryset.filter(user_sports__skill_level=skill_level)
         queryset = _with_public_player_rating_summary(queryset).prefetch_related(
             'user_sports__sport')
 
@@ -1461,9 +1467,17 @@ class GroundDiscoveryView(APIView):
 
 # ---------------- MATCHES ----------------
 class MatchListView(generics.ListAPIView):
-    queryset = Match.objects.select_related('sport', 'ground', 'organizer').prefetch_related('joined_players')
     serializer_class = MatchSerializer
     permission_classes = [IsActiveAccount]
+
+    def get_queryset(self):
+        queryset = Match.objects.select_related('sport', 'ground', 'organizer').prefetch_related('joined_players')
+        sport = self.request.query_params.get('sport', '').strip()
+        if sport:
+            queryset = queryset.filter(Q(sport__name__iexact=sport) | Q(sport__slug__iexact=sport))
+        if self.request.query_params.get('upcoming', '').lower() in ('1', 'true', 'yes'):
+            queryset = queryset.filter(status='upcoming', date_time__gt=timezone.now())
+        return queryset.order_by('date_time')
 
 
 class CreateMatchView(APIView):

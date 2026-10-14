@@ -177,20 +177,76 @@ class TournamentBracketService:
    for i,a in enumerate(teams):
     for b in teams[i+1:]: TournamentMatch.objects.create(tournament=tournament,round_number=i+1,match_number=no,team_a=a,team_b=b); no+=1
   else:
-   size=2**math.ceil(math.log2(len(teams))); pairs=[]
-   for i in range(0,size,2): pairs.append((teams[i] if i<len(teams) else None,teams[i+1] if i+1<len(teams) else None))
-   for no,(a,b) in enumerate(pairs,1): TournamentMatch.objects.create(tournament=tournament,round_number=1,match_number=no,team_a=a,team_b=b)
+   # Build every round up front.  This gives the organizer a complete
+   # quarter-final/semi-final/final schedule as soon as the bracket starts.
+   size=2**math.ceil(math.log2(len(teams)))
+   rounds=int(math.log2(size))
+   for round_number in range(1,rounds+1):
+    for match_number in range(1,(size//(2**round_number))+1):
+     TournamentMatch.objects.create(tournament=tournament,round_number=round_number,match_number=match_number)
+   for index,team in enumerate(teams):
+    match=TournamentMatch.objects.get(tournament=tournament,round_number=1,match_number=(index//2)+1)
+    if index%2==0: match.team_a=team
+    else: match.team_b=team
+    match.save(update_fields=['team_a','team_b','updated_at'])
+   cls.resolve_walkovers(tournament)
   tournament.status=Tournament.Status.STARTED; tournament.save(update_fields=['status','updated_at']); return tournament.matches.all()
+
+ @staticmethod
+ def next_match(match):
+  return TournamentMatch.objects.filter(
+   tournament=match.tournament,round_number=match.round_number+1,
+   match_number=(match.match_number+1)//2,
+  ).first()
+
+ @classmethod
+ def advance(cls,match,winner):
+  next_match=cls.next_match(match)
+  if next_match is None:
+   winner.status=TournamentTeam.Status.CHAMPION
+   winner.save(update_fields=['status','updated_at'])
+   match.tournament.status=Tournament.Status.COMPLETED
+   match.tournament.save(update_fields=['status','updated_at'])
+   return
+  if match.match_number%2: next_match.team_a=winner
+  else: next_match.team_b=winner
+  next_match.save(update_fields=['team_a','team_b','updated_at'])
+
+ @classmethod
+ def resolve_walkovers(cls,tournament):
+  """Advance byes only after both feeder matches have been decided."""
+  changed=True
+  while changed:
+   changed=False
+   for match in tournament.matches.filter(status=TournamentMatch.Status.SCHEDULED).order_by('round_number','match_number'):
+    feeders=TournamentMatch.objects.filter(tournament=tournament,round_number=match.round_number-1,match_number__in=[match.match_number*2-1,match.match_number*2]) if match.round_number>1 else TournamentMatch.objects.none()
+    if feeders.exists() and feeders.exclude(status__in=[TournamentMatch.Status.COMPLETED,TournamentMatch.Status.CANCELLED]).exists(): continue
+    if match.team_a_id and match.team_b_id: continue
+    if not match.team_a_id and not match.team_b_id:
+     match.status=TournamentMatch.Status.CANCELLED
+     match.save(update_fields=['status','updated_at'])
+     changed=True
+     continue
+    winner=match.team_a or match.team_b
+    match.winner=winner;match.status=TournamentMatch.Status.COMPLETED
+    match.save(update_fields=['winner','status','updated_at'])
+    cls.advance(match,winner)
+    changed=True
 class TournamentMatchService:
  @classmethod
  @transaction.atomic
  def result(cls,*,match,actor,score_a,score_b):
   if match.tournament.organizer_id!=actor.id and not actor.is_staff: raise PermissionDenied('Only organizer can submit results.')
+  if match.status!=TournamentMatch.Status.SCHEDULED or not match.team_a_id or not match.team_b_id: raise ValidationError('Both teams must be ready before recording a result.')
   try: score_a,score_b=int(score_a),int(score_b)
   except (TypeError,ValueError) as exc: raise ValidationError('Scores must be integers.') from exc
   if score_a<0 or score_b<0 or score_a==score_b: raise ValidationError('Scores must be non-negative and decisive.')
   match.score_a,match.score_b=score_a,score_b; match.winner=match.team_a if score_a>score_b else match.team_b; match.status=TournamentMatch.Status.COMPLETED; match.save(update_fields=['score_a','score_b','winner','status','updated_at'])
-  if match.tournament.format==Tournament.Format.SINGLE_ELIMINATION and match.round_number==1 and match.tournament.matches.filter(status=TournamentMatch.Status.SCHEDULED).count()==0: match.winner.status=TournamentTeam.Status.CHAMPION; match.winner.save(update_fields=['status','updated_at']); match.tournament.status=Tournament.Status.COMPLETED; match.tournament.save(update_fields=['status','updated_at'])
+  if match.tournament.format!=Tournament.Format.ROUND_ROBIN:
+   loser=match.team_b if match.winner_id==match.team_a_id else match.team_a
+   loser.status=TournamentTeam.Status.ELIMINATED;loser.save(update_fields=['status','updated_at'])
+   TournamentBracketService.advance(match,match.winner)
+   TournamentBracketService.resolve_walkovers(match.tournament)
   return match
 class TournamentStandingsService:
  @staticmethod

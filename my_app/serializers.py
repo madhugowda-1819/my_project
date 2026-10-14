@@ -229,7 +229,7 @@ class VenueSerializer(serializers.ModelSerializer):
     class Meta:
         model = Venue
         fields = [
-            'public_id', 'name', 'description', 'address', 'city', 'phone', 'email', 'rating',
+            'public_id', 'name', 'description', 'address', 'city', 'latitude', 'longitude', 'phone', 'email', 'rating',
             'opening_time', 'closing_time', 'active', 'sports', 'amenities', 'courts', 'images',
             'reviews', 'distance_km',
         ]
@@ -1379,7 +1379,8 @@ class TournamentSerializer(serializers.ModelSerializer):
 class TournamentTeamSerializer(serializers.ModelSerializer):
     class Meta: model=TournamentTeam; fields=['public_id','name','captain','seed','status']
 class TournamentMatchSerializer(serializers.ModelSerializer):
-    class Meta: model=TournamentMatch; fields=['public_id','round_number','match_number','team_a','team_b','score_a','score_b','winner','status']
+    team_a_name=serializers.CharField(source='team_a.name',read_only=True); team_b_name=serializers.CharField(source='team_b.name',read_only=True); winner_name=serializers.CharField(source='winner.name',read_only=True)
+    class Meta: model=TournamentMatch; fields=['public_id','round_number','match_number','team_a','team_a_name','team_b','team_b_name','score_a','score_b','winner','winner_name','status']
 
 
 class CollegeSubmitSerializer(serializers.Serializer):

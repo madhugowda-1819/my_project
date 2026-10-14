@@ -16,7 +16,7 @@ from .services.player_matching import PlayerMatchingService
 from .services.availability import VenueAvailabilityService
 from .services.bookings import BookingStatusService
 from .services.game_matching import GameMatchingService, apply_mood_ranking, mood_compatibility
-from .services.events import EventRegistrationService, EventReminderService, TournamentBracketService, TournamentService, TournamentStandingsService
+from .services.events import EventRegistrationService, EventReminderService, TournamentBracketService, TournamentMatchService, TournamentService, TournamentStandingsService
 from .services.colleges import CollegeService
 from .services.match_time_polls import MatchTimePollService
 from .services.practice import PracticeService
@@ -1992,6 +1992,39 @@ class EventTournamentTests(APITestCase):
         matches = TournamentBracketService.generate(tournament=tournament, actor=self.organizer)
         self.assertEqual(len(matches), 1)
         self.assertEqual({matches[0].team_a_id, matches[0].team_b_id}, {first.id, second.id})
+
+    def test_knockout_winners_advance_from_semifinals_to_final(self):
+        start = timezone.localdate() + timedelta(days=10)
+        tournament = Tournament.objects.create(
+            tournament_reference='TR-KNOCKOUT', name='Knockout Cup',
+            organizer=self.organizer, sport=self.sport, venue=self.venue,
+            start_date=start, end_date=start + timedelta(days=1),
+            registration_deadline=timezone.now() + timedelta(days=8),
+            maximum_teams=4,
+        )
+        teams = [
+            TournamentService.create_team(
+                tournament=tournament, creator=self.organizer, name=name)
+            for name in ['Alpha', 'Bravo', 'Comet', 'Delta']
+        ]
+        TournamentBracketService.generate(tournament=tournament, actor=self.organizer)
+        semifinals = list(tournament.matches.filter(round_number=1).order_by('match_number'))
+        self.assertEqual(len(semifinals), 2)
+        self.assertEqual(tournament.matches.filter(round_number=2).count(), 1)
+        TournamentMatchService.result(
+            match=semifinals[0], actor=self.organizer, score_a=2, score_b=1)
+        final = tournament.matches.get(round_number=2, match_number=1)
+        self.assertEqual(final.team_a, teams[0])
+        TournamentMatchService.result(
+            match=semifinals[1], actor=self.organizer, score_a=3, score_b=1)
+        final.refresh_from_db()
+        self.assertEqual(final.team_b, teams[2])
+        TournamentMatchService.result(
+            match=final, actor=self.organizer, score_a=2, score_b=0)
+        tournament.refresh_from_db()
+        teams[0].refresh_from_db()
+        self.assertEqual(tournament.status, Tournament.Status.COMPLETED)
+        self.assertEqual(teams[0].status, TournamentTeam.Status.CHAMPION)
 
 
 class CollegeNetworkApiTests(APITestCase):

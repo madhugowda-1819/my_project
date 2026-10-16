@@ -1,20 +1,25 @@
 from django.test import TestCase
+from django.test import SimpleTestCase, TransactionTestCase, override_settings
 from django.contrib.auth import get_user_model
 from django.contrib.auth.models import Group, Permission
 from django.utils import timezone
 from django.core.cache import cache
-from datetime import timedelta
+from datetime import date, datetime, time, timedelta
+from zoneinfo import ZoneInfo
 from unittest.mock import patch
+from concurrent.futures import ThreadPoolExecutor
+from threading import Barrier
 from rest_framework.test import APITestCase
 from rest_framework.exceptions import ValidationError
 
-from .models import Ground, SportsGround, Match, MatchReplacementOpportunity, MatchReplacementInvitation, MatchReplacementHistory, PracticeActivity, PracticeCompletion, SportsGoal, HealthActivityRecord, NotificationPreference, PlayerProfile, Sport, AvailabilitySlot, UserSport, UserBlock, Venue, VenueSport, Court, VenueAmenity, CourtBooking, VenueReview, CourtBlockedPeriod, Game, GamePlayer, Conversation, ConversationMember, Message, Community, CommunityMember, CommunityPostLike, Event, EventParticipant, EventReminder, Tournament, Notification, UserDevice, RecommendationProfile, Report, ModerationAction, PlayerRating, MatchReflection, ReferralAttribution, College, CollegeMembership, CollegeChallenge, TournamentTeam, TournamentTeamMember, TournamentMatch, CollegeResultDispute, MatchTimePoll, MatchTimePollOption, MatchTimePollVote, Achievement, UserAchievement
+from .models import Ground, SportsGround, Match, MatchParticipation, MatchReplacementOpportunity, MatchReplacementInvitation, MatchReplacementHistory, PracticeActivity, PracticeCompletion, SportsGoal, HealthActivityRecord, NotificationPreference, PlayerProfile, Sport, AvailabilitySlot, UserSport, UserBlock, Venue, VenueSport, Court, VenueAmenity, CourtBooking, VenueReview, CourtBlockedPeriod, Game, GamePlayer, Conversation, ConversationMember, Message, Community, CommunityMember, CommunityPostLike, Event, EventParticipant, EventReminder, Tournament, Notification, UserDevice, RecommendationProfile, PlayerRating, MatchReflection, ReferralAttribution, College, CollegeMembership, CollegeChallenge, TournamentTeam, TournamentTeamMember, TournamentMatch, CollegeResultDispute, MatchTimePoll, MatchTimePollOption, MatchTimePollVote, Achievement, UserAchievement, SportChallenge, ChallengeEntry, ChallengeRewardGrant
+from .maps import find_live_sports_grounds
 from .services.matches import accept_rescue_invitation
 from .services.locations import nearby_queryset
 from .services.ground_ingestion import GroundIngestionService
 from .services.player_matching import PlayerMatchingService
 from .services.availability import VenueAvailabilityService
-from .services.bookings import BookingStatusService
+from .services.bookings import BookingConflict, BookingService, BookingStatusService
 from .services.game_matching import GameMatchingService, apply_mood_ranking, mood_compatibility
 from .services.events import EventRegistrationService, EventReminderService, TournamentBracketService, TournamentMatchService, TournamentService, TournamentStandingsService
 from .services.colleges import CollegeService
@@ -26,8 +31,55 @@ from .services.training_recommendations import build_training_plan
 from .services.health import HealthActivityService
 from .services.recommendation_engine import RecommendationRankingService
 from .services.referrals import ReferralService
+from .services.achievements import AchievementEvaluationService
 
 User = get_user_model()
+
+
+class LiveMapsAdapterTests(SimpleTestCase):
+    @override_settings(GOOGLE_MAPS_PLACES_API_KEY='test-server-key')
+    @patch('my_app.maps.cache.set')
+    @patch('my_app.maps.cache.get', return_value=None)
+    @patch('my_app.maps.urlopen')
+    def test_google_text_search_is_fresh_and_omits_unnamed_results(
+            self, urlopen, cache_get, cache_set):
+        response = urlopen.return_value.__enter__.return_value
+        response.read.return_value = (
+            b'{"places":['
+            b'{"id":"abc","displayName":{"text":"Machaxi Sports Center"},'
+            b'"formattedAddress":"Bengaluru","location":{"latitude":12.97,"longitude":77.59},'
+            b'"websiteUri":"https://example.test"},'
+            b'{"id":"unnamed","location":{"latitude":12.97,"longitude":77.59}}]}'
+        )
+        results = find_live_sports_grounds(
+            latitude=12.97, longitude=77.59, query='Machaxi Sports Center',
+            sport='badminton', radius_km=5,
+        )
+        self.assertEqual([item['name'] for item in results], ['Machaxi Sports Center'])
+        self.assertEqual(results[0]['source'], 'google_maps_live')
+        self.assertNotIn('rating', results[0])
+        cache_get.assert_not_called()
+        cache_set.assert_not_called()
+        request = urlopen.call_args.args[0]
+        self.assertIn(b'Machaxi Sports Center badminton', request.data)
+        self.assertNotIn(b'test-server-key', request.data)
+
+    @override_settings(GOOGLE_MAPS_PLACES_API_KEY='')
+    @patch('my_app.maps.cache.set')
+    @patch('my_app.maps.cache.get', return_value=None)
+    @patch('my_app.maps.urlopen')
+    def test_osm_search_discards_features_without_real_names(
+            self, urlopen, cache_get, cache_set):
+        response = urlopen.return_value.__enter__.return_value
+        response.read.return_value = (
+            b'{"elements":['
+            b'{"type":"node","id":1,"lat":12.97,"lon":77.59,"tags":{"sport":"cricket"}},'
+            b'{"type":"node","id":2,"lat":12.97,"lon":77.59,"tags":{"name":"Town Cricket Ground"}}]}'
+        )
+        results = find_live_sports_grounds(latitude=12.97, longitude=77.59)
+        self.assertEqual([item['name'] for item in results], ['Town Cricket Ground'])
+        self.assertEqual(results[0]['source'], 'openstreetmap_live')
+        cache_set.assert_called_once()
 
 
 class HealthActivityApiTests(APITestCase):
@@ -35,7 +87,9 @@ class HealthActivityApiTests(APITestCase):
         self.user = User.objects.create_user(username='health-user', email='health@example.com', password='pw123456')
         self.other = User.objects.create_user(username='health-other', email='health-other@example.com', password='pw123456')
         self.client.force_authenticate(self.user)
-        self.today = timezone.localdate()
+        # Manual health entries default to India local time; do not derive the
+        # "future" fixture from Django's UTC localdate near a timezone boundary.
+        self.today = timezone.now().astimezone(ZoneInfo('Asia/Kolkata')).date()
 
     def test_manual_activity_validation_and_summary_totals(self):
         for data in [
@@ -55,17 +109,51 @@ class HealthActivityApiTests(APITestCase):
         self.assertEqual(fractional_steps.status_code, 400)
         future = self.client.post('/api/v1/health/activity/', {'metric': 'steps', 'value': 3, 'recorded_date': (self.today+timedelta(days=1)).isoformat()}, format='json')
         self.assertEqual(future.status_code, 400)
+        self.assertFalse(HealthActivityRecord.objects.filter(user=self.user, recorded_date=self.today + timedelta(days=1)).exists())
+
+    def test_health_activity_rejects_malformed_and_missing_fields(self):
+        malformed = self.client.post('/api/v1/health/activity/', {
+            'metric': 'steps', 'value': 500, 'recorded_date': 'not-a-date',
+        }, format='json')
+        missing = self.client.post('/api/v1/health/activity/', {
+            'metric': 'steps', 'value': 500,
+        }, format='json')
+        self.assertEqual(malformed.status_code, 400)
+        self.assertEqual(missing.status_code, 400)
+        self.assertEqual(HealthActivityRecord.objects.filter(user=self.user).count(), 0)
+
+    def test_health_import_rejects_future_date_without_persisting(self):
+        future_date = self.today + timedelta(days=1)
+        response = self.client.post('/api/v1/health/activity/sync/', {
+            'source': HealthActivityRecord.Source.HEALTH_CONNECT,
+            'records': [{
+                'metric': 'steps', 'value': 2500,
+                'recorded_date': future_date.isoformat(),
+                'external_record_id': 'future-record',
+            }],
+        }, format='json')
+        self.assertEqual(response.status_code, 400)
+        self.assertFalse(HealthActivityRecord.objects.filter(user=self.user, external_record_id='future-record').exists())
 
     def test_import_is_idempotent_and_records_are_private(self):
-        record = {'metric': 'steps', 'value': 7000, 'recorded_date': self.today.isoformat(), 'external_record_id': 'hc-record-1'}
+        record = {'metric': 'steps', 'value': 7000, 'recorded_date': self.today.isoformat(), 'external_record_id': 'hc-record-1', 'timezone': 'Asia/Kolkata'}
         payload = {'source': 'health_connect', 'records': [record, record]}
         first = self.client.post('/api/v1/health/activity/sync/', payload, format='json')
         self.assertEqual(first.status_code, 200, first.data)
         self.assertEqual(first.data['data'], {'created': 1, 'updated': 1})
         self.assertEqual(HealthActivityRecord.objects.filter(user=self.user).count(), 1)
+        repeated = self.client.post('/api/v1/health/activity/sync/', payload, format='json')
+        self.assertEqual(repeated.status_code, 200)
+        self.assertEqual(repeated.data['data'], {'created': 0, 'updated': 2})
+        imported = HealthActivityRecord.objects.get(user=self.user, source='health_connect')
+        detail = self.client.get(f'/api/v1/health/activity/{imported.public_id}/')
+        self.assertEqual(detail.status_code, 200)
+        self.assertEqual(detail.data['data']['external_record_id'], 'hc-record-1')
         self.client.force_authenticate(self.other)
         other_summary = self.client.get(f'/api/v1/health/activity/?start={self.today.isoformat()}&end={self.today.isoformat()}')
         self.assertEqual(other_summary.data['data']['records'], [])
+        private_detail = self.client.get(f'/api/v1/health/activity/{imported.public_id}/')
+        self.assertEqual(private_detail.status_code, 404)
         self.client.force_authenticate(self.user)
         manual = self.client.post('/api/v1/health/activity/', {'metric': 'steps', 'value': 100, 'recorded_date': self.today.isoformat()}, format='json')
         self.assertEqual(manual.status_code, 201)
@@ -78,6 +166,21 @@ class HealthActivityApiTests(APITestCase):
         disconnected = self.client.post('/api/v1/health/activity/disconnect/', {'source': 'health_connect'}, format='json')
         self.assertEqual(disconnected.status_code, 200)
         self.assertEqual(HealthActivityRecord.objects.filter(user=self.user, source='health_connect').count(), 0)
+
+    def test_activity_dates_use_the_requested_timezone_at_utc_boundary(self):
+        boundary = timezone.make_aware(datetime(2026, 10, 15, 20, 0), ZoneInfo('UTC'))
+        with patch('django.utils.timezone.now', return_value=boundary):
+            india_date = '2026-10-16'
+            accepted = self.client.post('/api/v1/health/activity/', {
+                'metric': 'steps', 'value': 100,
+                'recorded_date': india_date, 'timezone': 'Asia/Kolkata',
+            }, format='json')
+            utc_future = self.client.post('/api/v1/health/activity/', {
+                'metric': 'steps', 'value': 100,
+                'recorded_date': india_date, 'timezone': 'UTC',
+            }, format='json')
+        self.assertEqual(accepted.status_code, 201, accepted.data)
+        self.assertEqual(utc_future.status_code, 400)
 
 
 class SportsGoalApiTests(APITestCase):
@@ -137,6 +240,34 @@ class SportsGoalApiTests(APITestCase):
         self.assertEqual(premature.status_code, 400)
         paused = self.client.post(f'/api/v1/goals/{public_id}/', {'status': 'paused'}, format='json')
         self.assertEqual(paused.status_code, 200)
+
+    def test_manual_goal_progress_can_be_updated_and_update_rules_match_create(self):
+        created = self._create(
+            title='Training minutes', target=90, unit='minutes',
+            progress_source='manual', manual_progress=10,
+        )
+        self.assertEqual(created.status_code, 201, created.data)
+        public_id = created.data['data']['public_id']
+        updated = self.client.patch(
+            f'/api/v1/goals/{public_id}/', {'manual_progress': 45}, format='json',
+        )
+        self.assertEqual(updated.status_code, 200, updated.data)
+        self.assertEqual(updated.data['data']['progress'], 45)
+
+        over_target = self.client.patch(
+            f'/api/v1/goals/{public_id}/', {'manual_progress': 91}, format='json',
+        )
+        self.assertEqual(over_target.status_code, 400)
+        wrong_unit = self.client.patch(
+            f'/api/v1/goals/{public_id}/', {'unit': 'days'}, format='json',
+        )
+        self.assertEqual(wrong_unit.status_code, 400)
+        too_long = self.client.patch(
+            f'/api/v1/goals/{public_id}/',
+            {'end_date': (self.start + timedelta(days=367)).isoformat()}, format='json',
+        )
+        self.assertEqual(too_long.status_code, 400)
+        self.assertEqual(SportsGoal.objects.get(public_id=public_id).manual_progress, 45)
 
     @patch('my_app.services.goals.timezone.now')
     def test_due_reminder_is_scheduled_once_and_respects_existing_preferences(self, mocked_now):
@@ -201,6 +332,32 @@ class TrainingRecommendationApiTests(APITestCase):
         }, format='json')
         self.assertEqual(response.status_code, 401)
 
+    @patch('my_app.services.training_recommendations.timezone.now')
+    def test_recent_activity_window_uses_requested_timezone(self, mocked_now):
+        mocked_now.return_value = datetime(2026, 10, 15, 20, 0, tzinfo=ZoneInfo('UTC'))
+        activity = PracticeActivity.objects.create(user=self.user, name='Evening session')
+        PracticeCompletion.objects.create(
+            user=self.user, activity=activity, activity_name=activity.name,
+            practice_date=date(2026, 10, 16),
+        )
+        payload = {
+            'sport_id': self.sport.pk, 'goal': 'general_fitness',
+            'duration_minutes': 30,
+        }
+        utc = self.client.post('/api/v1/training/recommendations/',
+                               {**payload, 'timezone': 'UTC'}, format='json')
+        india = self.client.post('/api/v1/training/recommendations/',
+                                 {**payload, 'timezone': 'Asia/Kolkata'}, format='json')
+        self.assertEqual(utc.status_code, 200, utc.data)
+        self.assertEqual(india.status_code, 200, india.data)
+        self.assertEqual(utc.data['data']['generated_for']['week_of'], '2026-10-15')
+        self.assertEqual(india.data['data']['generated_for']['week_of'], '2026-10-16')
+        self.assertEqual(utc.data['data']['recent_context']['checklist_completions_last_7_days'], 0)
+        self.assertEqual(india.data['data']['recent_context']['checklist_completions_last_7_days'], 1)
+        invalid = self.client.post('/api/v1/training/recommendations/',
+                                   {**payload, 'timezone': 'Not_A_Zone'}, format='json')
+        self.assertEqual(invalid.status_code, 400)
+
 
 class DailyPracticeApiTests(APITestCase):
     def setUp(self):
@@ -222,6 +379,20 @@ class DailyPracticeApiTests(APITestCase):
         self.assertEqual(first_response.status_code, 200, first_response.content.decode()[:300])
         self.client.patch(completion_url, payload, format='json')
         self.assertEqual(PracticeCompletion.objects.filter(user=self.user).count(), 1)
+
+    def test_defaults_are_seeded_even_after_a_custom_activity_and_duplicates_are_validation_errors(self):
+        custom = self.client.post('/api/v1/practice/activities/', {
+            'name': 'Serve practice', 'description': 'Practice placement',
+        }, format='json')
+        self.assertEqual(custom.status_code, 201, custom.data)
+        checklist = self.client.get('/api/v1/practice/daily/')
+        self.assertEqual(checklist.status_code, 200, checklist.data)
+        names = {row['name'] for row in checklist.data['data']['activities']}
+        self.assertTrue({'Warm-up', 'Skill practice', 'Stretching'}.issubset(names))
+        duplicate = self.client.post('/api/v1/practice/activities/', {
+            'name': 'Serve practice',
+        }, format='json')
+        self.assertEqual(duplicate.status_code, 400)
 
     def test_activity_edit_keeps_previous_day_snapshot_and_other_user_is_private(self):
         day = timezone.now().date() - timedelta(days=1)
@@ -246,6 +417,18 @@ class DailyPracticeApiTests(APITestCase):
         self.assertEqual(day.data['data']['completion_percentage'], 40)
         future = self.client.get(f'/api/v1/practice/daily/?date={(today_local + timedelta(days=1)).isoformat()}&timezone=Asia%2FKolkata')
         self.assertEqual(future.status_code, 400)
+
+    @patch('my_app.services.practice.timezone.now')
+    def test_omitted_practice_and_history_dates_default_in_requested_timezone(self, mocked_now):
+        mocked_now.return_value = datetime(2026, 10, 15, 20, 0, tzinfo=ZoneInfo('UTC'))
+        day = self.client.get('/api/v1/practice/daily/?timezone=Asia%2FKolkata')
+        self.assertEqual(day.status_code, 200, day.data)
+        self.assertEqual(day.data['data']['date'], '2026-10-16')
+        history = self.client.get('/api/v1/practice/history/?timezone=Asia%2FKolkata')
+        self.assertEqual(history.status_code, 200, history.data)
+        self.assertEqual(history.data['data']['days'][0]['date'], '2026-10-16')
+        invalid = self.client.get('/api/v1/practice/daily/?timezone=Not_A_Zone')
+        self.assertEqual(invalid.status_code, 400)
 
 
 class BasicTests(TestCase):
@@ -278,6 +461,32 @@ class MatchApiTests(APITestCase):
         self.organizer.save()
         self.player.save()
 
+    def _create_ai_game(self, *, sport, reference):
+        game_date = timezone.now().date() + timedelta(days=2)
+        starts_at = timezone.make_aware(
+            datetime.combine(game_date, time(10, 0)), timezone.get_current_timezone(),
+        )
+        ends_at = starts_at + timedelta(hours=1)
+        venue = Venue.objects.create(
+            name=f'{reference} venue', address='1 Game Road', city='Bengaluru',
+            latitude=12.9716, longitude=77.5946, opening_time='08:00',
+            closing_time='22:00', timezone='Asia/Kolkata',
+        )
+        court = Court.objects.create(
+            venue=venue, sport=sport, name=f'{reference} court', capacity=6,
+            price_per_hour=500,
+        )
+        game = Game.objects.create(
+            game_reference=reference, host=self.organizer, sport=sport,
+            venue=venue, court=court, game_date=game_date,
+            start_time=starts_at.timetz().replace(tzinfo=None),
+            end_time=ends_at.timetz().replace(tzinfo=None),
+            starts_at=starts_at, ends_at=ends_at, min_players=2, max_players=6,
+            skill_level='intermediate', status=Game.Status.OPEN,
+        )
+        GamePlayer.objects.create(game=game, user=self.organizer)
+        return game
+
     def test_v1_create_and_join_match_is_idempotent(self):
         self.client.force_authenticate(self.organizer)
         future = timezone.now() + timedelta(days=1)
@@ -298,6 +507,63 @@ class MatchApiTests(APITestCase):
         self.assertEqual(second_join.status_code, 200)
         self.assertEqual(Match.objects.get(pk=match_id).joined_count(), 1)
         self.assertEqual(self.organizer.notifications.count(), 1)
+        notification=self.organizer.notifications.get()
+        self.assertEqual(notification.data['match_id'],str(Match.objects.get(pk=match_id).public_id))
+        self.assertTrue(notification.event_key)
+
+    def test_match_notification_public_id_resolves_to_the_correct_match(self):
+        match=Match.objects.create(sport=self.sport,ground=self.ground,organizer=self.organizer,date_time=timezone.now()+timedelta(days=1),total_players=3)
+        self.client.force_authenticate(self.player)
+        response=self.client.get(f'/api/v1/matches/public/{match.public_id}/')
+        self.assertEqual(response.status_code,200,response.data)
+        self.assertEqual(response.data['match']['public_id'],str(match.public_id))
+
+    def test_match_detail_reads_current_roster_and_requester_state(self):
+        match = Match.objects.create(
+            sport=self.sport, ground=self.ground, organizer=self.organizer,
+            date_time=timezone.now() + timedelta(days=1), total_players=3,
+        )
+        match.joined_players.add(self.player)
+        self.client.force_authenticate(self.player)
+
+        response = self.client.get(f'/api/v1/matches/{match.pk}/')
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.data['success'])
+        self.assertEqual(response.data['match']['id'], match.pk)
+        self.assertTrue(response.data['match']['is_joined'])
+        self.assertFalse(response.data['match']['is_organizer'])
+        self.assertEqual(response.data['match']['joinedPlayers'], 1)
+        self.client.force_authenticate(user=None)
+        self.assertEqual(self.client.get(f'/api/v1/matches/{match.pk}/').status_code, 401)
+
+    def test_rejoined_player_can_be_removed_again_and_gets_a_new_notification(self):
+        match = Match.objects.create(
+            sport=self.sport, ground=self.ground, organizer=self.organizer,
+            date_time=timezone.now() + timedelta(days=1), total_players=2,
+        )
+        match.joined_players.add(self.player)
+        self.client.force_authenticate(self.organizer)
+
+        first = self.client.post(
+            f'/api/v1/matches/{match.pk}/participants/{self.player.pk}/remove/',
+        )
+        self.assertEqual(first.status_code, 200)
+        self.client.force_authenticate(self.player)
+        self.assertEqual(self.client.post(f'/api/v1/matches/{match.pk}/join/').status_code, 200)
+        self.client.force_authenticate(self.organizer)
+        second = self.client.post(
+            f'/api/v1/matches/{match.pk}/participants/{self.player.pk}/remove/',
+        )
+
+        self.assertEqual(second.status_code, 200)
+        self.assertEqual(self.player.notifications.filter(title='Removed from match').count(), 2)
+        self.assertEqual(
+            MatchParticipation.objects.filter(
+                match=match, user=self.player, status=MatchParticipation.Status.REMOVED,
+            ).count(),
+            2,
+        )
 
     def test_expired_match_cannot_be_joined(self):
         match = Match.objects.create(
@@ -340,6 +606,77 @@ class MatchApiTests(APITestCase):
         self.assertEqual(Match.objects.get(pk=match.pk).joined_count(), 0)
         again = self.client.post(f'/api/v1/matches/{match.id}/leave/')
         self.assertEqual(again.status_code, 409)
+        history = MatchParticipation.objects.get(match=match, user=self.player)
+        self.assertEqual(history.status, MatchParticipation.Status.LEFT)
+        self.assertIsNotNone(history.ended_at)
+        self.assertEqual(self.organizer.notifications.filter(title='Player left your match').count(), 1)
+
+    def test_organizer_cancellation_notifies_players_and_blocks_later_actions(self):
+        match = Match.objects.create(sport=self.sport, ground=self.ground, organizer=self.organizer, date_time=timezone.now() + timedelta(days=1), total_players=2)
+        match.joined_players.add(self.player)
+        self.client.force_authenticate(self.player)
+        denied = self.client.post(f'/api/v1/matches/{match.id}/cancel/')
+        self.assertEqual(denied.status_code, 403)
+        self.client.force_authenticate(self.organizer)
+        response = self.client.post(f'/api/v1/matches/{match.id}/cancel/')
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data['match']['status'], 'cancelled')
+        self.assertEqual(self.player.notifications.filter(title='Match cancelled').count(), 1)
+        self.client.force_authenticate(self.player)
+        self.assertEqual(self.client.post(f'/api/v1/matches/{match.id}/leave/').status_code, 409)
+
+    def test_full_completed_and_cancelled_matches_reject_actions_without_losing_roster(self):
+        full = Match.objects.create(
+            sport=self.sport, ground=self.ground, organizer=self.organizer,
+            date_time=timezone.now() + timedelta(days=1), total_players=1,
+        )
+        full.joined_players.add(self.organizer)
+        self.client.force_authenticate(self.player)
+        self.assertEqual(self.client.post(f'/api/v1/matches/{full.id}/join/').status_code, 409)
+
+        completed = Match.objects.create(
+            sport=self.sport, ground=self.ground, organizer=self.organizer,
+            date_time=timezone.now() - timedelta(days=1), total_players=2, status='completed',
+        )
+        completed.joined_players.add(self.player)
+        self.assertEqual(self.client.post(f'/api/v1/matches/{completed.id}/leave/').status_code, 409)
+        self.assertTrue(completed.joined_players.filter(pk=self.player.pk).exists())
+
+        cancelled = Match.objects.create(
+            sport=self.sport, ground=self.ground, organizer=self.organizer,
+            date_time=timezone.now() + timedelta(days=1), total_players=2, status='cancelled',
+        )
+        cancelled.joined_players.add(self.player)
+        self.assertEqual(self.client.post(f'/api/v1/matches/{cancelled.id}/leave/').status_code, 409)
+        self.assertTrue(cancelled.joined_players.filter(pk=self.player.pk).exists())
+
+    def test_removal_records_reason_and_rejects_nonorganizer(self):
+        match = Match.objects.create(sport=self.sport, ground=self.ground, organizer=self.organizer, date_time=timezone.now() + timedelta(days=1), total_players=2)
+        match.joined_players.add(self.player)
+        self.client.force_authenticate(self.player)
+        self.assertEqual(self.client.post(f'/api/v1/matches/{match.id}/participants/{self.organizer.id}/remove/').status_code, 403)
+        self.client.force_authenticate(self.organizer)
+        response = self.client.post(f'/api/v1/matches/{match.id}/participants/{self.player.id}/remove/', {'reason': 'Roster update'}, format='json')
+        self.assertEqual(response.status_code, 200)
+        audit = MatchParticipation.objects.get(match=match, user=self.player)
+        self.assertEqual((audit.status, audit.reason), (MatchParticipation.Status.REMOVED, 'Roster update'))
+        self.assertEqual(match.joined_count(), 0)
+        self.assertEqual(self.player.notifications.filter(title='Removed from match').count(), 1)
+
+    def test_only_organizer_can_edit_and_capacity_cannot_drop_below_roster(self):
+        match = Match.objects.create(sport=self.sport, ground=self.ground, organizer=self.organizer, date_time=timezone.now() + timedelta(days=1), total_players=2)
+        match.joined_players.add(self.player)
+        second = User.objects.create_user(username='second-match-player', email='second-match-player@example.com', password='pw123456')
+        match.joined_players.add(second)
+        self.client.force_authenticate(self.player)
+        denied = self.client.patch(f'/api/v1/matches/{match.id}/', {'total_players': 3}, format='json')
+        self.assertEqual(denied.status_code, 403)
+        self.client.force_authenticate(self.organizer)
+        invalid = self.client.patch(f'/api/v1/matches/{match.id}/', {'total_players': 1}, format='json')
+        self.assertEqual(invalid.status_code, 400)
+        expanded = self.client.patch(f'/api/v1/matches/{match.id}/', {'total_players': 3}, format='json')
+        self.assertEqual(expanded.status_code, 200)
+        self.assertEqual(expanded.data['match']['total_players'], 3)
 
     @patch('my_project.settings.MATCH_RESCUE_WINDOW_MINUTES', 360)
     def test_withdrawal_notifies_limited_eligible_candidates_and_accepts_explicitly(self):
@@ -361,8 +698,122 @@ class MatchApiTests(APITestCase):
         match.refresh_from_db()
         self.assertTrue(match.joined_players.filter(pk=candidate.pk).exists())
         self.assertEqual(match.joined_count(), 1)
+        self.assertEqual(
+            MatchParticipation.objects.filter(
+                match=match, user=candidate, status=MatchParticipation.Status.JOINED,
+            ).count(),
+            1,
+        )
         self.assertTrue(MatchReplacementHistory.objects.filter(match=match, replacement_user=candidate).exists())
         self.assertEqual(MatchReplacementOpportunity.objects.get(pk=invitation.opportunity_id).closed_at is None, False)
+
+    @patch('my_project.settings.MATCH_RESCUE_WINDOW_MINUTES', 360)
+    def test_withdrawer_is_never_invited_back_and_ordinary_cancellation_does_not_trigger_rescue(self):
+        UserSport.objects.create(user=self.player, sport=self.sport, skill_level='intermediate')
+        candidate = User.objects.create_user(
+            username='rescue-candidate', email='rescue-candidate@example.com', password='pw123456',
+            latitude=12.9716, longitude=77.5946,
+        )
+        PlayerProfile.objects.create(user=candidate)
+        UserSport.objects.create(user=candidate, sport=self.sport, skill_level='intermediate')
+        match = Match.objects.create(
+            sport=self.sport, ground=self.ground, organizer=self.organizer,
+            date_time=timezone.now() + timedelta(hours=2), total_players=2,
+        )
+        match.joined_players.add(self.player)
+        self.client.force_authenticate(self.player)
+        self.assertEqual(self.client.post(f'/api/v1/matches/{match.pk}/leave/').status_code, 200)
+        self.assertFalse(MatchReplacementInvitation.objects.filter(candidate=self.player).exists())
+        self.assertTrue(MatchReplacementInvitation.objects.filter(candidate=candidate).exists())
+
+        ordinary = Match.objects.create(
+            sport=self.sport, ground=self.ground, organizer=self.organizer,
+            date_time=timezone.now() + timedelta(hours=8), total_players=2,
+        )
+        ordinary.joined_players.add(self.player)
+        self.assertEqual(self.client.post(f'/api/v1/matches/{ordinary.pk}/leave/').status_code, 200)
+        self.assertFalse(MatchReplacementOpportunity.objects.filter(match=ordinary).exists())
+
+    def test_invitation_decline_persists_and_cannot_be_reused(self):
+        match = Match.objects.create(
+            sport=self.sport, ground=self.ground, organizer=self.organizer,
+            date_time=timezone.now() + timedelta(hours=2), total_players=2,
+        )
+        opportunity = MatchReplacementOpportunity.objects.create(
+            match=match, withdrawn_user=self.organizer,
+            expires_at=timezone.now() + timedelta(hours=1),
+        )
+        invitation = MatchReplacementInvitation.objects.create(
+            opportunity=opportunity, candidate=self.player,
+        )
+        self.client.force_authenticate(self.player)
+        declined = self.client.post(
+            f'/api/v1/match-rescue-invitations/{invitation.public_id}/decline/',
+        )
+        self.assertEqual(declined.status_code, 200, declined.data)
+        invitation.refresh_from_db()
+        self.assertEqual(invitation.status, MatchReplacementInvitation.Status.DECLINED)
+        self.assertIsNotNone(invitation.responded_at)
+        rejected_accept = self.client.post(
+            f'/api/v1/match-rescue-invitations/{invitation.public_id}/accept/',
+        )
+        self.assertEqual(rejected_accept.status_code, 409)
+
+    def test_match_cancellation_closes_pending_rescue_invitations(self):
+        match = Match.objects.create(
+            sport=self.sport, ground=self.ground, organizer=self.organizer,
+            date_time=timezone.now() + timedelta(hours=2), total_players=2,
+        )
+        opportunity = MatchReplacementOpportunity.objects.create(
+            match=match, withdrawn_user=self.player,
+            expires_at=timezone.now() + timedelta(hours=1),
+        )
+        invitation = MatchReplacementInvitation.objects.create(
+            opportunity=opportunity, candidate=self.player,
+        )
+        self.client.force_authenticate(self.organizer)
+        response = self.client.post(f'/api/v1/matches/{match.pk}/cancel/')
+        self.assertEqual(response.status_code, 200, response.data)
+        opportunity.refresh_from_db()
+        invitation.refresh_from_db()
+        self.assertIsNotNone(opportunity.closed_at)
+        self.assertEqual(invitation.status, MatchReplacementInvitation.Status.UNAVAILABLE)
+        self.client.force_authenticate(self.player)
+        self.assertEqual(self.client.post(
+            f'/api/v1/match-rescue-invitations/{invitation.public_id}/accept/',
+        ).status_code, 409)
+
+    def test_only_one_invited_candidate_can_claim_the_last_slot(self):
+        candidates = []
+        for index in range(2):
+            candidate = User.objects.create_user(
+                username=f'claimant-{index}', email=f'claimant-{index}@example.com', password='pw123456',
+                latitude=12.9716, longitude=77.5946,
+            )
+            PlayerProfile.objects.create(user=candidate)
+            UserSport.objects.create(user=candidate, sport=self.sport, skill_level='intermediate')
+            candidates.append(candidate)
+        match = Match.objects.create(
+            sport=self.sport, ground=self.ground, organizer=self.organizer,
+            date_time=timezone.now() + timedelta(hours=2), total_players=1,
+        )
+        opportunity = MatchReplacementOpportunity.objects.create(
+            match=match, withdrawn_user=self.player,
+            expires_at=timezone.now() + timedelta(hours=1),
+        )
+        invitations = [MatchReplacementInvitation.objects.create(
+            opportunity=opportunity, candidate=candidate,
+        ) for candidate in candidates]
+        self.client.force_authenticate(candidates[0])
+        first = self.client.post(f'/api/v1/match-rescue-invitations/{invitations[0].public_id}/accept/')
+        self.assertEqual(first.status_code, 200, first.data)
+        self.client.force_authenticate(candidates[1])
+        second = self.client.post(f'/api/v1/match-rescue-invitations/{invitations[1].public_id}/accept/')
+        self.assertEqual(second.status_code, 409)
+        match.refresh_from_db()
+        self.assertEqual(match.joined_players.count(), 1)
+        invitations[1].refresh_from_db()
+        self.assertEqual(invitations[1].status, MatchReplacementInvitation.Status.UNAVAILABLE)
 
     @patch('my_project.settings.MATCH_RESCUE_WINDOW_MINUTES', 360)
     def test_rescue_excludes_blocked_players_and_expired_invitation_cannot_be_accepted(self):
@@ -383,6 +834,8 @@ class MatchApiTests(APITestCase):
         response = self.client.post(f'/api/v1/match-rescue-invitations/{invitation.public_id}/accept/')
         self.assertEqual(response.status_code, 409)
         self.assertEqual(Match.objects.get(pk=match.pk).joined_count(), 0)
+        invitation.refresh_from_db()
+        self.assertEqual(invitation.status, MatchReplacementInvitation.Status.EXPIRED)
 
     def test_invitation_cannot_be_accepted_by_another_user(self):
         opportunity = MatchReplacementOpportunity.objects.create(
@@ -417,25 +870,37 @@ class MatchApiTests(APITestCase):
 
     def test_ai_recommendations_return_paginated_matches(self):
         UserSport.objects.create(user=self.player, sport=self.sport, skill_level='intermediate', preferred=True)
-        Match.objects.create(
-            sport=self.sport, ground=self.ground, organizer=self.organizer,
-            date_time=timezone.now() + timedelta(days=1), total_players=2,
-        )
+        self._create_ai_game(sport=self.sport, reference='AI-FOOTBALL-1')
         self.client.force_authenticate(self.player)
         response = self.client.get('/api/v1/ai/matches/')
         self.assertEqual(response.status_code, 200)
         self.assertEqual(len(response.data), 1)
+        self.assertEqual(response.data[0]['sport']['name'], self.sport.name)
+        self.assertIn('match_score', response.data[0])
 
     def test_ai_recommendations_exclude_sports_not_in_player_profile(self):
         cricket = Sport.objects.get(name='Cricket')
         UserSport.objects.create(user=self.player, sport=self.sport, skill_level='intermediate', preferred=True)
-        Match.objects.create(sport=self.sport, ground=self.ground, organizer=self.organizer, date_time=timezone.now() + timedelta(days=1), total_players=2)
-        Match.objects.create(sport=cricket, ground=self.ground, organizer=self.organizer, date_time=timezone.now() + timedelta(days=1), total_players=2)
+        self._create_ai_game(sport=self.sport, reference='AI-FOOTBALL-2')
+        self._create_ai_game(sport=cricket, reference='AI-CRICKET-1')
         self.client.force_authenticate(self.player)
         response = self.client.get('/api/v1/ai/matches/')
         self.assertEqual(response.status_code, 200)
         self.assertEqual(len(response.data), 1)
-        self.assertEqual(response.data[0]['sportName'], self.sport.name)
+        self.assertEqual(response.data[0]['sport']['name'], self.sport.name)
+
+    def test_ai_recommendations_exclude_full_and_cancelled_games(self):
+        UserSport.objects.create(user=self.player, sport=self.sport, skill_level='intermediate', preferred=True)
+        full = self._create_ai_game(sport=self.sport, reference='AI-FOOTBALL-3')
+        full.status = Game.Status.FULL
+        full.save(update_fields=['status', 'updated_at'])
+        cancelled = self._create_ai_game(sport=self.sport, reference='AI-FOOTBALL-4')
+        cancelled.status = Game.Status.CANCELLED
+        cancelled.save(update_fields=['status', 'updated_at'])
+        self.client.force_authenticate(self.player)
+        response = self.client.get('/api/v1/ai/matches/')
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data, [])
 
 
 class AuthenticationApiTests(APITestCase):
@@ -698,6 +1163,101 @@ class ReferralApiTests(APITestCase):
         self.assertEqual(self.client.get('/api/v1/users/me/referrals/').status_code, 403)
 
 
+class PlayerChallengeAndAchievementTests(APITestCase):
+    def setUp(self):
+        self.user = User.objects.create_user(
+            username='challenge-player', email='challenge@example.com', password='StrongPass!123',
+        )
+        PlayerProfile.objects.create(user=self.user)
+        self.sport = Sport.objects.get(name='Badminton')
+        UserSport.objects.create(user=self.user, sport=self.sport, skill_level=UserSport.SkillLevel.INTERMEDIATE)
+        self.today = timezone.localdate()
+        self.client.force_authenticate(self.user)
+
+    def make_challenge(self, **changes):
+        values = {
+            'name': 'Practice streak', 'description': 'Complete a practice session.',
+            'sport': self.sport, 'kind': SportChallenge.Kind.INDIVIDUAL,
+            'metric': SportChallenge.Metric.CHECKLIST_COMPLETIONS, 'target': 1,
+            'starts_on': self.today, 'ends_on': self.today + timedelta(days=4),
+            'reward_points': 25, 'created_by': self.user,
+        }
+        values.update(changes)
+        return SportChallenge.objects.create(**values)
+
+    def test_challenge_join_progress_and_reward_are_server_calculated_and_idempotent(self):
+        achievement = Achievement.objects.create(
+            code='practice-challenge-reward', name='Practice finisher',
+            description='Complete a challenge.', category=Achievement.Category.ACTIVITY,
+            target_value=1,
+        )
+        challenge = self.make_challenge(reward_achievement=achievement)
+        joined = self.client.post(f'/api/v1/challenges/{challenge.public_id}/join/', {}, format='json')
+        self.assertEqual(joined.status_code, 201)
+        self.assertEqual(joined.data['data']['progress'], 0)
+        self.assertFalse(joined.data['data']['completed'])
+
+        activity = PracticeActivity.objects.create(user=self.user, name='Warm-up')
+        PracticeCompletion.objects.create(
+            user=self.user, activity=activity, activity_name='Warm-up', practice_date=self.today,
+        )
+        first = self.client.get('/api/v1/challenges/').data['data'][0]
+        second = self.client.get('/api/v1/challenges/').data['data'][0]
+        self.assertEqual(first['my_entry']['progress'], 1)
+        self.assertTrue(first['my_entry']['completed'])
+        self.assertEqual(first['my_entry']['reward_points'], 25)
+        self.assertEqual(second['my_entry']['reward_points'], 25)
+        self.assertEqual(ChallengeRewardGrant.objects.filter(entry__challenge=challenge, user=self.user).count(), 1)
+        self.assertTrue(UserAchievement.objects.get(user=self.user, achievement=achievement).unlocked)
+
+    def test_duplicate_join_and_expired_challenge_are_rejected(self):
+        challenge = self.make_challenge()
+        endpoint = f'/api/v1/challenges/{challenge.public_id}/join/'
+        self.assertEqual(self.client.post(endpoint, {}, format='json').status_code, 201)
+        self.assertEqual(self.client.post(endpoint, {}, format='json').status_code, 400)
+        expired = self.make_challenge(name='Expired challenge', starts_on=self.today - timedelta(days=3), ends_on=self.today - timedelta(days=1))
+        response = self.client.post(f'/api/v1/challenges/{expired.public_id}/join/', {}, format='json')
+        self.assertEqual(response.status_code, 400)
+
+    def test_only_entry_owner_can_leave_and_withdrawal_cannot_be_repeated(self):
+        challenge = self.make_challenge()
+        joined = self.client.post(f'/api/v1/challenges/{challenge.public_id}/join/', {}, format='json')
+        entry_id = joined.data['data']['public_id']
+        other = User.objects.create_user(username='other-challenge', email='other-challenge@example.com', password='StrongPass!123')
+        PlayerProfile.objects.create(user=other)
+        self.client.force_authenticate(other)
+        self.assertEqual(self.client.post(f'/api/v1/challenge-entries/{entry_id}/leave/').status_code, 403)
+        self.client.force_authenticate(self.user)
+        self.assertEqual(self.client.post(f'/api/v1/challenge-entries/{entry_id}/leave/').status_code, 200)
+        self.assertEqual(self.client.post(f'/api/v1/challenge-entries/{entry_id}/leave/').status_code, 400)
+
+    def test_challenge_filters_validate_and_player_privacy_is_enforced(self):
+        self.make_challenge()
+        self.assertEqual(self.client.get('/api/v1/challenges/?kind=invalid').status_code, 400)
+        other = User.objects.create_user(username='private-challenge-player', email='private-challenge@example.com', password='StrongPass!123')
+        PlayerProfile.objects.create(user=other, profile_visibility='private')
+        self.assertEqual(self.client.get(f'/api/v1/players/{other.public_id}/achievements/').status_code, 404)
+        self.client.force_authenticate(None)
+        self.assertEqual(self.client.get('/api/v1/challenges/').status_code, 401)
+
+    def test_achievement_evaluation_handles_unsupported_game_wins_and_keeps_unlock(self):
+        achievement = Achievement.objects.create(
+            code='unsupported-wins', name='Match winner', description='Win matches.',
+            category=Achievement.Category.WINS, target_value=1,
+        )
+        rows = AchievementEvaluationService.evaluate(user=self.user)
+        row = next(item for item in rows if item.achievement_id == achievement.id)
+        self.assertEqual(row.progress, 0)
+        row.unlocked = True
+        row.progress = 1
+        row.unlocked_at = timezone.now()
+        row.save()
+        AchievementEvaluationService.evaluate(user=self.user)
+        row.refresh_from_db()
+        self.assertTrue(row.unlocked)
+        self.assertGreaterEqual(row.progress, achievement.target_value)
+
+
 class PlayerProfileApiTests(APITestCase):
     def setUp(self):
         self.user = User.objects.create_user(username='owner', email='owner@example.com', password='StrongPass!123')
@@ -744,6 +1304,16 @@ class PlayerProfileApiTests(APITestCase):
         self.assertNotIn('longitude', detail.data)
         self.assertEqual(detail.data['location'], 'Bengaluru')
 
+    def test_public_player_detail_uses_public_id_and_includes_public_avatar_field(self):
+        response = self.client.get(f'/api/v1/players/public/{self.other.public_id}/')
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data['public_id'], str(self.other.public_id))
+        self.assertIn('avatar', response.data)
+        self.assertNotIn('email', response.data)
+        self.assertNotIn('phone', response.data)
+        self.assertNotIn('latitude', response.data)
+        self.assertNotIn('longitude', response.data)
+
     def test_matching_mood_preference_is_changeable_and_validated(self):
         accepted = self.client.patch('/api/v1/users/me/player-profile/', {'matching_mood': 'social'}, format='json')
         rejected = self.client.patch('/api/v1/users/me/player-profile/', {'matching_mood': 'competitive'}, format='json')
@@ -755,7 +1325,31 @@ class PlayerProfileApiTests(APITestCase):
         self.other.profile.profile_visibility = 'private'
         self.other.profile.save()
         response = self.client.get(f'/api/v1/players/{self.other.id}/')
+        public_id_response = self.client.get(f'/api/v1/players/public/{self.other.public_id}/')
         self.assertEqual(response.status_code, 404)
+        self.assertEqual(public_id_response.status_code, 404)
+
+    def test_global_player_search_excludes_private_and_blocked_profiles(self):
+        private = User.objects.create_user(
+            username='hidden-player', email='hidden-player@example.com',
+            password='StrongPass!123', full_name='Hidden Player', city='Bengaluru',
+        )
+        PlayerProfile.objects.create(user=private, profile_visibility='private')
+        public_result = self.client.get('/api/v1/search/', {
+            'type': 'player', 'q': 'Public Player',
+        })
+        private_result = self.client.get('/api/v1/search/', {
+            'type': 'player', 'q': 'Hidden Player',
+        })
+        self.assertEqual(public_result.status_code, 200)
+        self.assertEqual([row['title'] for row in public_result.data['results']], ['Public Player'])
+        self.assertEqual(private_result.data['results'], [])
+
+        UserBlock.objects.create(user=self.user, blocked_user=self.other)
+        blocked_result = self.client.get('/api/v1/search/', {
+            'type': 'player', 'q': 'Public Player',
+        })
+        self.assertEqual(blocked_result.data['results'], [])
 
 
 class NearbySearchApiTests(APITestCase):
@@ -803,12 +1397,113 @@ class NearbySearchApiTests(APITestCase):
 
     def test_home_player_feed_uses_database_distance_filter_and_bounded_results(self):
         response = self.client.get('/api/v1/players/', {
-            'lat': 12.9716, 'lng': 77.5946, 'radius': 2, 'sport': 'badminton',
+            'latitude': 12.9716, 'longitude': 77.5946, 'radius': 2, 'sport': 'badminton',
         })
         self.assertEqual(response.status_code, 200)
-        self.assertEqual([row['username'] for row in response.data], ['near-player'])
-        self.assertLess(response.data[0]['distance_km'], 1)
-        self.assertEqual(response.data[0]['rating_summary']['rating_count'], 0)
+        self.assertEqual([row['username'] for row in response.data['results']], ['near-player'])
+        self.assertLess(response.data['results'][0]['distance_km'], 1)
+        self.assertEqual(response.data['results'][0]['rating_summary']['rating_count'], 0)
+        legacy = self.client.get('/api/v1/players/', {
+            'lat': 12.9716, 'lng': 77.5946, 'radius': 2, 'sport': 'badminton',
+        })
+        self.assertEqual(legacy.status_code, 200)
+        self.assertEqual([row['username'] for row in legacy.data['results']], ['near-player'])
+
+    def test_player_directory_search_filters_and_sorting(self):
+        response = self.client.get('/api/v1/players/', {
+            'q': 'Near', 'city': 'Bengal', 'sport': 'BADMINTON',
+            'skill_level': 'advanced', 'availability': 'available',
+            'sort': 'name', 'page_size': 1,
+        })
+        self.assertEqual(response.status_code, 200, response.data)
+        self.assertEqual(response.data['count'], 1)
+        self.assertEqual(response.data['results'][0]['username'], 'near-player')
+
+        PlayerRating.objects.create(
+            reviewer=self.requester, player=self.near, rating=3.0,
+            playing_performance=3, teamwork=3, sportsmanship=3, punctuality=3,
+        )
+        PlayerRating.objects.create(
+            reviewer=self.requester, player=self.far, rating=4.5,
+            playing_performance=5, teamwork=4, sportsmanship=5, punctuality=4,
+        )
+        top_rated = self.client.get('/api/v1/players/', {
+            'q': 'Player', 'availability': 'all', 'sort': 'rating',
+        })
+        self.assertEqual(top_rated.data['results'][0]['username'], 'far-player')
+
+    def test_player_directory_availability_and_private_blocked_exclusions(self):
+        unavailable = User.objects.create_user(
+            username='unavailable-public', email='unavailable@example.com',
+            password='StrongPass!123', full_name='Unavailable Player',
+            city='Bengaluru', is_available=False,
+        )
+        PlayerProfile.objects.create(user=unavailable, profile_visibility='public')
+        private = User.objects.create_user(
+            username='private-directory', email='private-directory@example.com',
+            password='StrongPass!123', full_name='Private Player', city='Bengaluru',
+        )
+        PlayerProfile.objects.create(user=private, profile_visibility='private')
+        UserBlock.objects.create(user=self.requester, blocked_user=self.near)
+
+        result = self.client.get('/api/v1/players/', {
+            'availability': 'unavailable', 'city': 'Bengaluru', 'sort': 'name',
+        })
+        usernames = [row['username'] for row in result.data['results']]
+        self.assertEqual(usernames, ['unavailable-public'])
+
+        # Blocks are enforced in either direction, including direct profile reads.
+        self.assertEqual(
+            self.client.get(f'/api/v1/players/public/{self.near.public_id}/').status_code,
+            404,
+        )
+        UserBlock.objects.create(user=self.far, blocked_user=self.requester)
+        blocked_by_result = self.client.get('/api/v1/players/', {'q': 'Far Player'})
+        self.assertEqual(blocked_by_result.data['results'], [])
+
+    def test_player_directory_paginates_incrementally_without_duplicates(self):
+        for index in range(23):
+            player = User.objects.create_user(
+                username=f'directory-{index:02d}',
+                email=f'directory-{index:02d}@example.com',
+                password='StrongPass!123', full_name=f'Directory Player {index:02d}',
+                city='Bengaluru',
+            )
+            PlayerProfile.objects.create(user=player, profile_visibility='public')
+
+        first = self.client.get('/api/v1/players/', {
+            'q': 'Directory Player', 'page': 1, 'page_size': 10, 'sort': 'name',
+        })
+        second = self.client.get('/api/v1/players/', {
+            'q': 'Directory Player', 'page': 2, 'page_size': 10, 'sort': 'name',
+        })
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(second.status_code, 200)
+        self.assertEqual(first.data['count'], 23)
+        self.assertEqual(len(first.data['results']), 10)
+        self.assertEqual(len(second.data['results']), 10)
+        first_ids = {row['public_id'] for row in first.data['results']}
+        second_ids = {row['public_id'] for row in second.data['results']}
+        self.assertFalse(first_ids & second_ids)
+        self.assertIsNotNone(first.data['next'])
+
+    def test_player_directory_rejects_malformed_filters_and_requires_auth(self):
+        for query in (
+            {'sport': 'not-a-real-sport'},
+            {'skill_level': 'legend'},
+            {'availability': 'maybe'},
+            {'sort': 'random'},
+            {'page_size': 101},
+            {'page': 0},
+            {'page': 'not-a-number'},
+            {'q': 'x' * 101},
+            {'latitude': 12.9},
+            {'radius': 0},
+        ):
+            response = self.client.get('/api/v1/players/', query)
+            self.assertEqual(response.status_code, 400, (query, response.data))
+        self.client.force_authenticate(user=None)
+        self.assertEqual(self.client.get('/api/v1/players/').status_code, 401)
 
     def test_nearby_venues_and_invalid_or_missing_coordinates(self):
         venues = self.client.get('/api/v1/grounds/', {
@@ -847,6 +1542,93 @@ class GroundIngestionAndAutoGameTests(APITestCase):
             price_per_hour=500, active=True,
         )
         self.client.force_authenticate(self.user)
+
+    @patch('my_app.views.find_live_sports_grounds')
+    def test_live_ground_search_supports_keyword_filters_and_external_booking_status(self, provider):
+        provider.return_value = [{
+            'id': 'places/real-place-id', 'name': 'Machaxi Sports Center',
+            'address': 'Whitefield, Bengaluru', 'latitude': 12.972,
+            'longitude': 77.595, 'types': ['sports_complex'],
+            'mapsUrl': 'https://maps.google.com/?q=real-place-id',
+            'websiteUrl': 'https://example.test', 'source': 'google_maps_live',
+        }]
+        response = self.client.get('/api/v1/grounds/live/', {
+            'query': 'Machaxi Sports Center', 'sport': 'badminton',
+            'category': 'sports centre', 'lat': 12.9716, 'lng': 77.5946,
+            'radius': 5,
+        })
+        self.assertEqual(response.status_code, 200)
+        provider.assert_called_once_with(
+            latitude=12.9716, longitude=77.5946, radius_km=5.0,
+            query='Machaxi Sports Center', sport='badminton', category='sports centre',
+        )
+        result = response.data['results'][0]
+        self.assertEqual(result['name'], 'Machaxi Sports Center')
+        self.assertFalse(result['booking_supported'])
+        self.assertEqual(result['verification_status'], 'external_unverified')
+        self.assertAlmostEqual(result['distance_km'], 0.06, places=1)
+
+    def test_live_ground_search_rejects_invalid_or_partial_coordinates(self):
+        invalid = self.client.get('/api/v1/grounds/live/', {
+            'query': 'Badminton courts', 'lat': 91, 'lng': 77,
+        })
+        partial = self.client.get('/api/v1/grounds/live/', {
+            'query': 'Badminton courts', 'lat': 12,
+        })
+        empty = self.client.get('/api/v1/grounds/live/')
+        self.assertEqual(invalid.status_code, 400)
+        self.assertEqual(partial.status_code, 400)
+        self.assertEqual(empty.status_code, 400)
+
+    @patch('my_app.views.find_live_sports_grounds')
+    def test_provider_places_are_not_written_to_ground_catalogue(self, provider):
+        provider.return_value = [{
+            'id': 'ChIJ-provider-only', 'name': 'Provider-only Turf',
+            'address': 'Bengaluru', 'latitude': 12.973, 'longitude': 77.596,
+            'types': ['sports_complex'], 'source': 'google_maps_live',
+        }]
+        response = self.client.post('/api/v1/grounds/discover/', {
+            'latitude': 12.9717, 'longitude': 77.5947,
+        }, format='json')
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data['created_count'], 0)
+        self.assertEqual(response.data['data'], [])
+        self.assertFalse(Ground.objects.filter(name='Provider-only Turf').exists())
+
+    @patch('my_app.views.find_live_sports_grounds')
+    def test_live_ground_search_drops_unnamed_or_incomplete_provider_results(self, provider):
+        provider.return_value = [
+            {'id': 'unnamed', 'name': '', 'latitude': 12.972, 'longitude': 77.595},
+            {'id': 'no-location', 'name': 'A real facility'},
+        ]
+        response = self.client.get('/api/v1/grounds/live/', {
+            'query': 'sports facilities',
+        })
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data['results'], [])
+
+    @override_settings(GOOGLE_MAPS_PLACES_API_KEY='server-only-key')
+    @patch('my_app.views.find_live_sports_grounds')
+    @patch('my_app.views.UniversalGroundsView._refresh_from_overpass')
+    def test_tournament_nearby_catalogue_keeps_numeric_osm_ids(self, overpass, google):
+        osm_ground = SportsGround.objects.create(
+            osm_id='node/osm-tournament-ground', name='Community Sports Ground',
+            ground_type='pitch', sport='cricket', latitude=12.972,
+            longitude=77.595,
+        )
+        SportsGround.objects.create(
+            osm_id='google/legacy-cached-place', name='Legacy Google Ground',
+            ground_type='sports_centre', sport='multi-sport', latitude=12.973,
+            longitude=77.596,
+        )
+        response = self.client.get('/api/v1/grounds/nearby/', {
+            'latitude': 12.9716, 'longitude': 77.5946,
+        })
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual([ground['name'] for ground in response.data['grounds']], ['Community Sports Ground'])
+        self.assertEqual(response.data['grounds'][0]['id'], osm_ground.id)
+        self.assertEqual(response.data['attribution'], '© OpenStreetMap contributors')
+        google.assert_not_called()
 
     @patch('my_app.views.find_live_sports_grounds')
     def test_discovery_upserts_provider_grounds_and_saves_user_location(self, provider):
@@ -888,7 +1670,9 @@ class GroundIngestionAndAutoGameTests(APITestCase):
         self.assertEqual(Game.objects.filter(host=self.user).count(), 1)
         recommendations = self.client.get('/api/v1/ai/matches/')
         self.assertEqual(recommendations.status_code, 200)
-        self.assertEqual(recommendations.data[0]['public_id'], first.data['data']['public_id'])
+        # The host must not be recommended their own game. Other-player
+        # eligibility is covered by MatchApiTests above.
+        self.assertEqual(recommendations.data, [])
 
 
 class PlayerMatchingServiceTests(APITestCase):
@@ -984,16 +1768,105 @@ class MatchMyMoodTests(APITestCase):
         self.assertEqual(ranked[0]['base_score'], 80)
         self.assertIn('You share the same play mood', ranked[0]['reasons'])
 
-    def test_recommendations_are_actual_and_save_mood(self):
+    def test_recommendations_are_actual_and_get_filters_do_not_change_preferences(self):
         response = self.client.get('/api/v1/recommendations/match-my-mood/', {'sport': self.sport.id, 'mood': 'relaxed', 'radius': 20, 'availability': 'evening'})
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.data['mood'], 'relaxed')
         self.assertTrue(response.data['games'])
         self.assertTrue(response.data['players'])
         self.assertEqual(response.data['games'][0]['game']['public_id'], str(self.game.public_id))
-        self.assertEqual(self.user.profile.matching_mood, 'relaxed')
+        self.user.profile.refresh_from_db()
+        self.assertEqual(self.user.profile.matching_mood, 'energetic')
+        self.assertEqual(self.user.profile.preferred_distance, 15)
+        self.assertEqual(self.user.profile.preferred_play_times, ['evening'])
         self.assertIn('ranking_formula', response.data)
         self.assertIn('Your play moods are compatible', response.data['players'][0]['reasons'])
+
+    def test_all_supported_moods_change_recommendation_ranking(self):
+        moods = ('relaxed', 'energetic', 'learning', 'social')
+        for mood in moods:
+            rows = [
+                {'id': candidate_mood, 'score': 80, 'distance_km': index, 'reasons': []}
+                for index, candidate_mood in enumerate(moods)
+            ]
+            ranked = apply_mood_ranking(
+                rows, requester_mood=mood,
+                mood_getter=lambda row: row['id'],
+                base_key='score', reasons_key='reasons',
+            )
+            self.assertEqual(ranked[0]['id'], mood)
+            self.assertEqual(ranked[0]['score'], 82)
+            self.assertEqual(ranked[0]['mood_compatibility'], 100)
+            self.assertIn('You share the same play mood', ranked[0]['reasons'])
+
+    def test_endpoint_uses_selected_mood_to_reorder_persisted_games(self):
+        relaxed_host = User.objects.create_user(
+            username='relaxed-game-host', email='relaxed-game-host@example.com',
+            password='StrongPass!123', latitude=12.972, longitude=77.595,
+        )
+        PlayerProfile.objects.create(
+            user=relaxed_host, matching_mood='relaxed', preferred_play_times=['evening'],
+        )
+        UserSport.objects.create(user=relaxed_host, sport=self.sport, skill_level='intermediate')
+        relaxed_game = Game.objects.create(
+            game_reference='MOOD-GAME-RELAXED', host=relaxed_host, sport=self.sport,
+            venue=self.game.venue, court=self.game.court, game_date=self.game.game_date,
+            start_time=self.game.start_time, end_time=self.game.end_time,
+            starts_at=self.game.starts_at, ends_at=self.game.ends_at,
+            min_players=2, max_players=4, visibility='public', status='open',
+            skill_level='intermediate',
+        )
+        GamePlayer.objects.create(game=relaxed_game, user=relaxed_host)
+
+        relaxed = self.client.get('/api/v1/recommendations/match-my-mood/', {
+            'sport': self.sport.id, 'mood': 'relaxed', 'availability': 'evening',
+        })
+        energetic = self.client.get('/api/v1/recommendations/match-my-mood/', {
+            'sport': self.sport.id, 'mood': 'energetic', 'availability': 'evening',
+        })
+        self.assertEqual(relaxed.status_code, 200)
+        self.assertEqual(energetic.status_code, 200)
+        self.assertEqual(relaxed.data['games'][0]['game']['public_id'], str(relaxed_game.public_id))
+        self.assertEqual(energetic.data['games'][0]['game']['public_id'], str(self.game.public_id))
+        self.assertIn('ranking_formula', relaxed.data)
+
+    def test_missing_host_profile_does_not_break_availability_filter(self):
+        self.host.profile.delete()
+        response = self.client.get('/api/v1/recommendations/match-my-mood/', {
+            'sport': self.sport.id, 'availability': 'evening',
+        })
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.data['games']), 1)
+
+    def test_sport_skill_location_and_availability_filters_compose(self):
+        combined = self.client.get('/api/v1/recommendations/match-my-mood/', {
+            'sport': self.sport.id, 'skill_level': 'intermediate',
+            'availability': 'evening', 'latitude': 12.9716,
+            'longitude': 77.5946, 'radius': 2,
+        })
+        self.assertEqual(combined.status_code, 200)
+        self.assertEqual([row['game']['public_id'] for row in combined.data['games']], [str(self.game.public_id)])
+
+        wrong_sport = self.client.get('/api/v1/recommendations/match-my-mood/', {
+            'sport': Sport.objects.get(name='Tennis').id,
+        })
+        wrong_skill = self.client.get('/api/v1/recommendations/match-my-mood/', {
+            'sport': self.sport.id, 'skill_level': 'advanced',
+        })
+        wrong_time = self.client.get('/api/v1/recommendations/match-my-mood/', {
+            'sport': self.sport.id, 'availability': 'morning',
+        })
+        outside_radius = self.client.get('/api/v1/recommendations/match-my-mood/', {
+            'sport': self.sport.id, 'latitude': 13.5, 'longitude': 77.5, 'radius': 1,
+        })
+        for response in (wrong_sport, wrong_skill, wrong_time, outside_radius):
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(response.data['games'], [])
+
+        invalid_mood = self.client.get('/api/v1/recommendations/match-my-mood/', {'mood': 'competitive'})
+        incomplete_location = self.client.get('/api/v1/recommendations/match-my-mood/', {'latitude': 12.9})
+        self.assertEqual(invalid_mood.status_code, 400)
+        self.assertEqual(incomplete_location.status_code, 400)
 
     def test_blocks_filters_validation_permissions_and_empty(self):
         UserBlock.objects.create(user=self.user, blocked_user=self.host)
@@ -1039,6 +1912,33 @@ class VenueManagementTests(APITestCase):
         self.assertEqual(nearby.status_code, 200)
         self.assertEqual(nearby.data['results'][0]['name'], 'Arena One')
 
+    def test_venue_name_location_filters_and_active_bookable_inventory(self):
+        inactive = Court.objects.create(venue=self.venue, sport=self.sport, name='Closed Court', capacity=4, price_per_hour=250, active=False)
+        by_name = self.client.get('/api/v1/venues/search/', {'q': 'Arena', 'sport': 'badminton'})
+        by_city = self.client.get('/api/v1/venues/search/', {'q': 'Bengaluru', 'latitude': 12.9716, 'longitude': 77.5946, 'radius': 2})
+        no_match = self.client.get('/api/v1/venues/search/', {'q': 'No such venue'})
+        malformed = self.client.get('/api/v1/venues/search/', {'q': 'x' * 121})
+        self.assertEqual(by_name.status_code, 200)
+        self.assertEqual([item['public_id'] for item in by_name.data['results']], [str(self.venue.public_id)])
+        self.assertEqual(by_city.status_code, 200)
+        self.assertEqual(by_city.data['results'][0]['distance_km'], 0)
+        returned_courts=by_city.data['results'][0]['courts']
+        self.assertEqual(len(returned_courts),1)
+        self.assertEqual(returned_courts[0]['name'],self.court.name)
+        self.assertTrue(returned_courts[0]['active'])
+        self.assertEqual(returned_courts[0]['price_per_hour'],'400.00')
+        self.assertEqual(no_match.data['count'], 0)
+        self.assertEqual(malformed.status_code, 400)
+
+    def test_external_ground_catalog_is_never_reported_as_bookable_inventory(self):
+        response = self.client.get('/api/v1/grounds/nearby/', {
+            'latitude': 12.9716, 'longitude': 77.5946, 'radius': 5,
+        })
+        self.assertEqual(response.status_code, 200)
+        for result in response.data.get('results', []):
+            self.assertFalse(result['booking_supported'])
+            self.assertEqual(result['verification_status'], 'external_unverified')
+
     def test_review_eligibility_duplicate_and_deletion_permissions(self):
         completed = CourtBooking.objects.create(user=self.user, court=self.court, starts_at=timezone.now() - timedelta(hours=2), ends_at=timezone.now() - timedelta(hours=1), status='completed')
         cancelled = CourtBooking.objects.create(user=self.user, court=self.court, starts_at=timezone.now(), ends_at=timezone.now() + timedelta(hours=1), status='cancelled')
@@ -1061,93 +1961,6 @@ class VenueManagementTests(APITestCase):
         self.assertEqual(float(self.venue.rating), 0.0)
 
 
-class VenueOwnerOperationsTests(APITestCase):
-    def setUp(self):
-        self.owner = User.objects.create_user(username='venue-ops-owner', email='venue-ops@example.com', password='StrongPass!123')
-        owner_group, _ = Group.objects.get_or_create(name='SportMate Venue Owners')
-        self.owner.groups.add(owner_group)
-        self.other_owner = User.objects.create_user(username='other-venue-owner', email='other-venue@example.com', password='StrongPass!123')
-        self.other_owner.groups.add(owner_group)
-        self.admin = User.objects.create_superuser(username='venue-superowner', email='venue-admin@example.com', password='StrongPass!123')
-        self.sport = Sport.objects.get(name='Badminton')
-        self.venue = Venue.objects.create(
-            owner=self.owner, name='Owner Operations Arena', address='1 Main Road', city='Bengaluru',
-            latitude=12.9716, longitude=77.5946, opening_time='06:00', closing_time='22:00', active=True,
-        )
-        VenueSport.objects.create(venue=self.venue, sport=self.sport)
-        self.court = Court.objects.create(venue=self.venue, sport=self.sport, name='Court O1', capacity=4, price_per_hour=400)
-
-    def test_owner_can_create_pending_venue_and_manage_own_courts(self):
-        self.client.force_authenticate(self.owner)
-        created = self.client.post('/api/v1/venue-owner/venues/', {
-            'name': 'New Owner Ground', 'address': '12 Court Road', 'city': 'Mysuru',
-            'latitude': 12.3, 'longitude': 76.6, 'opening_time': '06:00', 'closing_time': '22:00',
-            'timezone': 'Asia/Kolkata', 'sport_ids': [self.sport.id],
-        }, format='json')
-        self.assertEqual(created.status_code, 201, created.data)
-        self.assertFalse(Venue.objects.get(public_id=created.data['data']['public_id']).active)
-        court = self.client.post(f"/api/v1/venue-owner/venues/{self.venue.public_id}/courts/", {
-            'name': 'Court O2', 'sport_id': self.sport.id, 'capacity': 6, 'price_per_hour': '500.00',
-        }, format='json')
-        self.assertEqual(court.status_code, 201, court.data)
-        deactivated = self.client.delete(f"/api/v1/venue-owner/courts/{court.data['data']['public_id']}/")
-        self.assertEqual(deactivated.status_code, 200)
-        self.assertFalse(Court.objects.get(public_id=court.data['data']['public_id']).active)
-
-    def test_owner_is_scoped_and_cannot_approve_venue(self):
-        self.client.force_authenticate(self.other_owner)
-        self.assertEqual(self.client.get('/api/v1/venue-owner/venues/').status_code, 200)
-        self.assertEqual(self.client.get(f'/api/v1/venue-owner/venues/{self.venue.public_id}/courts/').status_code, 404)
-        pending = Venue.objects.create(
-            owner=self.other_owner, name='Pending Owner Ground', address='12 Court Road', city='Bengaluru',
-            latitude=12.3, longitude=76.6, opening_time='06:00', closing_time='22:00', active=False,
-        )
-        response = self.client.patch(f'/api/v1/venue-owner/venues/{pending.public_id}/', {'active': True}, format='json')
-        self.assertEqual(response.status_code, 400)
-
-    def test_superowner_can_approve_and_transfer_only_to_approved_owner(self):
-        self.client.force_authenticate(self.admin)
-        response = self.client.patch(f'/api/v1/admin/venues/{self.venue.public_id}/', {
-            'active': False, 'owner_id': str(self.other_owner.public_id), 'reason': 'Operator reassignment',
-        }, format='json')
-        self.assertEqual(response.status_code, 200, response.data)
-        self.venue.refresh_from_db()
-        self.assertFalse(self.venue.active)
-        self.assertEqual(self.venue.owner_id, self.other_owner.id)
-        pending = User.objects.create_user(username='not-approved-owner', email='not-approved@example.com', password='StrongPass!123')
-        denied = self.client.patch(f'/api/v1/admin/venues/{self.venue.public_id}/', {'owner_id': str(pending.public_id)}, format='json')
-        self.assertEqual(denied.status_code, 400)
-
-    def test_owner_can_read_bookings_and_manage_future_maintenance_periods(self):
-        self.client.force_authenticate(self.owner)
-        now = timezone.now()
-        booking = CourtBooking.objects.create(
-            user=self.other_owner, court=self.court, venue=self.venue,
-            booking_date=timezone.localdate() + timedelta(days=2),
-            starts_at=now + timedelta(days=2), ends_at=now + timedelta(days=2, hours=1),
-            status=CourtBooking.Status.CONFIRMED,
-        )
-        bookings = self.client.get('/api/v1/venue-owner/bookings/')
-        self.assertEqual(bookings.status_code, 200)
-        self.assertEqual(bookings.data['data'][0]['public_id'], str(booking.public_id))
-
-        starts = now + timedelta(days=3)
-        ends = starts + timedelta(hours=1)
-        created = self.client.post(
-            f'/api/v1/venue-owner/venues/{self.venue.public_id}/courts/{self.court.public_id}/blocked-periods/',
-            {'starts_at': starts.isoformat(), 'ends_at': ends.isoformat(), 'type': 'maintenance', 'reason': 'Court resurfacing'},
-            format='json',
-        )
-        self.assertEqual(created.status_code, 201, created.data)
-        listed = self.client.get(f'/api/v1/venue-owner/venues/{self.venue.public_id}/courts/{self.court.public_id}/blocked-periods/')
-        self.assertEqual(listed.status_code, 200)
-        self.assertEqual(len(listed.data['data']), 1)
-        removed = self.client.delete(f"/api/v1/venue-owner/blocked-periods/{created.data['data']['public_id']}/")
-        self.assertEqual(removed.status_code, 204)
-
-    def test_non_owner_cannot_read_owner_dashboard(self):
-        self.client.force_authenticate(User.objects.create_user(username='regular-player', password='StrongPass!123'))
-        self.assertEqual(self.client.get('/api/v1/venue-owner/dashboard/').status_code, 403)
 
 
 class VenueAvailabilityTests(APITestCase):
@@ -1180,6 +1993,33 @@ class VenueAvailabilityTests(APITestCase):
         self.assertTrue(all(slot['status'] == 'available' for slot in slots))
         self.assertEqual(response.data['timezone'], 'Asia/Kolkata')
 
+    def test_availability_accepts_returned_public_filters_duration_and_legacy_ids(self):
+        public_filter = self.slots(sport=self.sport.slug, court=str(self.court.public_id), duration=30)
+        self.assertEqual(public_filter.status_code, 200)
+        self.assertEqual(len(public_filter.data['slots']), 6)
+        self.assertTrue(all(str(slot['court']['id']) == str(self.court.public_id) for slot in public_filter.data['slots']))
+        self.assertEqual(str(public_filter.data['slots'][0]['price']), '300.00')
+
+        legacy_filter = self.slots(sport=str(self.sport.pk), court=str(self.court.pk), duration=120)
+        self.assertEqual(legacy_filter.status_code, 200)
+        self.assertEqual(len(legacy_filter.data['slots']), 1)
+
+    def test_elapsed_same_day_slots_are_closed_and_rejected_at_booking(self):
+        today = timezone.localdate()
+        simulated_now = timezone.make_aware(datetime.combine(today, time(10, 15)), ZoneInfo('Asia/Kolkata'))
+        with patch('my_app.services.availability.timezone.now', return_value=simulated_now):
+            slots = self.client.get(f'/api/v1/venues/{self.venue.public_id}/availability/', {
+                'date': today.isoformat(), 'court': str(self.court.public_id), 'duration': 60,
+            })
+            self.assertEqual(slots.status_code, 200)
+            self.assertEqual([item['status'] for item in slots.data['slots']], ['closed', 'closed', 'available'])
+            booking = self.client.post('/api/v1/bookings/', {
+                'venue_id': str(self.venue.public_id), 'court_id': str(self.court.public_id),
+                'booking_date': today.isoformat(), 'start_time': '09:00', 'end_time': '10:00',
+            }, format='json')
+        self.assertEqual(booking.status_code, 400)
+        self.assertFalse(CourtBooking.objects.exists())
+
     def test_booked_overlap_adjacent_and_blocked_statuses(self):
         CourtBooking.objects.create(user=self.user, court=self.court, starts_at=self.open_at + timedelta(minutes=30), ends_at=self.open_at + timedelta(minutes=90), status='confirmed')
         CourtBlockedPeriod.objects.create(court=self.court, starts_at=self.open_at + timedelta(hours=2), ends_at=self.open_at + timedelta(hours=3), type='maintenance')
@@ -1192,13 +2032,28 @@ class VenueAvailabilityTests(APITestCase):
         }, format='json')
         self.assertEqual(booking.status_code, 201)
 
+        blocked_court = Court.objects.create(venue=self.venue, sport=self.sport, name='Blocked Court', capacity=4, price_per_hour=600)
+        CourtBlockedPeriod.objects.create(
+            court=blocked_court, starts_at=self.open_at, ends_at=self.open_at+timedelta(hours=1),
+            type=CourtBlockedPeriod.Type.BLOCKED,
+        )
+        blocked_slots = self.slots(court=str(blocked_court.public_id)).data['slots']
+        self.assertEqual(blocked_slots[0]['status'], 'blocked')
+
     def test_invalid_duration_closed_venue_and_transactional_conflict(self):
         invalid = self.slots(duration=45)
         self.assertEqual(invalid.status_code, 400)
         self.venue.active = False
         self.venue.save()
         closed = self.slots()
+        self.assertEqual(closed.status_code, 200)
         self.assertTrue(all(slot['status'] == 'closed' for slot in closed.data['slots']))
+        rejected = self.client.post('/api/v1/bookings/', {
+            'venue_id': str(self.venue.public_id), 'court_id': str(self.court.public_id),
+            'booking_date': self.date.isoformat(), 'start_time': '09:00', 'end_time': '10:00',
+        }, format='json')
+        self.assertEqual(rejected.status_code, 400)
+        self.assertFalse(CourtBooking.objects.filter(venue=self.venue).exists())
         self.venue.active = True
         self.venue.save()
         first = self.client.post('/api/v1/bookings/', {
@@ -1210,15 +2065,28 @@ class VenueAvailabilityTests(APITestCase):
         self.assertEqual(first.status_code, 201)
         self.assertEqual(second.status_code, 409)
 
+    def test_unknown_or_demo_venue_does_not_return_availability(self):
+        missing = self.client.get(f'/api/v1/venues/00000000-0000-0000-0000-000000000000/availability/', {
+            'date': self.date.isoformat(), 'duration': 60,
+        })
+        self.assertEqual(missing.status_code, 404)
+        self.venue.is_demo = True
+        self.venue.save(update_fields=['is_demo', 'updated_at'])
+        demo = self.slots()
+        self.assertEqual(demo.status_code, 404)
+
 
 class BookingEngineTests(APITestCase):
     def setUp(self):
+        # ScopedRateThrottle keys can otherwise leak across isolated API test
+        # users when the test runner reuses their auto-incremented IDs.
+        cache.clear()
         self.user = User.objects.create_user(username='booker', email='booker@example.com', password='StrongPass!123')
         self.other = User.objects.create_user(username='booker-other', email='booker-other@example.com', password='StrongPass!123')
         PlayerProfile.objects.create(user=self.user)
         PlayerProfile.objects.create(user=self.other)
         sport = Sport.objects.get(name='Badminton')
-        self.venue = Venue.objects.create(name='Booking Arena', address='3 Road', city='Bengaluru', latitude=12.97, longitude=77.59, opening_time='09:00', closing_time='20:00')
+        self.venue = Venue.objects.create(name='Booking Arena', address='3 Road', city='Bengaluru', latitude=12.97, longitude=77.59, opening_time='09:00', closing_time='20:00', owner=self.other)
         self.court = Court.objects.create(venue=self.venue, sport=sport, name='Booking Court', capacity=4, price_per_hour=500)
         self.other_venue = Venue.objects.create(name='Other Arena', address='4 Road', city='Bengaluru', latitude=12.98, longitude=77.60, opening_time='09:00', closing_time='20:00')
         self.other_court = Court.objects.create(venue=self.other_venue, sport=sport, name='Other Court', capacity=4, price_per_hour=500)
@@ -1237,8 +2105,14 @@ class BookingEngineTests(APITestCase):
         response = self.create(final_amount='1')
         self.assertEqual(response.status_code, 201)
         data = response.data['data']
+        duplicate = self.create()
+        self.assertEqual(duplicate.status_code, 201)
+        self.assertEqual(duplicate.data['data']['public_id'], data['public_id'])
+        self.assertEqual(CourtBooking.objects.filter(user=self.user, court=self.court).count(), 1)
         self.assertEqual(str(data['final_amount']), '500.00')
         self.assertTrue(data['booking_reference'].startswith('SM-'))
+        self.assertTrue(Notification.objects.filter(user=self.user,type='booking_created',data__booking_id=data['public_id']).exists())
+        self.assertTrue(Notification.objects.filter(user=self.other,type='booking_created',data__booking_id=data['public_id']).exists())
         self.client.force_authenticate(self.other)
         self.assertEqual(self.client.get(f"/api/v1/bookings/{data['public_id']}/").status_code, 404)
 
@@ -1277,6 +2151,7 @@ class BookingEngineTests(APITestCase):
         self.client.force_authenticate(self.user)
         cancelled = self.client.post(f"/api/v1/bookings/{first.data['data']['public_id']}/cancel/", {'reason': 'Plans changed'}, format='json')
         self.assertEqual(cancelled.status_code, 200)
+        self.assertTrue(Notification.objects.filter(user=self.other,type='booking_cancelled',data__booking_id=first.data['data']['public_id']).exists())
         self.client.force_authenticate(self.other)
         reuse = self.client.post('/api/v1/bookings/', self.payload(), format='json')
         self.assertEqual(reuse.status_code, 201)
@@ -1314,6 +2189,58 @@ class BookingEngineTests(APITestCase):
         self.assertEqual(upcoming_rows, [])
         self.assertEqual(len(past_rows), 1)
         self.assertEqual(len(cancelled_rows), 1)
+
+
+class BookingConcurrencyTests(TransactionTestCase):
+    reset_sequences = True
+
+    def setUp(self):
+        cache.clear()
+        sport = Sport.objects.get(name='Badminton')
+        self.venue = Venue.objects.create(
+            name='Concurrent Arena', address='Race Road', city='Bengaluru',
+            latitude=12.9716, longitude=77.5946,
+            opening_time='09:00', closing_time='20:00',
+        )
+        self.court = Court.objects.create(
+            venue=self.venue, sport=sport, name='Race Court', capacity=4,
+            price_per_hour=500,
+        )
+        self.users = [
+            User.objects.create_user(username=f'racer-{i}', email=f'racer-{i}@example.com', password='StrongPass!123')
+            for i in range(2)
+        ]
+        self.booking_date = timezone.localdate() + timedelta(days=3)
+
+    def test_simultaneous_players_cannot_book_the_same_court_slot(self):
+        barrier = Barrier(2)
+
+        def attempt(user_id):
+            from django.db import close_old_connections, connections
+            close_old_connections()
+            try:
+                user = User.objects.get(pk=user_id)
+                barrier.wait(timeout=5)
+                booking = BookingService.create(
+                    user=user,
+                    venue_id=self.venue.public_id,
+                    court_id=self.court.public_id,
+                    booking_date=self.booking_date,
+                    start_time=time(10),
+                    end_time=time(11),
+                )
+                return ('created', booking.pk)
+            except BookingConflict:
+                return ('conflict', None)
+            finally:
+                connections.close_all()
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            results = list(executor.map(attempt, [user.pk for user in self.users]))
+
+        self.assertEqual(sum(result[0] == 'created' for result in results), 1, results)
+        self.assertEqual(sum(result[0] == 'conflict' for result in results), 1, results)
+        self.assertEqual(CourtBooking.objects.filter(court=self.court).count(), 1)
 
 
 class GameApiTests(APITestCase):
@@ -1374,6 +2301,55 @@ class GameApiTests(APITestCase):
         self.assertEqual(cancelled.status_code, 200)
         self.assertEqual(cancelled.data['status'], Game.Status.CANCELLED)
 
+    def test_only_host_can_remove_active_player_and_history_and_chat_membership_are_preserved(self):
+        created = self.create_game()
+        game_id = created.data['data']['public_id']
+        self.client.force_authenticate(self.player)
+        self.assertEqual(self.client.post(f'/api/v1/games/{game_id}/join/').status_code, 200)
+        self.assertEqual(ConversationMember.objects.filter(conversation__game__public_id=game_id, user=self.player, is_active=True).count(), 1)
+        denied = self.client.post(f'/api/v1/games/{game_id}/players/{self.player.id}/remove/')
+        self.assertEqual(denied.status_code, 403)
+        self.client.force_authenticate(self.host)
+        removed = self.client.post(f'/api/v1/games/{game_id}/players/{self.player.id}/remove/', {'reason': 'Schedule changed'}, format='json')
+        self.assertEqual(removed.status_code, 200)
+        membership = GamePlayer.objects.get(game__public_id=game_id, user=self.player)
+        self.assertEqual(membership.status, GamePlayer.Status.REMOVED)
+        self.assertIsNotNone(membership.left_at)
+        self.assertEqual(Game.objects.get(public_id=game_id).game_players.filter(status=GamePlayer.Status.CONFIRMED).count(), 1)
+        self.assertFalse(ConversationMember.objects.filter(conversation__game__public_id=game_id, user=self.player, is_active=True).exists())
+        self.assertEqual(self.player.notifications.filter(title='Removed from game').count(), 1)
+        self.assertTrue(Message.objects.filter(conversation__game__public_id=game_id, message_type=Message.Type.SYSTEM, content__contains='removed').exists())
+
+    def test_game_remove_rejects_completed_game_and_inactive_member(self):
+        created = self.create_game()
+        game_id = created.data['data']['public_id']
+        self.assertEqual(self.client.post(f'/api/v1/games/{game_id}/players/{self.player.id}/remove/').status_code, 409)
+        Game.objects.filter(public_id=game_id).update(
+            status=Game.Status.COMPLETED,
+            starts_at=timezone.now() - timedelta(hours=2),
+            ends_at=timezone.now() - timedelta(hours=1),
+        )
+        self.assertEqual(self.client.post(f'/api/v1/games/{game_id}/players/{self.other.id}/remove/').status_code, 409)
+
+    def test_host_can_edit_and_cancel_game_but_participant_cannot(self):
+        created = self.create_game()
+        game_id = created.data['data']['public_id']
+        self.client.force_authenticate(self.player)
+        self.client.post(f'/api/v1/games/{game_id}/join/')
+        denied_edit = self.client.patch(f'/api/v1/games/{game_id}/', {'description': 'unauthorized'}, format='json')
+        denied_cancel = self.client.delete(f'/api/v1/games/{game_id}/')
+        self.assertEqual(denied_edit.status_code, 403)
+        self.assertEqual(denied_cancel.status_code, 403)
+        self.client.force_authenticate(self.host)
+        updated = self.client.patch(f'/api/v1/games/{game_id}/', {'description': 'New meeting point'}, format='json')
+        self.assertEqual(updated.status_code, 200)
+        self.assertEqual(updated.data['data']['description'], 'New meeting point')
+        self.assertEqual(self.player.notifications.filter(title='Game details updated').count(), 1)
+        cancelled = self.client.delete(f'/api/v1/games/{game_id}/')
+        self.assertEqual(cancelled.status_code, 204)
+        self.assertEqual(Game.objects.get(public_id=game_id).status, Game.Status.CANCELLED)
+        self.assertEqual(self.player.notifications.filter(title='Game cancelled').count(), 1)
+
     def test_private_visibility_and_player_privacy(self):
         created = self.create_game(visibility='private')
         game_id = created.data['data']['public_id']
@@ -1421,6 +2397,15 @@ class PlayerRatingApiTests(APITestCase):
         self.assertEqual(summary.data['data']['rating_count'], 1)
         self.assertEqual(summary.data['data']['teamwork'], 4.0)
 
+    def test_rating_uses_equal_weight_categories_and_rounds_half_up_on_create_and_edit(self):
+        url = f'/api/v1/players/{self.player.public_id}/ratings/'
+        created = self.client.post(url, self.payload(playing_performance=3, teamwork=3, sportsmanship=3, punctuality=4), format='json')
+        self.assertEqual(created.status_code, 201)
+        self.assertEqual(float(created.data['data']['rating']), 3.3)
+        edited = self.client.patch(f"/api/v1/ratings/{created.data['data']['public_id']}/", {'playing_performance': 3, 'teamwork': 3, 'sportsmanship': 3, 'punctuality': 4}, format='json')
+        self.assertEqual(edited.status_code, 200)
+        self.assertEqual(float(edited.data['data']['rating']), 3.3)
+
     def test_self_outsider_and_invalid_score_are_rejected(self):
         self.assertEqual(self.client.post(f'/api/v1/players/{self.reviewer.public_id}/ratings/', self.payload(), format='json').status_code, 400)
         self.client.force_authenticate(self.outsider)
@@ -1433,6 +2418,40 @@ class PlayerRatingApiTests(APITestCase):
         self.game.save(update_fields=['status', 'updated_at'])
         response = self.client.post(f'/api/v1/players/{self.player.public_id}/ratings/', self.payload(), format='json')
         self.assertEqual(response.status_code, 403)
+
+    def test_left_or_removed_participant_cannot_rate_and_completed_game_stats_are_truthful(self):
+        GamePlayer.objects.filter(game=self.game, user=self.player).update(status=GamePlayer.Status.LEFT, left_at=timezone.now())
+        response = self.client.post(f'/api/v1/players/{self.player.public_id}/ratings/', self.payload(), format='json')
+        self.assertEqual(response.status_code, 403)
+        stats = self.client.get(f'/api/v1/players/{self.reviewer.public_id}/statistics/').data['data']
+        self.assertEqual(stats['games_played'], 1)
+        # Game has no persisted score/result, so these must not be fabricated.
+        self.assertIsNone(stats['games_won'])
+        self.assertIsNone(stats['games_lost'])
+        self.assertIsNone(stats['games_drawn'])
+        self.assertIsNone(stats['win_rate'])
+        self.assertEqual(stats['events_participated'], 0)
+
+    def test_soft_deleted_rating_remains_single_submission_but_not_in_aggregate(self):
+        player_url = f'/api/v1/players/{self.player.public_id}/ratings/'
+        created = self.client.post(player_url, self.payload(), format='json')
+        self.assertEqual(created.status_code, 201)
+        rating_id = created.data['data']['public_id']
+        self.assertEqual(self.client.delete(f'/api/v1/ratings/{rating_id}/').status_code, 204)
+        eligibility = self.client.get(f'/api/v1/players/{self.player.public_id}/rating-eligibility/').data['data']
+        self.assertTrue(eligibility[0]['already_rated'])
+        self.assertEqual(self.client.post(player_url, self.payload(), format='json').status_code, 400)
+        summary = self.client.get(f'/api/v1/players/{self.player.public_id}/rating-summary/').data['data']
+        self.assertEqual(summary['rating_count'], 0)
+
+    def test_game_history_is_scoped_to_authenticated_membership(self):
+        response = self.client.get('/api/v1/games/history/')
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual([row['public_id'] for row in response.data['results']], [str(self.game.public_id)])
+        self.client.force_authenticate(self.outsider)
+        outsider_history = self.client.get('/api/v1/games/history/')
+        self.assertEqual(outsider_history.status_code, 200)
+        self.assertEqual(outsider_history.data['results'], [])
 
 
 class MatchReflectionApiTests(APITestCase):
@@ -1594,7 +2613,7 @@ class ConversationChatTests(APITestCase):
         self.client.force_authenticate(self.other)
         listed = self.client.get(f'/api/v1/conversations/{conversation_id}/messages/')
         self.assertEqual(listed.status_code, 200)
-        self.assertEqual(listed.data['count'], 1)
+        self.assertEqual(len(listed.data['results']), 1)
         self.assertEqual(self.client.post(f'/api/v1/conversations/{conversation_id}/read/').status_code, 200)
         self.client.force_authenticate(self.user)
         edited = self.client.patch(f'/api/v1/messages/{message_id}/', {'content': 'Updated plan'}, format='json')
@@ -1624,6 +2643,56 @@ class ConversationChatTests(APITestCase):
         self.client.post(f'/api/v1/conversations/{conversation_id}/read/')
         self.assertEqual(self.client.get('/api/v1/messages/unread/').data['unread'], 0)
 
+    def test_conversation_directory_paginates_and_orders_by_latest_message(self):
+        first = self.create_direct()
+        first_id = first.data['data']['public_id']
+        for index in range(21):
+            peer = User.objects.create_user(
+                username=f'chat-peer-{index}', email=f'chat-peer-{index}@example.com',
+                password='StrongPass!123',
+            )
+            conversation = Conversation.objects.create(
+                conversation_type=Conversation.Type.ONE_TO_ONE,
+                participant_one=min(self.user, peer, key=lambda user: user.pk),
+                participant_two=max(self.user, peer, key=lambda user: user.pk),
+            )
+            ConversationMember.objects.create(conversation=conversation, user=self.user)
+            ConversationMember.objects.create(conversation=conversation, user=peer)
+        self.client.post(
+            f'/api/v1/conversations/{first_id}/messages/',
+            {'content': 'This conversation was updated most recently.'}, format='json',
+        )
+
+        first_page = self.client.get('/api/v1/conversations/?page=1&page_size=20')
+        second_page = self.client.get('/api/v1/conversations/?page=2&page_size=20')
+
+        self.assertEqual(first_page.status_code, 200)
+        self.assertEqual(first_page.data['count'], 22)
+        self.assertEqual(first_page.data['results'][0]['public_id'], first_id)
+        self.assertIsNotNone(first_page.data['next'])
+        self.assertEqual(second_page.status_code, 200)
+        self.assertEqual(len(first_page.data['results']) + len(second_page.data['results']), 22)
+
+    def test_staff_cannot_access_message_actions_without_conversation_membership(self):
+        conversation_id = self.create_direct().data['data']['public_id']
+        message = self.client.post(
+            f'/api/v1/conversations/{conversation_id}/messages/',
+            {'content': 'Private message'}, format='json',
+        ).data['data']
+        staff = User.objects.create_user(
+            username='chat-staff', email='chat-staff@example.com', password='StrongPass!123',
+            is_staff=True,
+        )
+        self.client.force_authenticate(staff)
+
+        response = self.client.patch(
+            f"/api/v1/messages/{message['public_id']}/",
+            {'content': 'Unauthorized edit'}, format='json',
+        )
+
+        self.assertEqual(response.status_code, 403)
+        self.assertEqual(Message.objects.get(public_id=message['public_id']).content, 'Private message')
+
     def test_permissions_validation_and_blocking(self):
         created = self.create_direct()
         conversation_id = created.data['data']['public_id']
@@ -1636,6 +2705,56 @@ class ConversationChatTests(APITestCase):
         UserBlock.objects.create(user=self.user, blocked_user=self.other)
         blocked = self.client.post('/api/v1/conversations/', {'type': 'ONE_TO_ONE', 'user_id': self.other.id}, format='json')
         self.assertEqual(blocked.status_code, 403)
+
+    def test_idempotent_retry_and_cursor_history_preserve_order(self):
+        conversation_id = self.create_direct().data['data']['public_id']
+        retry_id = 'd6ddcc40-7050-4af6-9e98-2427a179ce30'
+        first = self.client.post(
+            f'/api/v1/conversations/{conversation_id}/messages/',
+            {'content': 'first', 'client_message_id': retry_id}, format='json',
+        )
+        retry = self.client.post(
+            f'/api/v1/conversations/{conversation_id}/messages/',
+            {'content': 'first', 'client_message_id': retry_id}, format='json',
+        )
+        self.assertEqual(first.status_code, 201)
+        self.assertEqual(retry.status_code, 201)
+        self.assertEqual(first.data['data']['public_id'], retry.data['data']['public_id'])
+        for content in ('second', 'third', 'fourth'):
+            self.client.post(f'/api/v1/conversations/{conversation_id}/messages/', {'content': content}, format='json')
+        latest = self.client.get(f'/api/v1/conversations/{conversation_id}/messages/?page_size=2')
+        self.assertEqual([row['content'] for row in latest.data['results']], ['fourth', 'third'])
+        older = self.client.get(
+            f"/api/v1/conversations/{conversation_id}/messages/?page_size=2&before={latest.data['next_cursor']}"
+        )
+        self.assertEqual([row['content'] for row in older.data['results']], ['second', 'first'])
+        invalid_cursor = self.client.get(f'/api/v1/conversations/{conversation_id}/messages/?before=not-a-uuid')
+        self.assertEqual(invalid_cursor.status_code, 400)
+        self.assertEqual(Message.objects.filter(conversation__public_id=conversation_id).count(), 4)
+        self.assertEqual(Notification.objects.filter(user=self.other, type='message').count(), 4)
+
+    def test_legacy_message_routes_are_scoped_validated_and_block_aware(self):
+        self.client.force_authenticate(self.other)
+        Message.objects.create(sender=self.outsider, receiver=self.other, content='Private legacy note')
+        self.client.force_authenticate(self.user)
+        own_thread = self.client.get(f'/api/v1/messages/{self.other.id}/')
+        other_thread = self.client.get(f'/api/v1/messages/{self.outsider.id}/')
+        self.assertEqual(own_thread.status_code, 200)
+        self.assertEqual(len(own_thread.data['results']), 0)
+        self.assertEqual(other_thread.status_code, 200)
+        self.assertEqual(len(other_thread.data['results']), 0)
+        empty = self.client.post('/api/v1/messages/', {'receiver': self.other.id, 'content': '   '}, format='json')
+        self.assertEqual(empty.status_code, 400)
+        self.assertEqual(self.client.post('/api/v1/messages/', {'receiver': self.user.id, 'content': 'Hello'}, format='json').status_code, 400)
+        UserBlock.objects.create(user=self.user, blocked_user=self.other)
+        blocked = self.client.post('/api/v1/messages/', {'receiver': self.other.id, 'content': 'Hello'}, format='json')
+        self.assertEqual(blocked.status_code, 403)
+
+    def test_expired_authentication_cannot_read_messages(self):
+        conversation_id = self.create_direct().data['data']['public_id']
+        self.client.force_authenticate(user=None)
+        response = self.client.get(f'/api/v1/conversations/{conversation_id}/messages/')
+        self.assertEqual(response.status_code, 401)
 
     def test_game_conversation_only_allows_confirmed_players(self):
         sport = Sport.objects.get(name='Badminton')
@@ -1653,6 +2772,34 @@ class ConversationChatTests(APITestCase):
         self.client.force_authenticate(self.other)
         sent = self.client.post(f'/api/v1/conversations/{conversation_id}/messages/', {'content': 'I will be there.'}, format='json')
         self.assertEqual(sent.status_code, 201)
+        self.client.force_authenticate(self.other)
+        left = self.client.post(f'/api/v1/games/{game.public_id}/leave/')
+        self.assertEqual(left.status_code, 200)
+        denied_after_leave = self.client.get(f'/api/v1/conversations/{conversation_id}/messages/')
+        self.assertEqual(denied_after_leave.status_code, 403)
+        self.assertEqual(Message.objects.filter(conversation__public_id=conversation_id).count(), 2)
+        self.assertTrue(Message.objects.filter(conversation__public_id=conversation_id, content='I will be there.').exists())
+
+    def test_cancelled_game_chat_keeps_history_readable_but_rejects_new_messages(self):
+        sport = Sport.objects.get(name='Badminton')
+        venue = Venue.objects.create(name='Cancelled Chat Arena', address='8 Road', city='Bengaluru', latitude=12.97, longitude=77.59, opening_time='09:00', closing_time='20:00')
+        court = Court.objects.create(venue=venue, sport=sport, name='Cancelled Chat Court', capacity=4, price_per_hour=500)
+        starts = timezone.now() + timedelta(days=2)
+        game = Game.objects.create(game_reference='GM-CHAT-CANCEL', host=self.user, sport=sport, venue=venue, court=court, game_date=timezone.localdate() + timedelta(days=2), start_time='10:00', end_time='11:00', starts_at=starts, ends_at=starts + timedelta(hours=1), min_players=2, max_players=4)
+        GamePlayer.objects.create(game=game, user=self.user)
+        GamePlayer.objects.create(game=game, user=self.other)
+        group = self.client.post('/api/v1/conversations/', {'type': 'GAME_GROUP', 'game_id': str(game.public_id)}, format='json')
+        conversation_id = group.data['data']['public_id']
+        self.client.force_authenticate(self.other)
+        self.client.post(f'/api/v1/conversations/{conversation_id}/messages/', {'content': 'Original history'}, format='json')
+        self.client.force_authenticate(self.user)
+        self.assertEqual(self.client.delete(f'/api/v1/games/{game.public_id}/').status_code, 204)
+        self.client.force_authenticate(self.other)
+        history = self.client.get(f'/api/v1/conversations/{conversation_id}/messages/')
+        self.assertEqual(history.status_code, 200)
+        self.assertTrue(any(item['content'] == 'Original history' for item in history.data['results']))
+        denied_send = self.client.post(f'/api/v1/conversations/{conversation_id}/messages/', {'content': 'After cancellation'}, format='json')
+        self.assertEqual(denied_send.status_code, 400)
 
 
 class MatchTimePollApiTests(APITestCase):
@@ -1721,6 +2868,12 @@ class MatchTimePollApiTests(APITestCase):
     def test_deadline_expiry_and_conflicting_schedule_leave_poll_open(self):
         expired = self.create_poll(deadline=timezone.now()-timedelta(minutes=1))
         self.assertEqual(expired.status_code, 400)
+        deadline = timezone.now() + timedelta(days=1)
+        before_deadline = self.create_poll(
+            deadline=deadline,
+            options=self.options(deadline - timedelta(minutes=1), timezone.now()+timedelta(days=12)),
+        )
+        self.assertEqual(before_deadline.status_code, 400)
         created = self.create_poll()
         poll_id, options = created.data['data']['public_id'], created.data['data']['options']
         self.client.force_authenticate(self.player)
@@ -1728,9 +2881,51 @@ class MatchTimePollApiTests(APITestCase):
         conflicting_start = options[0]['starts_at']
         Match.objects.create(sport=self.sport, ground=self.ground, organizer=self.other, date_time=conflicting_start, end_date_time=conflicting_start+timedelta(hours=2), total_players=2)
         self.client.force_authenticate(self.organizer)
-        conflict = self.client.post(f'/api/v1/match-time-polls/{poll_id}/finalize/', {'option_id': options[0]['public_id']}, format='json')
+        conflict = self.client.post(f'/api/v1/match-time-polls/{poll_id}/finalize/', {}, format='json')
         self.assertEqual(conflict.status_code, 400)
         self.assertEqual(MatchTimePoll.objects.get(public_id=poll_id).status, MatchTimePoll.Status.OPEN)
+
+    def test_insufficient_votes_and_cancelled_match_close_poll_and_reject_votes(self):
+        created = self.create_poll()
+        poll_id = created.data['data']['public_id']
+        option_id = created.data['data']['options'][0]['public_id']
+        self.client.force_authenticate(self.organizer)
+        insufficient = self.client.post(f'/api/v1/match-time-polls/{poll_id}/finalize/', {}, format='json')
+        self.assertEqual(insufficient.status_code, 400)
+        self.assertEqual(MatchTimePoll.objects.get(public_id=poll_id).status, MatchTimePoll.Status.OPEN)
+
+        cancelled = self.client.post(f'/api/v1/matches/{self.match.id}/cancel/', {}, format='json')
+        self.assertEqual(cancelled.status_code, 200)
+        poll = MatchTimePoll.objects.get(public_id=poll_id)
+        self.assertEqual(poll.status, MatchTimePoll.Status.CLOSED)
+        self.assertEqual(poll.votes.count(), 0)
+        self.client.force_authenticate(self.player)
+        late_vote = self.client.post(f'/api/v1/match-time-polls/{poll_id}/vote/', {'option_id': option_id}, format='json')
+        self.assertEqual(late_vote.status_code, 400)
+
+    def test_finalization_rejects_an_option_that_has_passed(self):
+        created = self.create_poll(options=self.options(
+            timezone.now()+timedelta(days=2), timezone.now()+timedelta(days=3),
+        ))
+        poll_id, option = created.data['data']['public_id'], created.data['data']['options'][0]
+        self.client.force_authenticate(self.player)
+        self.client.post(f'/api/v1/match-time-polls/{poll_id}/vote/', {'option_id': option['public_id']}, format='json')
+        self.client.force_authenticate(self.organizer)
+        with patch('my_app.services.match_time_polls.timezone.now', return_value=timezone.now()+timedelta(days=5)):
+            response = self.client.post(f'/api/v1/match-time-polls/{poll_id}/finalize/', {}, format='json')
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(MatchTimePoll.objects.get(public_id=poll_id).status, MatchTimePoll.Status.OPEN)
+
+    def test_expired_poll_disables_voting_but_keeps_results_available_to_finalize(self):
+        created = self.create_poll()
+        poll_id = created.data['data']['public_id']
+        self.client.force_authenticate(self.player)
+        self.client.post(f'/api/v1/match-time-polls/{poll_id}/vote/', {'option_id': created.data['data']['options'][0]['public_id']}, format='json')
+        poll = MatchTimePoll.objects.get(public_id=poll_id)
+        with patch('my_app.services.match_time_polls.timezone.now', return_value=poll.deadline+timedelta(minutes=1)):
+            state = MatchTimePollService.serialize(poll, user=self.organizer)
+        self.assertEqual(state['status'], MatchTimePoll.Status.OPEN)
+        self.assertFalse(state['voting_open'])
 
 
 class CommunityApiTests(APITestCase):
@@ -1758,7 +2953,11 @@ class CommunityApiTests(APITestCase):
         self.assertEqual(community.member_count, 1)
         self.assertEqual(community.members.get(user=self.owner).role, CommunityMember.Role.OWNER)
         self.client.force_authenticate(self.member)
-        self.assertTrue(self.client.post(f'/api/v1/communities/{community_id}/join/').data['joined'])
+        joined = self.client.post(f'/api/v1/communities/{community_id}/join/')
+        self.assertTrue(joined.data['joined'])
+        self.assertEqual(Community.objects.get(public_id=community_id).member_count, 2)
+        duplicate_join = self.client.post(f'/api/v1/communities/{community_id}/join/')
+        self.assertFalse(duplicate_join.data['changed'])
         post = self.client.post(f'/api/v1/communities/{community_id}/posts/', {'content': 'Looking for an evening game.'}, format='json')
         self.assertEqual(post.status_code, 201)
         post_id = post.data['data']['public_id']
@@ -1769,6 +2968,8 @@ class CommunityApiTests(APITestCase):
         self.assertEqual(like.status_code, 201)
         self.assertEqual(duplicate.status_code, 200)
         self.assertEqual(CommunityPostLike.objects.count(), 1)
+        self.client.post(f'/api/v1/communities/{community_id}/leave/')
+        self.assertEqual(Community.objects.get(public_id=community_id).member_count, 1)
 
     def test_community_update_and_owner_only_archive_preserve_record(self):
         created = self.create(is_club=False)
@@ -1789,8 +2990,13 @@ class CommunityApiTests(APITestCase):
         club_id = created.data['data']['public_id']
         self.client.force_authenticate(self.member)
         detail = self.client.get(f'/api/v1/communities/{club_id}/')
-        self.assertEqual(detail.status_code, 403)
-        self.assertFalse(Community.objects.filter(is_club=True, members__user=self.member, members__status=CommunityMember.Status.ACTIVE).exists())
+        self.assertEqual(detail.status_code, 200)
+        self.assertIsNone(detail.data['data']['member_role'])
+        self.assertEqual(self.client.get(f'/api/v1/communities/{club_id}/members/').status_code, 403)
+        self.assertTrue(self.client.post(f'/api/v1/communities/{club_id}/join/').data['joined'])
+        self.assertEqual(self.client.get(f'/api/v1/communities/{club_id}/').data['data']['member_count'], 2)
+        self.assertEqual(self.client.get(f'/api/v1/communities/{club_id}/members/').status_code, 200)
+        self.assertTrue(Community.objects.filter(is_club=True, members__user=self.member, members__status=CommunityMember.Status.ACTIVE).exists())
         self.client.force_authenticate(self.owner)
         detail = self.client.get(f'/api/v1/communities/{club_id}/')
         self.assertEqual(detail.status_code, 200)
@@ -1811,6 +3017,63 @@ class CommunityApiTests(APITestCase):
         self.assertEqual(banned.status_code, 200)
         self.client.force_authenticate(self.member)
         self.assertEqual(self.client.post(f'/api/v1/communities/{community_id}/join/').status_code, 403)
+
+    def test_closed_or_inactive_clubs_reject_new_members_and_filters_validate(self):
+        closed = self.create(name='Closed club', is_club=True, membership_open=False)
+        club_id = closed.data['data']['public_id']
+        self.client.force_authenticate(self.member)
+        response = self.client.post(f'/api/v1/communities/{club_id}/join/')
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(Community.objects.get(public_id=club_id).member_count, 1)
+        self.client.force_authenticate(self.owner)
+        self.client.delete(f'/api/v1/communities/{club_id}/')
+        self.client.force_authenticate(self.member)
+        self.assertEqual(self.client.post(f'/api/v1/communities/{club_id}/join/').status_code, 400)
+        self.assertEqual(self.client.get('/api/v1/communities/?sport=not-a-number').status_code, 400)
+        self.assertEqual(self.client.get('/api/v1/communities/?clubs=true&communities=true').status_code, 400)
+
+    def test_club_discovery_filters_by_sport_and_city(self):
+        created = self.create(is_club=True, city='Bengaluru')
+        response = self.client.get(f'/api/v1/communities/?clubs=true&sport={self.sport.id}&city=Bengaluru')
+        self.assertEqual(response.status_code, 200)
+        rows = response.data.get('results', response.data.get('data', []))
+        self.assertEqual([row['public_id'] for row in rows], [created.data['data']['public_id']])
+
+    def test_linked_club_events_and_games_use_authoritative_records(self):
+        club = self.create(is_club=True).data['data']
+        venue = Venue.objects.create(name='Community Venue', address='1 Road', city='Bengaluru', latitude=12.97, longitude=77.59, opening_time='09:00', closing_time='20:00')
+        court = Court.objects.create(venue=venue, sport=self.sport, name='Community Court', capacity=4, price_per_hour=300)
+        event_date = timezone.localdate() + timedelta(days=7)
+        event_data = {
+            'title': 'Club practice', 'sport_id': self.sport.id,
+            'community_id': club['public_id'], 'venue_id': str(venue.public_id),
+            'court_id': str(court.public_id), 'event_date': event_date.isoformat(),
+            'start_time': '10:00', 'end_time': '11:00', 'maximum_participants': 8,
+            'registration_deadline': (timezone.now() + timedelta(days=5)).isoformat(),
+            'visibility': 'community',
+        }
+        self.client.force_authenticate(self.member)
+        denied = self.client.post('/api/v1/events/', event_data, format='json')
+        self.assertEqual(denied.status_code, 403)
+        self.client.force_authenticate(self.owner)
+        created_event = self.client.post('/api/v1/events/', event_data, format='json')
+        self.assertEqual(created_event.status_code, 201, created_event.data)
+        starts_at = timezone.now() + timedelta(days=7)
+        game = Game.objects.create(
+            game_reference='GM-CLUB-LINK', host=self.owner, sport=self.sport, venue=venue, court=court,
+            game_date=event_date, start_time='12:00', end_time='13:00', starts_at=starts_at,
+            ends_at=starts_at + timedelta(hours=1), min_players=2, max_players=4,
+            visibility=Game.Visibility.PUBLIC, status=Game.Status.OPEN,
+        )
+        GamePlayer.objects.create(game=game, user=self.owner)
+        post = self.client.post(f"/api/v1/communities/{club['public_id']}/posts/", {
+            'content': 'Join our club match', 'post_type': 'game', 'game_id': str(game.public_id),
+        }, format='json')
+        self.assertEqual(post.status_code, 201)
+        activities = self.client.get(f"/api/v1/clubs/{club['public_id']}/activities/")
+        self.assertEqual(activities.status_code, 200)
+        self.assertEqual([item['public_id'] for item in activities.data['events']], [created_event.data['data']['public_id']])
+        self.assertEqual(activities.data['games'][0]['game']['public_id'], str(game.public_id))
 
     def test_club_roles_invites_and_ownership_transfer_permissions(self):
         created = self.create(is_club=True)
@@ -1874,6 +3137,9 @@ class EventTournamentTests(APITestCase):
         event = Event.objects.get(public_id=created.data['data']['public_id'])
         self.client.force_authenticate(self.first)
         self.assertEqual(self.client.post(f'/api/v1/events/{event.public_id}/register/').data['data']['status'], 'registered')
+        duplicate = self.client.post(f'/api/v1/events/{event.public_id}/register/')
+        self.assertEqual(duplicate.data['data']['status'], 'registered')
+        self.assertEqual(EventParticipant.objects.filter(event=event, user=self.first).count(), 1)
         self.client.force_authenticate(self.second)
         self.assertEqual(self.client.post(f'/api/v1/events/{event.public_id}/register/').data['data']['status'], 'waitlisted')
         self.client.force_authenticate(self.first)
@@ -1896,6 +3162,56 @@ class EventTournamentTests(APITestCase):
         outside = self.client.get('/api/v1/events/', {'date_from':(timezone.localdate()+timedelta(days=8)).isoformat(),'date_to':(timezone.localdate()+timedelta(days=8)).isoformat()})
         self.assertEqual(outside.status_code, 200)
         self.assertEqual(outside.data['count'] if isinstance(outside.data,dict) and 'count' in outside.data else len(outside.data), 0)
+
+    def test_calendar_lifecycle_filters_and_private_participant_visibility(self):
+        created = self.create_event()
+        event = Event.objects.get(public_id=created.data['data']['public_id'])
+        self.client.force_authenticate(self.first)
+        self.assertEqual(self.client.get('/api/v1/events/', {'lifecycle': 'upcoming'}).status_code, 200)
+        invalid = self.client.get('/api/v1/calendar/', {'lifecycle': 'future-ish'})
+        self.assertEqual(invalid.status_code, 400)
+        event.starts_at = timezone.now() - timedelta(minutes=10)
+        event.ends_at = timezone.now() + timedelta(hours=1)
+        event.save(update_fields=['starts_at', 'ends_at', 'updated_at'])
+        ongoing = self.client.get('/api/v1/calendar/', {'lifecycle': 'ongoing'})
+        self.assertEqual([row['public_id'] for row in ongoing.data['data']], [str(event.public_id)])
+        event.ends_at = timezone.now() - timedelta(minutes=1)
+        event.save(update_fields=['ends_at', 'updated_at'])
+        past = self.client.get('/api/v1/calendar/', {'lifecycle': 'past'})
+        self.assertEqual([row['public_id'] for row in past.data['data']], [str(event.public_id)])
+        private = Event.objects.create(
+            event_reference='EV-PRIVATE-1', title='Private event', organizer=self.organizer,
+            sport=self.sport, venue=self.venue, event_date=event.event_date,
+            start_time=event.start_time, end_time=event.end_time,
+            starts_at=event.starts_at, ends_at=event.ends_at,
+            maximum_participants=4, minimum_participants=1,
+            visibility=Event.Visibility.PRIVATE, registration_deadline=event.registration_deadline,
+        )
+        denied = self.client.get(f'/api/v1/events/{private.public_id}/participants/')
+        self.assertEqual(denied.status_code, 404)
+        # Public event rosters remain available to authenticated users.
+        self.assertEqual(self.client.get(f'/api/v1/events/{event.public_id}/participants/').status_code, 200)
+
+    def test_event_schedule_edit_rechecks_court_conflicts(self):
+        created = self.create_event()
+        event = Event.objects.get(public_id=created.data['data']['public_id'])
+        blocked_start = event.event_date
+        CourtBlockedPeriod.objects.create(
+            court=self.court, starts_at=event.starts_at + timedelta(days=1),
+            ends_at=event.ends_at + timedelta(days=1), reason='Maintenance',
+        )
+        response = self.client.patch(f'/api/v1/events/{event.public_id}/', {
+            'event_date': (blocked_start + timedelta(days=1)).isoformat(),
+        }, format='json')
+        self.assertEqual(response.status_code, 409, response.data)
+        event.refresh_from_db()
+        self.assertEqual(event.event_date, blocked_start)
+
+    def test_community_visibility_requires_linked_community(self):
+        payload = self.create_event().data['data']
+        event_id = payload['public_id']
+        response = self.client.patch(f'/api/v1/events/{event_id}/', {'visibility': 'community'}, format='json')
+        self.assertEqual(response.status_code, 400, response.data)
 
     def test_event_detail_edit_permissions_deadline_and_reminder_delivery(self):
         created=self.create_event();event=Event.objects.get(public_id=created.data['data']['public_id'])
@@ -1920,15 +3236,21 @@ class EventTournamentTests(APITestCase):
     def test_event_organizer_update_and_delete_cancel_preserve_event(self):
         created = self.create_event()
         event = Event.objects.get(public_id=created.data['data']['public_id'])
+        self.client.force_authenticate(self.first)
+        self.client.post(f'/api/v1/events/{event.public_id}/register/')
+        self.assertEqual(self.client.delete(f'/api/v1/events/{event.public_id}/').status_code, 403)
         self.client.force_authenticate(self.organizer)
         changed = self.client.patch(f'/api/v1/events/{event.public_id}/', {'title': 'Updated event', 'description': 'New details'}, format='json')
         self.assertEqual(changed.status_code, 200, changed.data)
+        self.assertTrue(Notification.objects.filter(user=self.first,type='event_updated',data__event_id=str(event.public_id)).exists())
         event.refresh_from_db()
         self.assertEqual(event.title, 'Updated event')
         cancelled = self.client.delete(f'/api/v1/events/{event.public_id}/')
         self.assertEqual(cancelled.status_code, 204)
         event.refresh_from_db()
         self.assertEqual(event.status, Event.Status.CANCELLED)
+        self.assertTrue(Notification.objects.filter(user=self.first, type='event_cancelled', data__event_id=str(event.public_id)).exists())
+        self.assertEqual(EventParticipant.objects.get(event=event, user=self.first).status, EventParticipant.Status.CANCELLED)
 
     def test_tournament_crud_is_organizer_only_and_delete_cancels(self):
         start = timezone.localdate() + timedelta(days=7)
@@ -1963,7 +3285,12 @@ class EventTournamentTests(APITestCase):
         }, format='json')
         self.assertEqual(response.status_code, 201, response.data)
         tournament = Tournament.objects.get(public_id=response.data['data']['public_id'])
-        self.assertEqual(tournament.venue.source_nearby_ground, nearby)
+        self.assertIsNone(tournament.venue)
+        self.assertEqual(tournament.nearby_ground, nearby)
+        self.assertEqual(Venue.objects.filter(source_nearby_ground=nearby).count(), 0)
+        self.assertIsNone(response.data['data']['venue'])
+        self.assertEqual(response.data['data']['nearby_ground_id'], nearby.id)
+        self.assertEqual(response.data['data']['venue_name'], nearby.name)
 
     def test_tournament_registration_uses_team_records_and_enforces_deadline_capacity(self):
         start=timezone.localdate()+timedelta(days=5)
@@ -1972,12 +3299,19 @@ class EventTournamentTests(APITestCase):
         joined=self.client.post(f'/api/v1/tournaments/{tournament.public_id}/register/',{'team_name':'First Team'},format='json')
         self.assertEqual(joined.status_code,201,joined.data)
         self.assertEqual(TournamentTeamMember.objects.filter(team__tournament=tournament,user=self.first,status='active').count(),1)
+        duplicate=self.client.post(f'/api/v1/tournaments/{tournament.public_id}/register/',{'team_name':'Ignored Duplicate'},format='json')
+        self.assertEqual(duplicate.status_code,200)
+        self.assertFalse(duplicate.data['created'])
         self.client.force_authenticate(self.second)
         self.assertEqual(self.client.post(f'/api/v1/tournaments/{tournament.public_id}/register/',{'team_name':'Second Team'},format='json').status_code,201)
         third=User.objects.create_user(username='event-third',email='event-third@example.com',password='StrongPass!123')
         self.client.force_authenticate(third)
         full=self.client.post(f'/api/v1/tournaments/{tournament.public_id}/register/',{'team_name':'Third Team'},format='json')
         self.assertEqual(full.status_code,400)
+        detail=self.client.get(f'/api/v1/tournaments/{tournament.public_id}/')
+        self.assertEqual(detail.data['registered_team_count'],2)
+        self.assertEqual(detail.data['available_team_slots'],0)
+        self.assertFalse(detail.data['registration_eligible'])
 
     def test_tournament_team_and_bracket_generation(self):
         start = timezone.localdate() + timedelta(days=10)
@@ -1992,6 +3326,59 @@ class EventTournamentTests(APITestCase):
         matches = TournamentBracketService.generate(tournament=tournament, actor=self.organizer)
         self.assertEqual(len(matches), 1)
         self.assertEqual({matches[0].team_a_id, matches[0].team_b_id}, {first.id, second.id})
+
+    def test_league_round_robin_ties_update_standings_and_double_elimination_is_rejected(self):
+        start=timezone.localdate()+timedelta(days=10)
+        tournament=Tournament.objects.create(tournament_reference='TR-LEAGUE',name='League',organizer=self.organizer,sport=self.sport,venue=self.venue,start_date=start,end_date=start+timedelta(days=2),registration_deadline=timezone.now()+timedelta(days=8),maximum_teams=3,format=Tournament.Format.LEAGUE)
+        teams=[TournamentService.create_team(tournament=tournament,creator=self.organizer,name=f'League {i}') for i in range(3)]
+        matches=TournamentBracketService.generate(tournament=tournament,actor=self.organizer)
+        self.assertEqual(len(matches),3)
+        self.assertEqual([tournament.matches.filter(round_number=round_no).count() for round_no in (1,2,3)],[1,1,1])
+        tied=TournamentMatchService.result(match=matches[0],actor=self.organizer,score_a=1,score_b=1)
+        self.assertIsNone(tied.winner_id)
+        rows=TournamentStandingsService.standings(tournament)
+        self.assertEqual(sum(row['points'] for row in rows),2)
+        self.assertEqual(sum(row['draws'] for row in rows),2)
+        for match in matches[1:]: TournamentMatchService.result(match=match,actor=self.organizer,score_a=2,score_b=0)
+        tournament.refresh_from_db()
+        self.assertEqual(tournament.status,Tournament.Status.COMPLETED)
+        payload={'name':'Bad Format','sport_id':self.sport.id,'venue_id':str(self.venue.public_id),'start_date':start.isoformat(),'end_date':start.isoformat(),'registration_deadline':(timezone.now()+timedelta(days=2)).isoformat(),'maximum_teams':4,'format':'double_elimination'}
+        rejected=self.client.post('/api/v1/tournaments/',payload,format='json')
+        self.assertEqual(rejected.status_code,400)
+
+    def test_tournament_result_permissions_duplicates_and_cancellation_preserve_completed_results(self):
+        start=timezone.localdate()+timedelta(days=10)
+        tournament=Tournament.objects.create(tournament_reference='TR-RESULT',name='Results Cup',organizer=self.organizer,sport=self.sport,venue=self.venue,start_date=start,end_date=start+timedelta(days=1),registration_deadline=timezone.now()+timedelta(days=8),maximum_teams=4)
+        teams=[TournamentService.create_team(tournament=tournament,creator=self.organizer,name=f'Result Team {i}') for i in range(4)]
+        match=TournamentBracketService.generate(tournament=tournament,actor=self.organizer).get(round_number=1,match_number=1)
+        self.client.force_authenticate(self.first)
+        denied=self.client.post(f'/api/v1/tournaments/{tournament.public_id}/matches/{match.public_id}/result/',{'score_a':3,'score_b':1},format='json')
+        self.assertEqual(denied.status_code,403)
+        self.client.force_authenticate(self.organizer)
+        invalid=self.client.post(f'/api/v1/tournaments/{tournament.public_id}/matches/{match.public_id}/result/',{'score_a':1,'score_b':1},format='json')
+        self.assertEqual(invalid.status_code,400)
+        saved=self.client.post(f'/api/v1/tournaments/{tournament.public_id}/matches/{match.public_id}/result/',{'score_a':3,'score_b':1},format='json')
+        self.assertEqual(saved.status_code,200,saved.data)
+        duplicate=self.client.post(f'/api/v1/tournaments/{tournament.public_id}/matches/{match.public_id}/result/',{'score_a':0,'score_b':4},format='json')
+        self.assertEqual(duplicate.status_code,400)
+        self.assertEqual(TournamentMatch.objects.get(pk=match.pk).score_a,3)
+        completed=tournament.matches.get(status=TournamentMatch.Status.COMPLETED)
+        TournamentService.cancel(tournament=tournament,actor=self.organizer)
+        completed.refresh_from_db()
+        self.assertEqual(completed.status,TournamentMatch.Status.COMPLETED)
+        self.assertEqual(completed.winner_id,teams[0].id)
+        self.assertEqual(tournament.matches.filter(status=TournamentMatch.Status.CANCELLED).count(),2)
+
+    def test_bracket_generation_and_results_are_rejected_after_tournament_cancellation(self):
+        start=timezone.localdate()+timedelta(days=10)
+        tournament=Tournament.objects.create(tournament_reference='TR-CANCEL-1',name='Cancelled Cup',organizer=self.organizer,sport=self.sport,venue=self.venue,start_date=start,end_date=start+timedelta(days=1),registration_deadline=timezone.now()+timedelta(days=8),maximum_teams=2)
+        for i in range(2): TournamentService.create_team(tournament=tournament,creator=self.organizer,name=f'Cancelled Team {i}')
+        TournamentBracketService.generate(tournament=tournament,actor=self.organizer)
+        pending=tournament.matches.get()
+        TournamentService.cancel(tournament=tournament,actor=self.organizer)
+        pending.refresh_from_db()
+        self.assertEqual(pending.status,TournamentMatch.Status.CANCELLED)
+        with self.assertRaises(ValidationError): TournamentMatchService.result(match=pending,actor=self.organizer,score_a=2,score_b=0)
 
     def test_knockout_winners_advance_from_semifinals_to_final(self):
         start = timezone.localdate() + timedelta(days=10)
@@ -2063,6 +3450,52 @@ class CollegeNetworkApiTests(APITestCase):
         self.assertEqual(self.verify(college).status_code, 200)
         self.assertEqual(college.__class__.objects.get(pk=college.pk).verification_status, College.VerificationStatus.VERIFIED)
 
+    def test_submission_evidence_duplicate_prevention_and_private_status_tracking(self):
+        self.client.force_authenticate(self.first_admin)
+        missing_evidence = self.client.post('/api/v1/colleges/', {
+            'name': 'Evidence College', 'city': 'Bengaluru',
+        }, format='json')
+        self.assertEqual(missing_evidence.status_code, 400)
+        invalid_evidence = self.client.post('/api/v1/colleges/', {
+            'name': 'Evidence College', 'city': 'Bengaluru',
+            'verification_evidence': 'not-a-url',
+        }, format='json')
+        self.assertEqual(invalid_evidence.status_code, 400)
+
+        college = self.submit_college(self.first_admin, 'Status College')
+        duplicate = self.client.post('/api/v1/colleges/', {
+            'name': ' status college ', 'city': 'bengaluru',
+            'verification_evidence': 'https://example.edu/evidence',
+        }, format='json')
+        self.assertEqual(duplicate.status_code, 400)
+        self.client.force_authenticate(self.outsider)
+        self.assertEqual(self.client.get('/api/v1/colleges/', {'mine': 'true'}).data['data'], [])
+        self.assertEqual(self.client.get('/api/v1/colleges/', {'status': 'pending'}).status_code, 403)
+
+        self.client.force_authenticate(self.admin)
+        rejected = self.client.post(
+            f'/api/v1/admin/colleges/{college.public_id}/verification/',
+            {'approve': False, 'reason': 'Evidence needs an official source.'}, format='json',
+        )
+        self.assertEqual(rejected.status_code, 200, rejected.data)
+        self.client.force_authenticate(self.first_admin)
+        own = self.client.get('/api/v1/colleges/', {'mine': 'true'}).data['data']
+        self.assertEqual(len(own), 1)
+        self.assertEqual(own[0]['verification_status'], College.VerificationStatus.REJECTED)
+        self.assertEqual(own[0]['rejection_reason'], 'Evidence needs an official source.')
+        self.assertTrue(own[0]['is_my_submission'])
+        self.assertTrue(Notification.objects.filter(
+            user=self.first_admin, event_key=f'college-review:{college.pk}:rejected',
+        ).exists())
+        self.client.force_authenticate(self.admin)
+        repeated_review = self.client.post(
+            f'/api/v1/admin/colleges/{college.public_id}/verification/',
+            {'approve': True}, format='json',
+        )
+        self.assertEqual(repeated_review.status_code, 400)
+        self.client.force_authenticate(self.outsider)
+        self.assertEqual(self.client.get(f'/api/v1/colleges/{college.public_id}/').status_code, 404)
+
     def test_only_college_admin_can_manage_roster_and_only_members_are_eligible(self):
         college = self.submit_college(self.first_admin, 'Roster College')
         self.verify(college)
@@ -2087,9 +3520,25 @@ class CollegeNetworkApiTests(APITestCase):
         self.client.force_authenticate(self.first_admin)
         rejected = self.client.post(f'/api/v1/college-teams/{team.public_id}/roster/', {'user_id': self.outsider.id}, format='json')
         self.assertEqual(rejected.status_code, 403)
+        self.assertEqual(self.client.get(f'/api/v1/college-teams/{team.public_id}/roster/').status_code, 200)
         self.activate_player(college, self.first_player)
         accepted = self.client.post(f'/api/v1/college-teams/{team.public_id}/roster/', {'user_id': self.first_player.id}, format='json')
         self.assertEqual(accepted.status_code, 201, accepted.data)
+        roster = self.client.get(f'/api/v1/college-teams/{team.public_id}/roster/')
+        self.assertIn(self.first_player.id, [item['user_id'] for item in roster.data['data']])
+        self.client.force_authenticate(self.outsider)
+        self.assertEqual(self.client.get(f'/api/v1/college-teams/{team.public_id}/roster/').status_code, 403)
+        self.client.force_authenticate(self.first_admin)
+        duplicate_team = self.client.post(f'/api/v1/tournaments/{tournament.public_id}/college-teams/', {'college_id': str(college.public_id), 'name': 'Another team'}, format='json')
+        self.assertEqual(duplicate_team.status_code, 400)
+        self.activate_player(other, self.first_player)
+        self.client.force_authenticate(self.second_admin)
+        second_team = TournamentTeam.objects.get(public_id=second.data['data']['public_id'])
+        cross_team_duplicate = self.client.post(f'/api/v1/college-teams/{second_team.public_id}/roster/', {'user_id': self.first_player.id}, format='json')
+        self.assertEqual(cross_team_duplicate.status_code, 400)
+        Tournament.objects.filter(pk=tournament.pk).update(status=Tournament.Status.STARTED)
+        closed_registration = self.client.post(f'/api/v1/tournaments/{tournament.public_id}/college-teams/', {'college_id': str(college.public_id), 'name': 'Late team'}, format='json')
+        self.assertEqual(closed_registration.status_code, 400)
 
     def test_challenge_fixture_result_dispute_and_standings_use_tournament_records(self):
         first = self.submit_college(self.first_admin, 'Fixture College A')
@@ -2100,6 +3549,8 @@ class CollegeNetworkApiTests(APITestCase):
         self.client.force_authenticate(self.first_admin)
         challenge_response = self.client.post(f'/api/v1/colleges/{first.public_id}/challenges/', {'challenged_college_id': str(second.public_id), 'sport_id': self.sport.id, 'message': 'Friendly fixture'}, format='json')
         self.assertEqual(challenge_response.status_code, 201, challenge_response.data)
+        duplicate_challenge = self.client.post(f'/api/v1/colleges/{first.public_id}/challenges/', {'challenged_college_id': str(second.public_id), 'sport_id': self.sport.id}, format='json')
+        self.assertEqual(duplicate_challenge.status_code, 400)
         challenge_id = challenge_response.data['data']['public_id']
         self.client.force_authenticate(self.second_admin)
         answer = self.client.post(f'/api/v1/college-challenges/{challenge_id}/answer/', {'accept': True, 'venue_id': str(self.venue.public_id), 'start_date': (timezone.localdate()+timedelta(days=7)).isoformat(), 'end_date': (timezone.localdate()+timedelta(days=7)).isoformat(), 'registration_deadline': (timezone.now()+timedelta(days=5)).isoformat()}, format='json')
@@ -2114,6 +3565,7 @@ class CollegeNetworkApiTests(APITestCase):
         match = TournamentMatch.objects.create(tournament=tournament, round_number=1, match_number=1, team_a=TournamentTeam.objects.get(public_id=ta.data['data']['public_id']), team_b=TournamentTeam.objects.get(public_id=tb.data['data']['public_id']))
         self.client.force_authenticate(self.outsider)
         self.assertEqual(self.client.post(f'/api/v1/tournaments/{tournament.public_id}/matches/{match.public_id}/college-result/', {'score_a': 2, 'score_b': 1}, format='json').status_code, 403)
+        self.assertEqual(self.client.get(f'/api/v1/tournament-matches/{match.public_id}/college-disputes/').status_code, 403)
         self.client.force_authenticate(self.first_admin)
         result = self.client.post(f'/api/v1/tournaments/{tournament.public_id}/matches/{match.public_id}/college-result/', {'score_a': 2, 'score_b': 1}, format='json')
         self.assertEqual(result.status_code, 200, result.data)
@@ -2124,7 +3576,14 @@ class CollegeNetworkApiTests(APITestCase):
         self.client.force_authenticate(self.first_player)
         dispute = self.client.post(f'/api/v1/tournament-matches/{match.public_id}/college-disputes/', {'reason': 'Score report was entered incorrectly.'}, format='json')
         self.assertEqual(dispute.status_code, 201, dispute.data)
+        self.assertEqual(self.client.get(f'/api/v1/tournament-matches/{match.public_id}/college-disputes/').status_code, 200)
+        self.client.force_authenticate(self.first_admin)
+        self.assertEqual(self.client.get('/api/v1/admin/college-result-disputes/').status_code, 403)
         self.client.force_authenticate(self.admin)
+        queue = self.client.get('/api/v1/admin/college-result-disputes/')
+        self.assertEqual(queue.status_code, 200, queue.data)
+        self.assertEqual(len(queue.data['data']), 1)
+        self.assertEqual(queue.data['data'][0]['tournament_name'], tournament.name)
         resolved = self.client.post(f'/api/v1/admin/college-result-disputes/{dispute.data["data"]["public_id"]}/resolve/', {'resolution': 'Confirmed after reviewing the signed score sheet.'}, format='json')
         self.assertEqual(resolved.status_code, 200, resolved.data)
         self.assertEqual(CollegeResultDispute.objects.get(pk=match.college_disputes.first().pk).status, CollegeResultDispute.Status.RESOLVED)
@@ -2147,6 +3606,7 @@ class NotificationApiTests(APITestCase):
     def test_notification_ownership(self):
         self.client.force_authenticate(self.other)
         self.assertEqual(self.client.get(f'/api/v1/notifications/{self.notification.public_id}/').status_code,404)
+        self.assertEqual(self.client.post(f'/api/v1/notifications/{self.notification.public_id}/read/').status_code,404)
 
     def test_notification_list_is_paginated_and_private_to_current_user(self):
         Notification.objects.create(user=self.other, type='message', title='Private')
@@ -2155,6 +3615,27 @@ class NotificationApiTests(APITestCase):
         self.assertEqual(response.data['count'], 1)
         self.assertEqual(len(response.data['results']), 1)
         self.assertEqual(response.data['results'][0]['public_id'], str(self.notification.public_id))
+
+    def test_notification_filters_reject_malformed_values(self):
+        self.assertEqual(self.client.get('/api/v1/notifications/', {'is_read':'perhaps'}).status_code,400)
+        self.assertEqual(self.client.get('/api/v1/notifications/', {'created_after':'not-a-date'}).status_code,400)
+
+    def test_event_key_makes_creation_idempotent_and_preferences_apply(self):
+        from my_app.services.notifications import NotificationService
+        first=NotificationService.create_notification(user=self.user,type='booking_created',title='Booked',event_key='booking:123')
+        second=NotificationService.create_notification(user=self.user,type='booking_created',title='Retry',event_key='booking:123')
+        self.assertEqual(first.pk,second.pk)
+        self.assertEqual(Notification.objects.filter(user=self.user,event_key='booking:123').count(),1)
+        NotificationPreference.objects.update_or_create(user=self.user,defaults={'booking_notifications':False})
+        self.assertIsNone(NotificationService.create_notification(user=self.user,type='booking_created',title='Muted',event_key='booking:124'))
+
+    def test_device_registration_is_private_and_does_not_return_token(self):
+        response=self.client.post('/api/v1/notifications/devices/',{'device_token':'opaque-token','platform':'android'},format='json')
+        self.assertEqual(response.status_code,201)
+        self.assertEqual(response.data['delivery_status'],'not_configured')
+        self.assertNotIn('device_token',response.data['data'])
+        self.client.force_authenticate(self.other)
+        self.assertEqual(self.client.delete(f"/api/v1/notifications/devices/{response.data['data']['public_id']}/").status_code,404)
 
 
 class RecommendationEngineTests(APITestCase):
@@ -2214,46 +3695,6 @@ class RecommendationEngineTests(APITestCase):
         self.assertEqual(data['tournaments'][0]['metadata']['venue'], venue.name)
 
 
-class ModerationApiTests(APITestCase):
-    def setUp(self):
-        self.reporter = User.objects.create_user(username='reporter', email='reporter@example.com', password='StrongPass!123')
-        self.target = User.objects.create_user(username='target', email='target@example.com', password='StrongPass!123')
-        self.moderator = User.objects.create_user(username='moderator', email='moderator@example.com', password='StrongPass!123')
-        self.moderator.groups.add(Group.objects.create(name='SportMate Moderators'))
-        self.admin = User.objects.create_user(username='platform-admin', email='platform-admin@example.com', password='StrongPass!123')
-        self.admin.groups.add(Group.objects.create(name='SportMate Admins'))
-
-    def create_report(self):
-        self.client.force_authenticate(self.reporter)
-        return self.client.post('/api/v1/reports/', {
-            'target_type': 'user', 'target_public_id': str(self.target.public_id),
-            'reason': 'abuse', 'description': 'Repeated abusive conduct.',
-        }, format='json')
-
-    def test_report_ownership_moderation_and_restore(self):
-        created = self.create_report()
-        self.assertEqual(created.status_code, 201)
-        report_id = created.data['data']['public_id']
-        self.assertEqual(self.client.get('/api/v1/admin/dashboard/').status_code, 403)
-        self.client.force_authenticate(self.moderator)
-        suspended = self.client.patch(f'/api/v1/reports/{report_id}/', {'action': 'suspend', 'action_reason': 'Policy violation.'}, format='json')
-        self.assertEqual(suspended.status_code, 200)
-        self.target.refresh_from_db()
-        self.assertEqual(self.target.account_status, User.AccountStatus.SUSPENDED)
-        self.assertEqual(ModerationAction.objects.filter(action='suspend').count(), 1)
-        restored = self.client.patch(f'/api/v1/reports/{report_id}/', {'action': 'restore', 'status': 'resolved', 'resolution': 'Restriction lifted.'}, format='json')
-        self.assertEqual(restored.status_code, 200)
-        self.target.refresh_from_db()
-        self.assertEqual(self.target.account_status, User.AccountStatus.ACTIVE)
-        self.client.force_authenticate(self.admin)
-        self.assertEqual(self.client.get('/api/v1/admin/dashboard/').status_code, 200)
-        self.assertEqual(self.client.get('/api/v1/admin/moderation/actions/').status_code, 200)
-
-    def test_normal_user_cannot_access_another_report(self):
-        created = self.create_report()
-        report_id = created.data['data']['public_id']
-        self.client.force_authenticate(self.target)
-        self.assertEqual(self.client.get(f'/api/v1/reports/{report_id}/').status_code, 404)
 
 
 class ProductionHardeningTests(APITestCase):

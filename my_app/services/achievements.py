@@ -1,6 +1,7 @@
 """Server-controlled, non-monetary achievements, progress and levels."""
+from django.db import transaction
 from django.utils import timezone
-from my_app.models import Achievement, CommunityMember, EventParticipant, PlayerRating, TournamentTeam, UserAchievement
+from my_app.models import Achievement, CommunityMember, EventParticipant, HealthActivityRecord, PlayerRating, ReferralAttribution, TournamentTeam, UserAchievement
 from my_app.services.statistics import PlayerStatisticsService
 from my_app.services.notifications import NotificationService
 
@@ -11,20 +12,29 @@ class AchievementProgressService:
   stats=PlayerStatisticsService.statistics(user=user)
   category=achievement.category
   if category==Achievement.Category.GAMES:return stats['games_completed']
-  if category==Achievement.Category.WINS:return stats['games_won']
+  if category==Achievement.Category.WINS:return stats['games_won'] or 0
   if category==Achievement.Category.EVENTS:return stats['events_joined']
   if category==Achievement.Category.COMMUNITIES:return CommunityMember.objects.filter(user=user,status='active').count()
   if category==Achievement.Category.RATINGS:return PlayerRating.objects.filter(player=user,deleted_at__isnull=True).count()
   if category==Achievement.Category.TOURNAMENTS:return TournamentTeam.objects.filter(members__user=user,status='champion').count()
+  if category==Achievement.Category.SOCIAL:return ReferralAttribution.objects.filter(referrer=user,status=ReferralAttribution.Status.SUCCESSFUL).count()
+  if category==Achievement.Category.ACTIVITY:return HealthActivityRecord.objects.filter(user=user,source__in=(HealthActivityRecord.Source.APPLE_HEALTH,HealthActivityRecord.Source.HEALTH_CONNECT),is_estimated=False).count()
   return 0
 class AchievementEvaluationService:
  @classmethod
+ @transaction.atomic
  def evaluate(cls,*,user):
   result=[]
   for achievement in Achievement.objects.filter(is_active=True):
-   progress=AchievementProgressService.metric(user=user,achievement=achievement)
-   ua,_=UserAchievement.objects.get_or_create(user=user,achievement=achievement)
+   # No persisted game winner exists, so the statistics service reports None;
+   # do not compare that unsupported metric or invent wins.
+   progress=AchievementProgressService.metric(user=user,achievement=achievement) or 0
+   ua,_=UserAchievement.objects.select_for_update().get_or_create(user=user,achievement=achievement)
    changed=[]
+   # Unlocks are historical awards: later edits/removals of source records
+   # must not reduce the recorded progress or relock the achievement.
+   if ua.unlocked:
+    progress=max(progress,achievement.target_value,ua.progress)
    if ua.progress!=progress:ua.progress=progress;changed.append('progress')
    if not ua.unlocked and progress>=achievement.target_value:
     ua.unlocked=True;ua.unlocked_at=timezone.now();changed+=['unlocked','unlocked_at']

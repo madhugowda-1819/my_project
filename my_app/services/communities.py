@@ -5,7 +5,7 @@ from django.utils import timezone
 from django.utils.text import slugify
 from rest_framework.exceptions import APIException, NotFound, PermissionDenied, ValidationError
 
-from my_app.models import Community, CommunityComment, CommunityMember, CommunityPost, CommunityPostLike, Game
+from my_app.models import Community, CommunityComment, CommunityMember, CommunityPost, CommunityPostLike, Game, GamePlayer
 from my_app.services.locations import nearby_queryset
 from my_app.utils import create_notification
 
@@ -69,16 +69,16 @@ class CommunityService:
     @classmethod
     @transaction.atomic
     def join(cls, *, community, user):
+        community = Community.objects.select_for_update().get(pk=community.pk)
         if not community.is_active:
             raise CommunityError('This community is inactive.')
-        community = Community.objects.select_for_update().get(pk=community.pk)
+        if not community.membership_open:
+            raise CommunityError('This club is not accepting new members or requests.')
         member = CommunityMember.objects.select_for_update().filter(community=community, user=user).first()
         if member and member.status == CommunityMember.Status.BANNED:
             raise PermissionDenied('You are banned from this community.')
         if member and member.status in (CommunityMember.Status.ACTIVE, CommunityMember.Status.PENDING):
             return member, False
-        if not community.membership_open and community.visibility == Community.Visibility.PUBLIC:
-            raise PermissionDenied('This club is not accepting new members.')
         target_status = CommunityMember.Status.ACTIVE if community.visibility == Community.Visibility.PUBLIC else CommunityMember.Status.PENDING
         if member:
             member.status, member.role, member.joined_at = target_status, CommunityMember.Role.MEMBER, (timezone.now() if target_status == CommunityMember.Status.ACTIVE else None)
@@ -124,6 +124,11 @@ class CommunityService:
     @classmethod
     @transaction.atomic
     def invite(cls, *, community, actor, user_id):
+        community = Community.objects.select_for_update().get(pk=community.pk)
+        if not community.is_active:
+            raise CommunityError('This community is inactive.')
+        if not community.membership_open:
+            raise CommunityError('This club is not accepting invitations.')
         CommunityMembershipService.admin(community=community, user=actor)
         from my_app.models import User
         user = User.objects.filter(pk=user_id, is_active=True, account_status=User.AccountStatus.ACTIVE).first()
@@ -199,6 +204,8 @@ class CommunityPostService:
     @classmethod
     @transaction.atomic
     def create(cls, *, community, author, content, post_type='text', game_id=None):
+        if not community.is_active:
+            raise CommunityError('This community is inactive.')
         member = CommunityMembershipService.active_member(community=community, user=author)
         if post_type == CommunityPost.Type.ANNOUNCEMENT and member.role not in (CommunityMember.Role.OWNER, CommunityMember.Role.CAPTAIN, CommunityMember.Role.ADMIN, CommunityMember.Role.MODERATOR):
             raise PermissionDenied('Only moderators can create announcements.')
@@ -208,6 +215,10 @@ class CommunityPostService:
                 game = Game.objects.get(public_id=game_id)
             except Game.DoesNotExist as exc:
                 raise NotFound('Game not found.') from exc
+            if game.visibility != Game.Visibility.PUBLIC and game.host_id != author.id and not GamePlayer.objects.filter(
+                game=game, user=author, status=GamePlayer.Status.CONFIRMED,
+            ).exists():
+                raise PermissionDenied('You cannot link a game that is private to another player.')
         post = CommunityPost.objects.create(community=community, author=author, content=cls.content(content), post_type=post_type, game=game)
         if post_type == CommunityPost.Type.ANNOUNCEMENT:
             for membership in community.members.filter(status=CommunityMember.Status.ACTIVE).exclude(user=author).select_related('user'):

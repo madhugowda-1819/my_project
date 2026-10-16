@@ -2,7 +2,7 @@ from django.contrib import admin
 from django.contrib.auth.admin import UserAdmin
 from .models import (
     User, Sport, PlayerProfile, AvailabilitySlot,
-    Match, Message, Notification, Ground, Venue, Court, VenueSport, Report, ModerationAction, UserModeration
+    Match, Message, Notification, Ground
 )
 
 
@@ -64,26 +64,6 @@ class GroundAdmin(admin.ModelAdmin):
     filter_horizontal = ('sports',)
 
 
-@admin.register(Venue)
-class VenueAdmin(admin.ModelAdmin):
-    list_display = ('name', 'city', 'opening_time', 'closing_time', 'active', 'is_demo', 'source_ground')
-    list_filter = ('active', 'is_demo', 'city')
-    search_fields = ('name', 'city', 'address', 'source_ground__name')
-    autocomplete_fields = ('source_ground',)
-
-
-@admin.register(Court)
-class CourtAdmin(admin.ModelAdmin):
-    list_display = ('name', 'venue', 'sport', 'capacity', 'price_per_hour', 'active')
-    list_filter = ('active', 'sport')
-    search_fields = ('name', 'venue__name')
-
-
-@admin.register(VenueSport)
-class VenueSportAdmin(admin.ModelAdmin):
-    list_display = ('venue', 'sport')
-
-
 # ------------------------------------------------------------------
 # 🔥 MATCH (UPDATED)
 # ------------------------------------------------------------------
@@ -109,31 +89,3 @@ class MessageAdmin(admin.ModelAdmin):
 class NotificationAdmin(admin.ModelAdmin):
     list_display = ('user', 'type', 'title', 'is_read', 'created_at')
     list_filter = ('type', 'is_read')
-
-
-@admin.register(Report)
-class ReportAdmin(admin.ModelAdmin):
-    list_display = ('public_id', 'reporter', 'target_type', 'reason', 'status', 'assigned_moderator', 'created_at')
-    list_filter = ('status', 'reason', 'target_type')
-    search_fields = ('reporter__email', 'description', 'resolution')
-    readonly_fields = ('public_id', 'created_at', 'updated_at', 'resolved_at')
-
-
-@admin.register(ModerationAction)
-class ModerationActionAdmin(admin.ModelAdmin):
-    list_display = ('moderator', 'target_type', 'action', 'created_at')
-    list_filter = ('action', 'target_type')
-    readonly_fields = ('public_id', 'moderator', 'report', 'target_type', 'target_public_id', 'action', 'reason', 'previous_state', 'new_state', 'created_at', 'updated_at')
-
-    def has_add_permission(self, request):
-        return False
-
-    def has_change_permission(self, request, obj=None):
-        return False
-
-
-@admin.register(UserModeration)
-class UserModerationAdmin(admin.ModelAdmin):
-    list_display = ('user', 'moderator', 'action', 'status', 'starts_at', 'ends_at')
-    list_filter = ('action', 'status')
-    readonly_fields = ('public_id', 'created_at', 'updated_at')

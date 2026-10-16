@@ -1,7 +1,7 @@
 from datetime import timedelta
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from django.db import transaction
+from django.db import IntegrityError, transaction
 from django.utils import timezone
 from rest_framework.exceptions import NotFound, ValidationError
 
@@ -20,13 +20,17 @@ DEFAULT_ACTIVITIES = (
 def _timezone(name):
     try:
         return ZoneInfo(name)
-    except (ZoneInfoNotFoundError, TypeError):
+    except (ZoneInfoNotFoundError, TypeError, ValueError):
         raise ValidationError({'timezone': ['Use a valid IANA timezone, such as Asia/Kolkata.']})
 
 
+def current_date(timezone_name='UTC'):
+    """Return today's date in the same explicit timezone used by practice APIs."""
+    tz = _timezone(timezone_name)
+    return timezone.now().astimezone(tz).date()
+
+
 def ensure_default_activities(user):
-    if user.practice_activities.exists():
-        return
     for order, (name, description) in enumerate(DEFAULT_ACTIVITIES):
         PracticeActivity.objects.get_or_create(
             user=user, name=name,
@@ -64,7 +68,7 @@ def day_payload(*, user, practice_date, tz):
 def streak_for(*, user, today, tz):
     # A day counts when every activity that was active on that day was completed.
     # Yesterday's completion keeps a streak visible on a not-yet-completed today.
-    activities = list(user.practice_activities.filter(created_at__date__lte=today))
+    activities = list(user.practice_activities.all())
     if not activities:
         return 0
     completion_map = {}
@@ -89,6 +93,10 @@ def streak_for(*, user, today, tz):
 
 
 class PracticeService:
+    @staticmethod
+    def current_date(timezone_name='UTC'):
+        return current_date(timezone_name)
+
     @staticmethod
     def get_day(*, user, practice_date, timezone_name):
         tz = _timezone(timezone_name)
@@ -123,9 +131,17 @@ class PracticeService:
     def create_activity(*, user, name, description='', sort_order=None):
         if sort_order is None:
             sort_order = (user.practice_activities.order_by('-sort_order').values_list('sort_order', flat=True).first() or 0) + 1
-        return PracticeActivity.objects.create(user=user, name=name.strip(), description=description.strip(), sort_order=sort_order)
+        try:
+            with transaction.atomic():
+                return PracticeActivity.objects.create(
+                    user=user, name=name.strip(), description=description.strip(),
+                    sort_order=sort_order,
+                )
+        except IntegrityError as exc:
+            raise ValidationError({'name': ['An activity with this name already exists.']}) from exc
 
     @staticmethod
+    @transaction.atomic
     def update_activity(*, user, public_id, changes):
         try:
             activity = PracticeActivity.objects.get(user=user, public_id=public_id)
@@ -134,7 +150,11 @@ class PracticeService:
         for field in ('name', 'description', 'sort_order', 'is_active'):
             if field in changes:
                 setattr(activity, field, changes[field])
-        activity.save()
+        try:
+            with transaction.atomic():
+                activity.save()
+        except IntegrityError as exc:
+            raise ValidationError({'name': ['An activity with this name already exists.']}) from exc
         return activity
 
     @staticmethod
@@ -152,7 +172,10 @@ class PracticeService:
         day = start_date
         while day <= end_date:
             done = grouped.get(day, [])
-            applicable = {a.id for a in user.practice_activities.filter(created_at__date__lte=day)}
+            applicable = {
+                activity.id for activity in user.practice_activities.all()
+                if activity.created_at.astimezone(tz).date() <= day
+            }
             relevant = [row for row in done if row.activity_id in applicable]
             total = max(len(applicable), len(relevant))
             completed = len(relevant)

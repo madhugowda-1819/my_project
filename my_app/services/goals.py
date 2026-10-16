@@ -13,7 +13,7 @@ from my_app.services.notifications import NotificationService
 def _tz(name):
     try:
         return ZoneInfo(name)
-    except (ZoneInfoNotFoundError, TypeError):
+    except (ZoneInfoNotFoundError, TypeError, ValueError):
         raise ValidationError({'reminder_timezone': ['Use a valid IANA timezone.']})
 
 
@@ -81,17 +81,25 @@ class SportsGoalService:
         if (data['end_date'] - data['start_date']).days > 366:
             raise ValidationError({'end_date': ['Goal duration cannot exceed 367 days.']})
         source = data['progress_source']
+        SportsGoalService._validate_source_unit(source, data['unit'])
+        if source != SportsGoal.Source.MANUAL and data.get('manual_progress', 0):
+            raise ValidationError({'manual_progress': ['Only manual goals accept manually recorded progress.']})
+        if data.get('manual_progress', 0) > data['target']:
+            raise ValidationError({'manual_progress': ['Progress cannot exceed the target.']})
+        _tz(data.get('reminder_timezone', 'Asia/Kolkata'))
+        goal = SportsGoal.objects.create(user=user, **data)
+        return serialize_goal(goal)
+
+    @staticmethod
+    def _validate_source_unit(source, unit):
         allowed_units = {
             SportsGoal.Source.PRACTICE_DAYS: {'sessions', 'days'},
             SportsGoal.Source.MATCHES_COMPLETED: {'matches'},
             SportsGoal.Source.CHECKLIST_COMPLETIONS: {'activities', 'completions'},
             SportsGoal.Source.MANUAL: {'sessions', 'minutes', 'repetitions', 'points'},
         }
-        if data['unit'].lower() not in allowed_units[source]:
+        if unit.lower() not in allowed_units[source]:
             raise ValidationError({'unit': [f'Invalid unit for {source}.']})
-        _tz(data.get('reminder_timezone', 'Asia/Kolkata'))
-        goal = SportsGoal.objects.create(user=user, **data)
-        return serialize_goal(goal)
 
     @staticmethod
     @transaction.atomic
@@ -106,6 +114,11 @@ class SportsGoalService:
             setattr(goal, key, value)
         if goal.end_date < goal.start_date:
             raise ValidationError({'end_date': ['End date must be on or after start date.']})
+        if (goal.end_date - goal.start_date).days > 366:
+            raise ValidationError({'end_date': ['Goal duration cannot exceed 367 days.']})
+        SportsGoalService._validate_source_unit(goal.progress_source, goal.unit)
+        if goal.progress_source != SportsGoal.Source.MANUAL and goal.manual_progress:
+            raise ValidationError({'manual_progress': ['Only manual goals accept manually recorded progress.']})
         if goal.progress_source == SportsGoal.Source.MANUAL and goal.manual_progress > goal.target:
             raise ValidationError({'manual_progress': ['Progress cannot exceed the target.']})
         if goal.reminder_enabled:
@@ -135,8 +148,9 @@ class SportsGoalService:
         return serialize_goal(goal)
 
     @staticmethod
-    def summaries(*, user, today=None):
-        today = today or timezone.localdate()
+    def summaries(*, user, today=None, timezone_name='Asia/Kolkata'):
+        tz = _tz(timezone_name)
+        today = today or timezone.now().astimezone(tz).date()
         def range_summary(start, end):
             goals = SportsGoal.objects.filter(user=user, start_date__lte=end, end_date__gte=start).exclude(status=SportsGoal.Status.ARCHIVED)
             return {'goal_count': goals.count(), 'completed_count': goals.filter(status=SportsGoal.Status.COMPLETED).count(), 'progress': [serialize_goal(goal) for goal in goals.order_by('end_date')]}

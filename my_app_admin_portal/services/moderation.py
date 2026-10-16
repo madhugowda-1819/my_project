@@ -1,13 +1,13 @@
-"""Transactional, auditable platform moderation.  API views never mutate targets directly."""
+"""Transactional, auditable platform moderation."""
 from django.db import transaction
 from django.utils import timezone
 from rest_framework.exceptions import NotFound, ValidationError
 
 from my_app.models import (
     Community, CommunityComment, CommunityPost, Event, Game, Message,
-    ModerationAction, PlayerProfile, PlayerRating, Report, Tournament, User,
-    UserModeration, VenueReview,
+    PlayerProfile, PlayerRating, Tournament, User, VenueReview,
 )
+from my_app_admin_portal.models import ModerationAction, Report, UserModeration
 from my_app.services.notifications import NotificationService
 
 
@@ -86,8 +86,8 @@ class ModerationService:
         previous = cls._target_state(target)
         target_user = cls._target_user(target, target_type)
         now = timezone.now()
-
-        if action in [ModerationAction.Action.SUSPEND, ModerationAction.Action.BAN, ModerationAction.Action.RESTORE, ModerationAction.Action.WARN] and target_type != Report.TargetType.USER:
+        account_actions = [ModerationAction.Action.SUSPEND, ModerationAction.Action.BAN, ModerationAction.Action.RESTORE, ModerationAction.Action.WARN]
+        if action in account_actions and target_type != Report.TargetType.USER:
             raise ValidationError({'action': ['User account actions require a user target.']})
         if action == ModerationAction.Action.SUSPEND:
             if ends_at is not None and ends_at <= now:
@@ -128,7 +128,6 @@ class ModerationService:
                 raise ValidationError({'action': ['This target does not support content removal.']})
         else:
             raise ValidationError({'action': ['Unsupported moderation action.']})
-
         action_log = ModerationAction.objects.create(
             moderator=moderator, report=report, target_type=target_type,
             target_public_id=target_public_id, action=action, reason=reason,

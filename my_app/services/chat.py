@@ -140,22 +140,41 @@ class MessageService:
 
     @classmethod
     @transaction.atomic
-    def send(cls, *, conversation, sender, content):
+    def send(cls, *, conversation, sender, content, client_message_id=None):
         if not conversation.active:
             raise ChatError('This conversation is inactive.')
         ChatPermissionService.active_member(conversation=conversation, user=sender)
+        if conversation.game_id and conversation.game.status == Game.Status.CANCELLED:
+            raise ChatError('Cancelled game conversations are read-only.')
         if conversation.conversation_type == Conversation.Type.ONE_TO_ONE:
             other = conversation.participant_two if conversation.participant_one_id == sender.id else conversation.participant_one
             ChatPermissionService.ensure_not_blocked(user=sender, other_user=other)
-        message = Message.objects.create(
-            conversation=conversation, sender=sender, content=cls._content(content), message_type=Message.Type.TEXT,
-        )
-        recipients = ConversationMember.objects.filter(conversation=conversation, is_active=True).exclude(user=sender).select_related('user')
-        for member in recipients:
-            create_notification(
-                user=member.user, type='message', title=f'New message from {sender.username}',
-                body=message.content[:80], data={'message_id': str(message.public_id), 'conversation_id': str(conversation.public_id)},
+        clean_content = cls._content(content)
+        if client_message_id is not None:
+            message, created = Message.objects.get_or_create(
+                conversation=conversation, sender=sender,
+                client_message_id=client_message_id,
+                defaults={'content': clean_content, 'message_type': Message.Type.TEXT},
             )
+            if not created and (message.content != clean_content or message.message_type != Message.Type.TEXT):
+                raise ValidationError({'client_message_id': ['This retry key was already used for a different message.']})
+        else:
+            message = Message.objects.create(
+                conversation=conversation, sender=sender, content=clean_content,
+                message_type=Message.Type.TEXT,
+            )
+            created = True
+        if created:
+            # The conversation directory is ordered by updated_at. Keep that
+            # timestamp aligned with the newest persisted message.
+            conversation.updated_at = message.created_at
+            conversation.save(update_fields=['updated_at'])
+            recipients = ConversationMember.objects.filter(conversation=conversation, is_active=True).exclude(user=sender).select_related('user')
+            for member in recipients:
+                create_notification(
+                    user=member.user, type='message', title=f'New message from {sender.username}',
+                    body=message.content[:80], data={'message_id': str(message.public_id), 'conversation_id': str(conversation.public_id)},
+                )
         return message
 
     @classmethod
@@ -179,6 +198,8 @@ class MessageService:
         message.content = cls._content(content)
         message.is_edited = True
         message.save(update_fields=['content', 'is_edited', 'updated_at'])
+        message.conversation.updated_at = message.updated_at
+        message.conversation.save(update_fields=['updated_at'])
         return message
 
     @classmethod

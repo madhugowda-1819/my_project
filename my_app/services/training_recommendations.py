@@ -1,6 +1,7 @@
 """Explainable, rule-based sport training suggestions (not medical advice or AI)."""
 
 from datetime import timedelta
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from django.utils import timezone
 from rest_framework.exceptions import ValidationError
@@ -29,7 +30,7 @@ SPORT_DRILLS = {
 }
 
 
-def build_training_plan(*, user, sport_id, goal, duration_minutes, days_per_week=3, skill_level=None):
+def build_training_plan(*, user, sport_id, goal, duration_minutes, days_per_week=3, skill_level=None, timezone_name='Asia/Kolkata'):
     """Build a session and a weekly cadence from user-owned sport preferences only."""
     try:
         sport = Sport.objects.get(pk=sport_id, is_active=True)
@@ -44,6 +45,10 @@ def build_training_plan(*, user, sport_id, goal, duration_minutes, days_per_week
         raise ValidationError({'duration_minutes': 'Choose 15 to 120 minutes.'})
     if not 1 <= days_per_week <= 7:
         raise ValidationError({'days_per_week': 'Choose 1 to 7 days per week.'})
+    try:
+        tz = ZoneInfo(timezone_name)
+    except (ZoneInfoNotFoundError, TypeError, ValueError):
+        raise ValidationError({'timezone': 'Use a valid IANA timezone.'})
     skill = skill_level or preference.skill_level
     if skill not in UserSport.SkillLevel.values:
         raise ValidationError({'skill_level': 'Choose a valid skill level.'})
@@ -72,7 +77,7 @@ def build_training_plan(*, user, sport_id, goal, duration_minutes, days_per_week
     weekdays = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']
     step = max(1, 7 // days_per_week)
     session_days = [weekdays[(index * step) % 7] for index in range(days_per_week)]
-    today = timezone.localdate()
+    today = timezone.now().astimezone(tz).date()
     recent_completions = PracticeCompletion.objects.filter(
         user=user, practice_date__gte=today - timedelta(days=6), practice_date__lte=today,
     ).count()

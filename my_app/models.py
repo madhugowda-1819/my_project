@@ -219,9 +219,8 @@ class Venue(TimestampedPublicModel):
         'Ground', null=True, blank=True, on_delete=models.SET_NULL,
         related_name='verified_venue',
     )
-    # Nearby map grounds can host a tournament even before they become a
-    # bookable venue with courts.  Keep the source link to avoid generating a
-    # new Venue every time the same ground is selected.
+    # Legacy tournament-location projection. New tournaments point directly
+    # to Tournament.nearby_ground and do not create Venue rows from discovery.
     source_nearby_ground = models.OneToOneField(
         'SportsGround', null=True, blank=True, on_delete=models.SET_NULL,
         related_name='tournament_venue',
@@ -434,28 +433,6 @@ class Ground(models.Model):
         ]
 
 
-class VenueOwnerApplication(TimestampedPublicModel):
-    class Status(models.TextChoices):
-        PENDING = 'pending', 'Pending'
-        APPROVED = 'approved', 'Approved'
-        REJECTED = 'rejected', 'Rejected'
-
-    applicant = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='venue_owner_applications')
-    business_name = models.CharField(max_length=200)
-    phone = models.CharField(max_length=20)
-    city = models.CharField(max_length=100)
-    address = models.CharField(max_length=255)
-    status = models.CharField(max_length=16, choices=Status.choices, default=Status.PENDING, db_index=True)
-    reviewed_by = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.SET_NULL, related_name='reviewed_venue_owner_applications')
-    review_note = models.CharField(max_length=500, blank=True)
-
-
-class RoleAuditLog(TimestampedPublicModel):
-    actor = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, on_delete=models.SET_NULL, related_name='role_audit_actions')
-    target_user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='role_audit_entries')
-    role = models.CharField(max_length=64)
-    action = models.CharField(max_length=16)
-    reason = models.CharField(max_length=500, blank=True)
 
 
 class SportsGround(models.Model):
@@ -511,6 +488,7 @@ class Match(TimestampedPublicModel):
         ('upcoming', 'Upcoming'),
         ('ongoing', 'Ongoing'),
         ('completed', 'Completed'),
+        ('cancelled', 'Cancelled'),
     ]
 
     sport = models.ForeignKey(Sport, on_delete=models.CASCADE)
@@ -556,6 +534,25 @@ class Match(TimestampedPublicModel):
             models.CheckConstraint(check=models.Q(total_players__gt=0), name='match_total_players_is_positive'),
             models.CheckConstraint(check=models.Q(end_date_time__gt=models.F('date_time')), name='match_end_after_start'),
         ]
+
+
+class MatchParticipation(TimestampedPublicModel):
+    """Auditable legacy Match membership; active roster remains the M2M field."""
+    class Status(models.TextChoices):
+        JOINED = 'joined', 'Joined'
+        LEFT = 'left', 'Left'
+        REMOVED = 'removed', 'Removed'
+
+    match = models.ForeignKey(Match, on_delete=models.CASCADE, related_name='participation_history')
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='match_participation_history')
+    status = models.CharField(max_length=10, choices=Status.choices, default=Status.JOINED, db_index=True)
+    joined_at = models.DateTimeField(default=timezone.now)
+    ended_at = models.DateTimeField(null=True, blank=True)
+    reason = models.CharField(max_length=500, blank=True)
+
+    class Meta:
+        constraints = [models.UniqueConstraint(fields=['match', 'user'], condition=models.Q(status='joined'), name='unique_active_match_participation')]
+        indexes = [models.Index(fields=['user', 'status'], name='match_participant_user_idx')]
 
 
 class MatchTimePoll(TimestampedPublicModel):
@@ -960,7 +957,7 @@ class Tournament(TimestampedPublicModel):
     tournament_reference=models.CharField(max_length=20,unique=True,db_index=True); name=models.CharField(max_length=200)
     is_inter_college = models.BooleanField(default=False, db_index=True)
     organizer=models.ForeignKey(settings.AUTH_USER_MODEL,on_delete=models.PROTECT,related_name='organized_tournaments'); sport=models.ForeignKey(Sport,on_delete=models.PROTECT,related_name='tournaments')
-    community=models.ForeignKey(Community,null=True,blank=True,on_delete=models.SET_NULL,related_name='tournaments'); venue=models.ForeignKey(Venue,on_delete=models.PROTECT,related_name='tournaments'); event=models.OneToOneField(Event,null=True,blank=True,on_delete=models.SET_NULL,related_name='tournament')
+    community=models.ForeignKey(Community,null=True,blank=True,on_delete=models.SET_NULL,related_name='tournaments'); venue=models.ForeignKey(Venue,null=True,blank=True,on_delete=models.PROTECT,related_name='tournaments'); nearby_ground=models.ForeignKey(SportsGround,null=True,blank=True,on_delete=models.SET_NULL,related_name='tournaments'); event=models.OneToOneField(Event,null=True,blank=True,on_delete=models.SET_NULL,related_name='tournament')
     start_date=models.DateField(); end_date=models.DateField(); registration_deadline=models.DateTimeField(); maximum_teams=models.PositiveIntegerField(); format=models.CharField(max_length=24,choices=Format.choices,default=Format.SINGLE_ELIMINATION); skill_level=models.CharField(max_length=16,choices=UserSport.SkillLevel.choices,blank=True); status=models.CharField(max_length=12,choices=Status.choices,default=Status.OPEN,db_index=True)
     class Meta:
         constraints=[models.CheckConstraint(check=models.Q(end_date__gte=models.F('start_date')),name='tournament_date_range_valid'),models.CheckConstraint(check=models.Q(maximum_teams__gt=1),name='tournament_max_teams_valid')]
@@ -1050,6 +1047,7 @@ class Message(TimestampedPublicModel):
 
     conversation = models.ForeignKey(Conversation, null=True, blank=True, on_delete=models.CASCADE, related_name='messages')
     sender = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='sent_messages')
+    client_message_id = models.UUIDField(null=True, blank=True)
     # Retained for legacy `/messages/` clients. All conversation API messages
     # leave this null and use ConversationMember access control.
     receiver = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.CASCADE, related_name='received_messages')
@@ -1072,6 +1070,11 @@ class Message(TimestampedPublicModel):
             models.CheckConstraint(
                 check=models.Q(receiver__isnull=True) | ~models.Q(sender=models.F('receiver')),
                 name='message_sender_differs_from_receiver',
+            ),
+            models.UniqueConstraint(
+                fields=['conversation', 'sender', 'client_message_id'],
+                condition=models.Q(client_message_id__isnull=False),
+                name='unique_conversation_client_message',
             ),
         ]
 
@@ -1114,6 +1117,13 @@ class Notification(TimestampedPublicModel):
             models.Index(fields=['user', 'type', 'created_at'], name='notification_user_type_idx'),
             models.Index(fields=['user', 'deleted_at', '-created_at'], name='notif_user_del_created_idx'),
             models.Index(fields=['user', 'is_read', 'deleted_at'], name='notif_user_unread_idx'),
+        ]
+        constraints = [
+            models.UniqueConstraint(
+                fields=['user', 'event_key'],
+                condition=~models.Q(event_key=''),
+                name='notification_user_event_key_unique',
+            ),
         ]
 
 
@@ -1278,6 +1288,17 @@ class ChallengeEntryMember(TimestampedPublicModel):
     class Meta:
         constraints = [models.UniqueConstraint(fields=['entry', 'user'], name='unique_challenge_entry_member')]
 
+
+class ChallengeRewardGrant(TimestampedPublicModel):
+    """Idempotent record of a configured challenge reward for one entrant."""
+    entry = models.ForeignKey(ChallengeEntry, on_delete=models.CASCADE, related_name='reward_grants')
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='challenge_reward_grants')
+    points = models.PositiveIntegerField(default=0)
+    granted_at = models.DateTimeField(default=timezone.now)
+
+    class Meta:
+        constraints = [models.UniqueConstraint(fields=['entry', 'user'], name='unique_challenge_reward_grant')]
+
 class RecommendationProfile(TimestampedPublicModel):
     user=models.OneToOneField(settings.AUTH_USER_MODEL,on_delete=models.CASCADE,related_name='recommendation_profile')
     preferences=models.JSONField(default=dict,blank=True)
@@ -1377,92 +1398,7 @@ class HealthActivityRecord(TimestampedPublicModel):
         indexes = [models.Index(fields=['user', 'recorded_date', 'metric'], name='health_user_date_metric_idx')]
 
 
-# ---------------------------------------------------------------------------
-# PLATFORM MODERATION
-# ---------------------------------------------------------------------------
-class Report(TimestampedPublicModel):
-    class TargetType(models.TextChoices):
-        USER = 'user', 'User'
-        PLAYER_PROFILE = 'player_profile', 'Player profile'
-        GAME = 'game', 'Game'
-        COMMUNITY = 'community', 'Community'
-        COMMUNITY_POST = 'community_post', 'Community post'
-        COMMUNITY_COMMENT = 'community_comment', 'Community comment'
-        MESSAGE = 'message', 'Message'
-        EVENT = 'event', 'Event'
-        TOURNAMENT = 'tournament', 'Tournament'
-        RATING = 'rating', 'Rating'
-        VENUE_REVIEW = 'venue_review', 'Venue review'
-
-    class Reason(models.TextChoices):
-        SPAM = 'spam', 'Spam'
-        HARASSMENT = 'harassment', 'Harassment'
-        ABUSE = 'abuse', 'Abuse'
-        INAPPROPRIATE_CONTENT = 'inappropriate_content', 'Inappropriate content'
-        FAKE_PROFILE = 'fake_profile', 'Fake profile'
-        FRAUD = 'fraud', 'Fraud'
-        CHEATING = 'cheating', 'Cheating'
-        OTHER = 'other', 'Other'
-
-    class Status(models.TextChoices):
-        PENDING = 'pending', 'Pending'
-        UNDER_REVIEW = 'under_review', 'Under review'
-        RESOLVED = 'resolved', 'Resolved'
-        DISMISSED = 'dismissed', 'Dismissed'
-
-    reporter = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.PROTECT, related_name='reports_created')
-    target_type = models.CharField(max_length=24, choices=TargetType.choices, db_index=True)
-    target_public_id = models.UUIDField(db_index=True)
-    reason = models.CharField(max_length=24, choices=Reason.choices, db_index=True)
-    description = models.TextField(blank=True)
-    status = models.CharField(max_length=16, choices=Status.choices, default=Status.PENDING, db_index=True)
-    assigned_moderator = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.SET_NULL, related_name='reports_assigned')
-    resolution = models.TextField(blank=True)
-    resolved_at = models.DateTimeField(null=True, blank=True)
-
-    class Meta:
-        indexes = [
-            models.Index(fields=['status', 'created_at'], name='report_status_created_idx'),
-            models.Index(fields=['target_type', 'target_public_id'], name='report_target_idx'),
-            models.Index(fields=['reporter', 'created_at'], name='report_reporter_created_idx'),
-        ]
 
 
-class ModerationAction(TimestampedPublicModel):
-    class Action(models.TextChoices):
-        WARN = 'warn', 'Warn'
-        HIDE = 'hide', 'Hide'
-        REMOVE = 'remove', 'Remove'
-        SUSPEND = 'suspend', 'Suspend'
-        BAN = 'ban', 'Ban'
-        RESTORE = 'restore', 'Restore'
-
-    moderator = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.PROTECT, related_name='moderation_actions')
-    report = models.ForeignKey(Report, null=True, blank=True, on_delete=models.SET_NULL, related_name='actions')
-    target_type = models.CharField(max_length=24, choices=Report.TargetType.choices, db_index=True)
-    target_public_id = models.UUIDField(db_index=True)
-    action = models.CharField(max_length=12, choices=Action.choices, db_index=True)
-    reason = models.TextField(blank=True)
-    previous_state = models.JSONField(default=dict, blank=True)
-    new_state = models.JSONField(default=dict, blank=True)
-
-    class Meta:
-        indexes = [models.Index(fields=['target_type', 'target_public_id', 'created_at'], name='moderation_target_time_idx')]
 
 
-class UserModeration(TimestampedPublicModel):
-    """Current and historical platform restrictions; never client writable."""
-    class Status(models.TextChoices):
-        ACTIVE = 'active', 'Active'
-        ENDED = 'ended', 'Ended'
-
-    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='moderation_records')
-    moderator = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.PROTECT, related_name='user_moderations_issued')
-    action = models.CharField(max_length=12, choices=ModerationAction.Action.choices)
-    reason = models.TextField(blank=True)
-    starts_at = models.DateTimeField()
-    ends_at = models.DateTimeField(null=True, blank=True)
-    status = models.CharField(max_length=10, choices=Status.choices, default=Status.ACTIVE, db_index=True)
-
-    class Meta:
-        indexes = [models.Index(fields=['user', 'status'], name='user_moderation_status_idx')]

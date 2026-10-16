@@ -10,6 +10,7 @@ from my_app.models import (
     TournamentTeamMember,
 )
 from my_app.services.events import EventService, TournamentMatchService
+from my_app.services.notifications import NotificationService
 from my_app.utils import create_notification
 
 
@@ -26,6 +27,9 @@ class CollegeService:
     @classmethod
     @transaction.atomic
     def submit(cls, *, actor, name, city, state='', country='India', description='', approved_email_domain='', verification_evidence=''):
+        name, city, country = name.strip(), city.strip(), country.strip()
+        if College.objects.filter(name__iexact=name, city__iexact=city, country__iexact=country).exists():
+            raise ValidationError({'name': 'A college with this name and location has already been submitted.'})
         base = slugify(name)[:190] or 'college'
         slug, suffix = base, 2
         while College.objects.filter(slug=slug).exists():
@@ -33,8 +37,8 @@ class CollegeService:
             slug = f'{base[:200-len(ending)]}{ending}'
             suffix += 1
         college = College.objects.create(
-            name=name.strip(), slug=slug, city=city.strip(), state=state.strip(),
-            country=country.strip(), description=description.strip(),
+            name=name, slug=slug, city=city, state=state.strip(),
+            country=country, description=description.strip(),
             approved_email_domain=approved_email_domain.strip().lower().lstrip('@'),
             verification_evidence=verification_evidence, submitted_by=actor,
         )
@@ -45,6 +49,8 @@ class CollegeService:
     @transaction.atomic
     def review(cls, *, college, actor, approve, reason=''):
         college = College.objects.select_for_update().get(pk=college.pk)
+        if college.verification_status != College.VerificationStatus.PENDING:
+            raise ValidationError('Only pending college submissions can be reviewed.')
         college.verification_status = College.VerificationStatus.VERIFIED if approve else College.VerificationStatus.REJECTED
         college.reviewed_by, college.reviewed_at = actor, timezone.now()
         college.rejection_reason = '' if approve else reason.strip()
@@ -53,6 +59,13 @@ class CollegeService:
         if membership:
             membership.status = CollegeMembership.Status.ACTIVE if approve else CollegeMembership.Status.REJECTED
             membership.save(update_fields=['status', 'updated_at'])
+        NotificationService.create_notification(
+            user=college.submitted_by, type='message',
+            title='College verification update',
+            body=(f'{college.name} was verified.' if approve else f'{college.name} was not verified. {college.rejection_reason}').strip(),
+            data={'college_id': str(college.public_id), 'verification_status': college.verification_status},
+            event_key=f'college-review:{college.pk}:{college.verification_status}',
+        )
         return college
 
     @classmethod
@@ -119,7 +132,10 @@ class CollegeService:
             raise ValidationError('A college cannot challenge itself.')
         if any(c.verification_status != College.VerificationStatus.VERIFIED for c in (challenger, challenged)):
             raise ValidationError('Both colleges must be verified to create a challenge.')
-        challenge = CollegeChallenge.objects.create(challenger=challenger, challenged=challenged, sport=sport, message=message.strip(), created_by=actor)
+        try:
+            challenge = CollegeChallenge.objects.create(challenger=challenger, challenged=challenged, sport=sport, message=message.strip(), created_by=actor)
+        except IntegrityError as exc:
+            raise ValidationError('A pending challenge for this college and sport already exists.') from exc
         for admin in CollegeMembership.objects.filter(college=challenged, role=CollegeMembership.Role.ADMIN, status=CollegeMembership.Status.ACTIVE).select_related('user'):
             create_notification(user=admin.user, type='message', title='College challenge received', body=f'{challenger.name} challenged {challenged.name} in {sport.name}.', data={'challenge_id': challenge.public_id.hex})
         return challenge
@@ -135,6 +151,8 @@ class CollegeService:
             challenge.status = CollegeChallenge.Status.DECLINED
             challenge.save(update_fields=['status', 'updated_at'])
             return challenge
+        if any(college.verification_status != College.VerificationStatus.VERIFIED for college in (challenge.challenger, challenge.challenged)):
+            raise ValidationError('Both colleges must remain verified to accept this challenge.')
         if start_date < timezone.localdate() or end_date < start_date or registration_deadline <= timezone.now() or registration_deadline.date() > start_date:
             raise ValidationError('Challenge fixture dates or registration deadline are invalid.')
         community = challenge.challenger.clubs.filter(is_active=True).first()
@@ -151,8 +169,12 @@ class CollegeService:
     @classmethod
     @transaction.atomic
     def create_team(cls, *, tournament, college, actor, name):
+        tournament = Tournament.objects.select_for_update().select_related('college_challenge').get(pk=tournament.pk)
+        college = College.objects.select_for_update().get(pk=college.pk)
         if not tournament.is_inter_college or not hasattr(tournament, 'college_challenge'):
             raise ValidationError('Tournament is not an inter-college competition.')
+        if tournament.status != Tournament.Status.OPEN or timezone.now() >= tournament.registration_deadline:
+            raise ValidationError('The tournament team registration period is closed.')
         cls.membership(college, actor, admin=True)
         if college.verification_status != College.VerificationStatus.VERIFIED:
             raise PermissionDenied('Verified college membership is required.')
@@ -165,15 +187,25 @@ class CollegeService:
             raise ValidationError('This tournament has reached its team capacity.')
         if tournament.teams.filter(college=college).exists():
             raise ValidationError('This college already has a team in the tournament.')
-        team = TournamentTeam.objects.create(tournament=tournament, college=college, name=name.strip(), captain=actor, created_by=actor, seed=tournament.teams.count()+1)
+        try:
+            team = TournamentTeam.objects.create(tournament=tournament, college=college, name=name.strip(), captain=actor, created_by=actor, seed=tournament.teams.count()+1)
+        except IntegrityError as exc:
+            raise ValidationError('A team with this name is already registered.') from exc
         TournamentTeamMember.objects.create(team=team, user=actor, role=TournamentTeamMember.Role.CAPTAIN)
         return team
 
     @classmethod
     @transaction.atomic
     def add_roster_member(cls, *, team, actor, user):
+        tournament = Tournament.objects.select_for_update().get(pk=team.tournament_id)
+        team = TournamentTeam.objects.select_for_update().select_related('college').get(pk=team.pk)
+        team.tournament = tournament
         if not team.college_id or not team.tournament.is_inter_college:
             raise ValidationError('This is not a college team.')
+        if team.status != TournamentTeam.Status.ACTIVE:
+            raise ValidationError('This team is not accepting roster members.')
+        if team.college.verification_status != College.VerificationStatus.VERIFIED:
+            raise ValidationError('The college must remain verified to update its tournament roster.')
         cls.membership(team.college, actor, admin=True)
         cls.membership(team.college, user)
         if team.tournament.status != Tournament.Status.OPEN or timezone.now() >= team.tournament.registration_deadline:
@@ -206,8 +238,12 @@ class CollegeService:
     @classmethod
     @transaction.atomic
     def record_result(cls, *, match, actor, score_a, score_b):
-        tournament = match.tournament
+        tournament = Tournament.objects.select_for_update().get(pk=match.tournament_id)
+        match = TournamentMatch.objects.select_for_update().select_related('team_a', 'team_b').get(pk=match.pk)
+        match.tournament = tournament
         if tournament.is_inter_college:
+            if tournament.status in (Tournament.Status.CANCELLED, Tournament.Status.COMPLETED):
+                raise ValidationError('Results cannot be changed for a cancelled or completed tournament.')
             if match.status == TournamentMatch.Status.COMPLETED:
                 raise ValidationError('This result has already been submitted. Use the dispute process to challenge it.')
             if not match.team_a_id or not match.team_b_id or match.team_a.college_id == match.team_b.college_id:
@@ -260,7 +296,7 @@ class CollegeService:
         for team in (match.team_a, match.team_b):
             if team:
                 for admin in CollegeMembership.objects.filter(college=team.college, role=CollegeMembership.Role.ADMIN, status=CollegeMembership.Status.ACTIVE).select_related('user'):
-                    create_notification(user=admin.user, type='message', title='College result disputed', body=f'A player disputed the result for {team.tournament.name}.', data={'match_id': match.public_id.hex, 'dispute_id': dispute.public_id.hex})
+                    create_notification(user=admin.user, type='message', title='College result disputed', body=f'A player disputed the result for {team.tournament.name}.', data={'match_id': str(match.public_id), 'dispute_id': str(dispute.public_id)})
         return dispute
 
     @staticmethod

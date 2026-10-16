@@ -10,7 +10,7 @@ from django.db import IntegrityError, transaction
 from django.utils import timezone
 from rest_framework.exceptions import APIException, NotFound, PermissionDenied, ValidationError
 
-from my_app.models import Court, Game, GamePlayer, Sport, UserSport, Venue
+from my_app.models import Court, Game, GamePlayer, Sport, User, UserSport, Venue
 from my_app.services.bookings import BookingService
 
 
@@ -181,6 +181,13 @@ class GameService:
         from my_app.services.chat import ConversationService, MessageService
         conversation = ConversationService.sync_game_member(game=game, user=user, active=True)
         MessageService.system_message(conversation=conversation, content=f'{user.username} joined the game.')
+        from my_app.services.notifications import NotificationService
+        NotificationService.create_notification(
+            user=game.host, actor=user, type='game_joined', title='Player joined your game',
+            body=f'{user.username} joined {game.sport.name} at {game.venue.name}.',
+            data={'game_id': str(game.public_id)},
+            event_key=f'game-joined:{game.pk}:{user.pk}:{timezone.now().timestamp()}',
+        )
         return GameLifecycleService.refresh(game), True
 
     @classmethod
@@ -206,6 +213,13 @@ class GameService:
             from my_app.services.chat import ConversationService, MessageService
             conversation = ConversationService.sync_game_member(game=game, user=user, active=False)
             MessageService.system_message(conversation=conversation, content='The host cancelled the game.')
+            from my_app.services.notifications import NotificationService
+            for participant in game.game_players.filter(status=GamePlayer.Status.CONFIRMED).exclude(user=user).select_related('user'):
+                NotificationService.create_notification(
+                    user=participant.user, actor=user, type='game_cancelled', title='Game cancelled',
+                    body=f'{user.username} cancelled the {game.sport.name} game.',
+                    data={'game_id': str(game.public_id)}, event_key=f'game-cancelled:{game.pk}:{participant.user_id}',
+                )
             return game, 'cancelled'
         membership = GamePlayer.objects.select_for_update().filter(
             game=game, user=user, status=GamePlayer.Status.CONFIRMED,
@@ -218,7 +232,50 @@ class GameService:
         from my_app.services.chat import ConversationService, MessageService
         conversation = ConversationService.sync_game_member(game=game, user=user, active=False)
         MessageService.system_message(conversation=conversation, content=f'{user.username} left the game.')
+        from my_app.services.notifications import NotificationService
+        NotificationService.create_notification(
+            user=game.host, actor=user, type='game_joined', title='Player left your game',
+            body=f'{user.username} left {game.sport.name}; their player slot is available again.',
+            data={'game_id': str(game.public_id)},
+            event_key=f'game-left:{game.pk}:{user.pk}:{membership.pk}',
+        )
         return GameLifecycleService.refresh(game), 'left'
+
+    @classmethod
+    @transaction.atomic
+    def remove_player(cls, *, game_id, actor, player_id, reason=''):
+        try:
+            game = Game.objects.select_for_update().select_related('host', 'sport', 'venue').get(public_id=game_id)
+        except Game.DoesNotExist as exc:
+            raise NotFound('Game not found.') from exc
+        if game.host_id != actor.id:
+            raise PermissionDenied('Only the game host can remove players.')
+        GameLifecycleService.refresh(game)
+        if game.status not in (Game.Status.OPEN, Game.Status.ALMOST_FULL, Game.Status.FULL):
+            raise GameUnavailable('Players can only be removed before the game starts.')
+        if player_id == game.host_id:
+            raise GameUnavailable('The game host cannot be removed.')
+        membership = GamePlayer.objects.select_for_update().filter(
+            game=game, user_id=player_id, status=GamePlayer.Status.CONFIRMED,
+        ).select_related('user').first()
+        if membership is None:
+            raise GameUnavailable('That player is not an active participant in this game.')
+        now = timezone.now()
+        membership.status = GamePlayer.Status.REMOVED
+        membership.left_at = now
+        membership.save(update_fields=['status', 'left_at', 'updated_at'])
+        from my_app.services.chat import ConversationService, MessageService
+        conversation = ConversationService.sync_game_member(game=game, user=membership.user, active=False)
+        MessageService.system_message(conversation=conversation, content=f'{membership.user.username} was removed from the game.')
+        from my_app.services.notifications import NotificationService
+        clean_reason = reason.strip()
+        NotificationService.create_notification(
+            user=membership.user, actor=actor, type='game_joined', title='Removed from game',
+            body=f'You were removed from {game.sport.name} at {game.venue.name}.' + (f' Reason: {clean_reason}' if clean_reason else ''),
+            data={'game_id': str(game.public_id), 'reason': clean_reason},
+            event_key=f'game-removed:{game.pk}:{membership.user_id}:{membership.pk}',
+        )
+        return GameLifecycleService.refresh(game)
 
     @classmethod
     @transaction.atomic
@@ -242,6 +299,14 @@ class GameService:
         for field, value in changes.items():
             setattr(game, field, value)
         game.save(update_fields=[*changes.keys(), 'updated_at'])
+        from my_app.services.notifications import NotificationService
+        for participant in game.game_players.filter(status=GamePlayer.Status.CONFIRMED).exclude(user=actor).select_related('user'):
+            NotificationService.create_notification(
+                user=participant.user, actor=actor, type='game_updated', title='Game details updated',
+                body=f'The host updated details for the {game.sport.name} game.',
+                data={'game_id': str(game.public_id)},
+                event_key=f'game-updated:{game.pk}:{game.updated_at.isoformat()}:{participant.user_id}',
+            )
         return GameLifecycleService.refresh(game)
 
     @classmethod
@@ -262,4 +327,11 @@ class GameService:
         from my_app.services.chat import ConversationService, MessageService
         conversation = ConversationService.game_conversation(game=game)
         MessageService.system_message(conversation=conversation, content='The game was cancelled.')
+        from my_app.services.notifications import NotificationService
+        for participant in game.game_players.filter(status=GamePlayer.Status.CONFIRMED).exclude(user=actor).select_related('user'):
+            NotificationService.create_notification(
+                user=participant.user, actor=actor, type='game_cancelled', title='Game cancelled',
+                body=f'{actor.username} cancelled the {game.sport.name} game.',
+                data={'game_id': str(game.public_id)}, event_key=f'game-cancelled:{game.pk}:{participant.user_id}',
+            )
         return game

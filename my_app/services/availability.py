@@ -1,6 +1,7 @@
 from datetime import datetime, timedelta, timezone as datetime_timezone
 from decimal import Decimal
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+from django.db.models import Q
 
 from django.db import transaction
 from django.utils import timezone
@@ -45,9 +46,18 @@ class VenueAvailabilityService:
         local_open, local_close = cls.local_range(venue, date_value)
         courts = venue.courts.select_related('sport').filter(active=True)
         if sport:
-            courts = courts.filter(sport=sport)
+            sport_value = str(getattr(sport, 'pk', sport))
+            courts = courts.filter(
+                Q(sport__pk=sport_value if sport_value.isdigit() else -1)
+                | Q(sport__slug__iexact=sport_value)
+                | Q(sport__name__iexact=sport_value)
+            )
         if court_id:
-            courts = courts.filter(pk=court_id)
+            court_value = str(court_id)
+            courts = courts.filter(
+                Q(pk=court_value if court_value.isdigit() else -1)
+                | Q(public_id__iexact=court_value)
+            )
         court_list = list(courts)
         if court_id and not court_list:
             raise ValidationError({'court': ['Court is unavailable for this venue and filter.']})
@@ -79,6 +89,8 @@ class VenueAvailabilityService:
                 end = cursor + timedelta(minutes=duration)
                 utc_start, utc_end = cursor.astimezone(datetime_timezone.utc), end.astimezone(datetime_timezone.utc)
                 status = 'available' if venue.active and court.active else 'closed'
+                if status == 'available' and utc_start <= timezone.now():
+                    status = 'closed'
                 if status == 'available' and any(cls.overlaps(utc_start, utc_end, booking.starts_at, booking.ends_at) for booking in bookings_by_court[court.pk]):
                     status = 'booked'
                 if status == 'available' and any(cls.overlaps(utc_start, utc_end, game.starts_at, game.ends_at) for game in games_by_court[court.pk]):

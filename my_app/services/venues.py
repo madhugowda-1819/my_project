@@ -1,7 +1,7 @@
-from django.db.models import Avg, Q
+from django.db.models import Avg, Prefetch, Q
 from rest_framework.exceptions import PermissionDenied, ValidationError
 
-from my_app.models import CourtBooking, VenueReview
+from my_app.models import Court, CourtBooking, VenueReview
 from my_app.services.locations import nearby_queryset
 
 
@@ -20,8 +20,15 @@ class VenueDiscoveryService:
             is_demo=False,
             courts__active=True,
         ).distinct().prefetch_related(
-            'venue_sports__sport', 'courts__sport', 'images', 'reviews', 'amenities',
+            'venue_sports__sport',
+            Prefetch('courts', queryset=Court.objects.filter(active=True).select_related('sport')),
+            'images', 'reviews', 'amenities',
         )
+        if data.get('q'):
+            query = data['q'].strip()
+            queryset = queryset.filter(
+                Q(name__icontains=query) | Q(address__icontains=query) | Q(city__icontains=query),
+            )
         if data.get('sport'):
             sport = str(data['sport'])
             queryset = queryset.filter(

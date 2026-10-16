@@ -44,7 +44,8 @@ class HealthActivityService:
                 raise ValidationError({'records': [f'{metric} value exceeds the supported daily maximum.']})
             recorded_date = item['recorded_date']
             try:
-                local_today = timezone.now().astimezone(ZoneInfo(item.get('timezone', 'UTC'))).date()
+                timezone_name = item.get('timezone', 'Asia/Kolkata')
+                local_today = timezone.now().astimezone(ZoneInfo(timezone_name)).date()
             except (ZoneInfoNotFoundError, TypeError):
                 raise ValidationError({'records': ['Every imported record must use a valid IANA timezone.']})
             if recorded_date > local_today or recorded_date < local_today - timedelta(days=365):
@@ -54,7 +55,7 @@ class HealthActivityService:
                 defaults={
                     'metric': metric, 'value': value, 'unit': METRIC_UNITS[metric],
                     'recorded_date': recorded_date, 'synced_at': now,
-                    'recorded_timezone': item.get('timezone', 'UTC'),
+                    'recorded_timezone': timezone_name,
                     'is_estimated': False,
                 },
             )

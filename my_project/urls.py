@@ -11,8 +11,12 @@ urlpatterns = [
     path('reset-password/', password_reset_page),
     path('admin/', admin.site.urls),
     # Versioned API for all new integrations.
+    path('api/v1/', include('my_app_admin_portal.urls')),
+    path('api/v1/', include('my_app_venue_portal.urls')),
     path('api/v1/', include('my_app.urls')),
     # Legacy route retained while mobile clients migrate to v1.
+    path('api/', include('my_app_admin_portal.urls')),
+    path('api/', include('my_app_venue_portal.urls')),
     path('api/', include('my_app.urls')),
 ]
 

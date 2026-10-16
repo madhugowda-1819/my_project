@@ -4,9 +4,8 @@ from datetime import timedelta
 from django.db import transaction
 from django.utils import timezone
 from rest_framework.exceptions import APIException, NotFound, PermissionDenied, ValidationError
-from my_app.models import Event, EventParticipant, EventReminder, Tournament, TournamentTeam, TournamentTeamMember, TournamentMatch, UserSport
+from my_app.models import CommunityMember, Court, Event, EventParticipant, EventReminder, Tournament, TournamentTeam, TournamentTeamMember, TournamentMatch, UserSport
 from my_app.services.bookings import BookingService
-from my_app.utils import create_notification
 
 class EventError(APIException): status_code=400; default_code='EVENT_ERROR'; default_detail='Event request could not be completed.'
 class EventCapacityService:
@@ -24,10 +23,18 @@ class EventService:
  @transaction.atomic
  def create(cls,*,organizer,**data):
   venue=data['venue']; court=data.get('court')
+  community=data.get('community')
+  if community and not CommunityMember.objects.filter(
+   community=community,user=organizer,status=CommunityMember.Status.ACTIVE,
+   role__in=[CommunityMember.Role.OWNER,CommunityMember.Role.CAPTAIN,CommunityMember.Role.ADMIN],
+  ).exists():
+   raise PermissionDenied('Only an active club leader can create a community-linked event.')
   if not venue.active or (court and (not court.active or court.venue_id!=venue.id or court.sport_id!=data['sport'].id)): raise EventError('Invalid active venue/court for this event.')
   starts,ends=BookingService._local_datetimes(venue=venue,booking_date=data['event_date'],start_time=data['start_time'],end_time=data['end_time'])
   if starts<=timezone.now() or data['registration_deadline']>=starts: raise ValidationError('Event must be future and registration deadline must precede it.')
-  if court: BookingService._validate_request(venue=venue,court=court,booking_date=data['event_date'],start_time=data['start_time'],end_time=data['end_time'],lock_bookings=True)
+  if court:
+   court= Court.objects.select_for_update().get(pk=court.pk)
+   BookingService._validate_request(venue=venue,court=court,booking_date=data['event_date'],start_time=data['start_time'],end_time=data['end_time'],lock_bookings=True)
   return Event.objects.create(event_reference=cls.ref('EV'),organizer=organizer,starts_at=starts,ends_at=ends,**data)
 class EventRegistrationService:
  @classmethod
@@ -46,7 +53,12 @@ class EventRegistrationService:
   _,slots=EventCapacityService.refresh(event); status=EventParticipant.Status.REGISTERED if slots else EventParticipant.Status.WAITLISTED
   if existing: existing.status=status; existing.left_at=None; existing.save(update_fields=['status','left_at','updated_at']); participant=existing
   else: participant=EventParticipant.objects.create(event=event,user=user,status=status)
-  EventCapacityService.refresh(event); create_notification(user=user,type='message',title='Event registration',body=('Registered.' if status=='registered' else 'Added to waitlist.'),data={'event_id':event.public_id.hex})
+  EventCapacityService.refresh(event)
+  from my_app.services.notifications import NotificationService
+  if event.organizer_id != user.id:
+   NotificationService.create_notification(user=event.organizer,actor=user,type='event_registered' if status=='registered' else 'event_waitlisted',title='Event registration update',body=f'{user.username} '+('registered for' if status=='registered' else 'joined the waitlist for')+f' {event.title}.',data={'event_id':str(event.public_id)},event_key=f'event-registration:{participant.pk}:{status}')
+  else:
+   NotificationService.create_notification(user=user,type='event_registered',title='Event registration confirmed',body=f'You are registered for {event.title}.',data={'event_id':str(event.public_id)},event_key=f'event-registration:{participant.pk}:{status}')
   return participant,True
  @classmethod
  @transaction.atomic
@@ -59,7 +71,10 @@ class EventRegistrationService:
   if not removed: EventReminder.objects.filter(event=event,user=user,sent_at__isnull=True,cancelled_at__isnull=True).update(cancelled_at=timezone.now(),updated_at=timezone.now())
   if not removed:
    nxt=EventParticipant.objects.select_for_update().filter(event=event,status=EventParticipant.Status.WAITLISTED).order_by('joined_at','id').first()
-   if nxt: nxt.status=EventParticipant.Status.REGISTERED; nxt.save(update_fields=['status','updated_at']); create_notification(user=nxt.user,type='message',title='Event waitlist promotion',body=f'You are registered for {event.title}.',data={'event_id':event.public_id.hex})
+   if nxt:
+    nxt.status=EventParticipant.Status.REGISTERED; nxt.save(update_fields=['status','updated_at'])
+    from my_app.services.notifications import NotificationService
+    NotificationService.create_notification(user=nxt.user,type='event_promoted',title='Event waitlist promotion',body=f'You are registered for {event.title}.',data={'event_id':str(event.public_id)},event_key=f'event-waitlist-promoted:{nxt.pk}')
   EventCapacityService.refresh(event); return p
 
 
@@ -95,7 +110,8 @@ class EventReminderService:
   for reminder in reminders:
    if not EventParticipant.objects.filter(event=reminder.event,user=reminder.user,status=EventParticipant.Status.REGISTERED).exists():
     reminder.cancelled_at=now;reminder.save(update_fields=['cancelled_at','updated_at']);continue
-   create_notification(user=reminder.user,type='reminder',title='Event reminder',body=f'{reminder.event.title} starts at {reminder.event.starts_at:%b %d, %Y %I:%M %p}.',data={'event_id':reminder.event.public_id.hex,'starts_at':reminder.event.starts_at.isoformat()},priority=2)
+   from my_app.services.notifications import NotificationService
+   NotificationService.create_notification(user=reminder.user,type='reminder',title='Event reminder',body=f'{reminder.event.title} starts at {reminder.event.starts_at:%b %d, %Y %I:%M %p}.',data={'event_id':str(reminder.event.public_id),'starts_at':reminder.event.starts_at.isoformat()},priority=2,event_key=f'event-reminder:{reminder.pk}')
    reminder.sent_at=now;reminder.save(update_fields=['sent_at','updated_at']);sent+=1
   return sent
 
@@ -111,7 +127,8 @@ class EventCancellationService:
   event.status=Event.Status.CANCELLED;event.save(update_fields=['status','updated_at'])
   participants=EventParticipant.objects.select_for_update().filter(event=event,status__in=[EventParticipant.Status.REGISTERED,EventParticipant.Status.WAITLISTED]).select_related('user')
   for participant in participants:
-   create_notification(user=participant.user,type='message',title='Event cancelled',body=f'{event.title} has been cancelled by its organizer.',data={'event_id':event.public_id.hex})
+   from my_app.services.notifications import NotificationService
+   NotificationService.create_notification(user=participant.user,actor=actor,type='event_cancelled',title='Event cancelled',body=f'{event.title} has been cancelled by its organizer.',data={'event_id':str(event.public_id)},event_key=f'event-cancelled:{event.pk}:{participant.user_id}')
    participant.status=EventParticipant.Status.CANCELLED;participant.left_at=timezone.now();participant.save(update_fields=['status','left_at','updated_at'])
   EventReminder.objects.filter(event=event,sent_at__isnull=True,cancelled_at__isnull=True).update(cancelled_at=timezone.now(),updated_at=timezone.now())
   return event
@@ -126,6 +143,23 @@ class TournamentService:
   if active_count>=tournament.maximum_teams: raise EventError('Tournament team capacity is full.')
   team=TournamentTeam.objects.create(tournament=tournament,name=name.strip(),captain=creator,created_by=creator,seed=active_count+1)
   TournamentTeamMember.objects.create(team=team,user=creator,role=TournamentTeamMember.Role.CAPTAIN); return team
+
+ @classmethod
+ @transaction.atomic
+ def cancel(cls, *, tournament, actor):
+  tournament = Tournament.objects.select_for_update().get(pk=tournament.pk)
+  if tournament.organizer_id != actor.id and not actor.is_staff:
+   raise PermissionDenied('Only the tournament organizer can cancel it.')
+  if tournament.status == Tournament.Status.COMPLETED:
+   raise ValidationError('Completed tournaments cannot be cancelled.')
+  if tournament.status == Tournament.Status.CANCELLED:
+   return tournament
+  tournament.status = Tournament.Status.CANCELLED
+  tournament.save(update_fields=['status', 'updated_at'])
+  tournament.matches.filter(status__in=[TournamentMatch.Status.SCHEDULED, TournamentMatch.Status.LIVE]).update(
+   status=TournamentMatch.Status.CANCELLED, updated_at=timezone.now(),
+  )
+  return tournament
 
 class TournamentRegistrationService:
  @classmethod
@@ -168,15 +202,24 @@ class TournamentBracketService:
  @classmethod
  @transaction.atomic
  def generate(cls,*,tournament,actor):
+  tournament=Tournament.objects.select_for_update().get(pk=tournament.pk)
   if tournament.organizer_id!=actor.id and not actor.is_staff: raise PermissionDenied('Only organizer can generate brackets.')
+  if tournament.status not in (Tournament.Status.OPEN, Tournament.Status.FULL): raise EventError('Brackets can only be generated for an open tournament.')
   if tournament.matches.exists(): raise EventError('Bracket already generated.')
   teams=list(tournament.teams.filter(status=TournamentTeam.Status.ACTIVE).order_by('seed','created_at'))
   if len(teams)<2: raise EventError('At least two teams are required.')
-  if tournament.format==Tournament.Format.ROUND_ROBIN:
-   no=1
-   for i,a in enumerate(teams):
-    for b in teams[i+1:]: TournamentMatch.objects.create(tournament=tournament,round_number=i+1,match_number=no,team_a=a,team_b=b); no+=1
-  else:
+  if tournament.format in (Tournament.Format.ROUND_ROBIN, Tournament.Format.LEAGUE):
+   rotation=list(teams)
+   if len(rotation)%2: rotation.append(None)
+   for round_number in range(1,len(rotation)):
+    match_number=1
+    for index in range(len(rotation)//2):
+     team_a,team_b=rotation[index],rotation[len(rotation)-1-index]
+     if team_a is not None and team_b is not None:
+      TournamentMatch.objects.create(tournament=tournament,round_number=round_number,match_number=match_number,team_a=team_a,team_b=team_b)
+      match_number+=1
+    rotation=[rotation[0],rotation[-1],*rotation[1:-1]]
+  elif tournament.format == Tournament.Format.SINGLE_ELIMINATION:
    # Build every round up front.  This gives the organizer a complete
    # quarter-final/semi-final/final schedule as soon as the bracket starts.
    size=2**math.ceil(math.log2(len(teams)))
@@ -190,6 +233,8 @@ class TournamentBracketService:
     else: match.team_b=team
     match.save(update_fields=['team_a','team_b','updated_at'])
    cls.resolve_walkovers(tournament)
+  else:
+   raise ValidationError('Double elimination brackets are not supported yet.')
   tournament.status=Tournament.Status.STARTED; tournament.save(update_fields=['status','updated_at']); return tournament.matches.all()
 
  @staticmethod
@@ -236,17 +281,27 @@ class TournamentMatchService:
  @classmethod
  @transaction.atomic
  def result(cls,*,match,actor,score_a,score_b):
-  if match.tournament.organizer_id!=actor.id and not actor.is_staff: raise PermissionDenied('Only organizer can submit results.')
-  if match.status!=TournamentMatch.Status.SCHEDULED or not match.team_a_id or not match.team_b_id: raise ValidationError('Both teams must be ready before recording a result.')
+  tournament=Tournament.objects.select_for_update().get(pk=match.tournament_id)
+  match=TournamentMatch.objects.select_for_update().select_related('team_a','team_b').get(pk=match.pk)
+  match.tournament=tournament
+  if tournament.organizer_id!=actor.id and not actor.is_staff: raise PermissionDenied('Only organizer can submit results.')
+  if tournament.status in (Tournament.Status.CANCELLED,Tournament.Status.COMPLETED): raise ValidationError('Results cannot be changed for a cancelled or completed tournament.')
+  if match.status not in (TournamentMatch.Status.SCHEDULED,TournamentMatch.Status.LIVE) or not match.team_a_id or not match.team_b_id: raise ValidationError('Both teams must be ready before recording a result.')
   try: score_a,score_b=int(score_a),int(score_b)
   except (TypeError,ValueError) as exc: raise ValidationError('Scores must be integers.') from exc
-  if score_a<0 or score_b<0 or score_a==score_b: raise ValidationError('Scores must be non-negative and decisive.')
-  match.score_a,match.score_b=score_a,score_b; match.winner=match.team_a if score_a>score_b else match.team_b; match.status=TournamentMatch.Status.COMPLETED; match.save(update_fields=['score_a','score_b','winner','status','updated_at'])
-  if match.tournament.format!=Tournament.Format.ROUND_ROBIN:
+  round_robin = tournament.format in (Tournament.Format.ROUND_ROBIN, Tournament.Format.LEAGUE)
+  if score_a<0 or score_b<0 or (score_a==score_b and not round_robin): raise ValidationError('Scores must be non-negative; knockout results must be decisive.')
+  match.score_a,match.score_b=score_a,score_b
+  match.winner=match.team_a if score_a>score_b else match.team_b if score_b>score_a else None
+  match.status=TournamentMatch.Status.COMPLETED; match.save(update_fields=['score_a','score_b','winner','status','updated_at'])
+  if not round_robin:
    loser=match.team_b if match.winner_id==match.team_a_id else match.team_a
    loser.status=TournamentTeam.Status.ELIMINATED;loser.save(update_fields=['status','updated_at'])
    TournamentBracketService.advance(match,match.winner)
    TournamentBracketService.resolve_walkovers(match.tournament)
+  elif not tournament.matches.exclude(status__in=[TournamentMatch.Status.COMPLETED,TournamentMatch.Status.CANCELLED]).exists():
+   tournament.status=Tournament.Status.COMPLETED
+   tournament.save(update_fields=['status','updated_at'])
   return match
 class TournamentStandingsService:
  @staticmethod

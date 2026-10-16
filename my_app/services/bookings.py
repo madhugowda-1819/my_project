@@ -2,8 +2,10 @@
 import secrets
 from datetime import datetime, timedelta, timezone as datetime_timezone
 from decimal import Decimal
+from time import sleep
 
-from django.db import IntegrityError, transaction
+from django.db import IntegrityError, OperationalError, connection, transaction
+from django.db.models import F
 from django.utils import timezone
 from rest_framework.exceptions import APIException, NotFound, PermissionDenied, ValidationError
 
@@ -82,6 +84,14 @@ class BookingCancellationService:
         booking.cancellation_reason = reason.strip()
         booking.cancelled_at = timezone.now()
         booking.save(update_fields=['status', 'cancellation_reason', 'cancelled_at', 'updated_at'])
+        from my_app.services.notifications import NotificationService
+        if booking.venue.owner_id and booking.venue.owner_id != actor.id:
+            NotificationService.create_notification(
+                user=booking.venue.owner, actor=actor, type='booking_cancelled',
+                title='Booking cancelled', body=f'{actor.username} cancelled booking {booking.booking_reference}.',
+                data={'booking_id': str(booking.public_id), 'venue_id': str(booking.venue.public_id)},
+                event_key=f'booking-cancelled:{booking.pk}:{booking.updated_at.isoformat()}:owner:{booking.venue.owner_id}',
+            )
         return booking
 
 
@@ -100,6 +110,8 @@ class BookingService:
         zone = VenueAvailabilityService.venue_zone(venue)
         local_start = timezone.make_aware(datetime.combine(booking_date, start_time), zone)
         local_end = timezone.make_aware(datetime.combine(booking_date, end_time), zone)
+        if local_start <= timezone.now():
+            raise BookingError('Past times cannot be booked.')
         if local_start < local_open or local_end > local_close:
             raise BookingError('Requested time is outside venue operating hours.')
         return local_start.astimezone(datetime_timezone.utc), local_end.astimezone(datetime_timezone.utc)
@@ -157,8 +169,30 @@ class BookingService:
         return venue, court, prices
 
     @classmethod
-    @transaction.atomic
     def create(cls, *, user, venue_id, court_id, booking_date, start_time, end_time, status=CourtBooking.Status.CONFIRMED):
+        for attempt in range(5):
+            try:
+                return cls._create_once(
+                    user=user, venue_id=venue_id, court_id=court_id,
+                    booking_date=booking_date, start_time=start_time,
+                    end_time=end_time, status=status,
+                )
+            except OperationalError as exc:
+                locked = 'locked' in str(exc).lower()
+                if connection.vendor != 'sqlite' or not locked:
+                    raise
+                if attempt == 4:
+                    raise BookingConflict('This slot is being booked right now. Refresh availability and try again.') from exc
+                sleep(0.05 * (attempt + 1))
+
+    @classmethod
+    @transaction.atomic
+    def _create_once(cls, *, user, venue_id, court_id, booking_date, start_time, end_time, status=CourtBooking.Status.CONFIRMED):
+        if connection.vendor == 'sqlite':
+            # This must be the first database operation in the transaction:
+            # SQLite otherwise upgrades two concurrent read transactions to
+            # writers at once and can let both proceed from a stale snapshot.
+            Court.objects.filter(public_id=court_id).update(updated_at=F('updated_at'))
         try:
             venue = Venue.objects.select_for_update().get(public_id=venue_id)
         except Venue.DoesNotExist as exc:
@@ -167,6 +201,24 @@ class BookingService:
             court = Court.objects.select_for_update().get(public_id=court_id)
         except Court.DoesNotExist as exc:
             raise NotFound('Court not found.') from exc
+        if not venue.active or venue.is_demo:
+            raise BookingError('Venue is inactive or is not a real bookable venue.')
+        if court.venue_id != venue.id:
+            raise BookingError('Court does not belong to the selected venue.')
+        if not court.active:
+            raise BookingError('Court is inactive.')
+        starts_at, ends_at = cls._local_datetimes(
+            venue=venue, booking_date=booking_date, start_time=start_time, end_time=end_time,
+        )
+        # Treat a retried request as successful only when the same player
+        # already holds that exact active reservation. Other users and
+        # overlapping requests still go through the conflict check below.
+        existing = CourtBooking.objects.select_for_update().filter(
+            user=user, court=court, starts_at=starts_at, ends_at=ends_at,
+            status__in=BOOKING_BLOCKING_STATUSES,
+        ).first()
+        if existing:
+            return existing
         starts_at, ends_at = cls._validate_request(
             venue=venue, court=court, booking_date=booking_date, start_time=start_time, end_time=end_time,
             lock_bookings=True,
@@ -174,11 +226,25 @@ class BookingService:
         prices = BookingPricingService.calculate(court=court, starts_at=starts_at, ends_at=ends_at)
         for _ in range(5):
             try:
-                return CourtBooking.objects.create(
+                booking = CourtBooking.objects.create(
                     user=user, venue=venue, court=court, booking_date=booking_date,
                     start_time=start_time, end_time=end_time, starts_at=starts_at, ends_at=ends_at,
                     booking_reference=cls._reference(), status=status, **prices,
                 )
+                from my_app.services.notifications import NotificationService
+                booking_data={'booking_id': str(booking.public_id), 'venue_id': str(venue.public_id)}
+                NotificationService.create_notification(
+                    user=user, type='booking_created', title='Booking confirmed',
+                    body=f'Your booking at {venue.name} is {booking.status}.', data=booking_data,
+                    event_key=f'booking-created:{booking.pk}:player:{user.pk}',
+                )
+                if venue.owner_id and venue.owner_id != user.id:
+                    NotificationService.create_notification(
+                        user=venue.owner, actor=user, type='booking_created', title='New court booking',
+                        body=f'{user.username} booked {court.name} at {venue.name}.', data=booking_data,
+                        event_key=f'booking-created:{booking.pk}:owner:{venue.owner_id}',
+                    )
+                return booking
             except IntegrityError:
                 continue
         raise BookingError('Could not allocate a unique booking reference.')

@@ -37,8 +37,8 @@ class MatchTimePollService:
             start, end = option['starts_at'], option.get('ends_at')
             if timezone.is_naive(start) or (end is not None and timezone.is_naive(end)):
                 raise ValidationError({'options': 'Each date/time must include a timezone offset.'})
-            if start <= now:
-                raise ValidationError({'options': 'Proposed match times must be in the future.'})
+            if start <= deadline:
+                raise ValidationError({'options': 'Proposed match times must be after the poll deadline.'})
             if end is None:
                 option['ends_at'] = start + duration
             elif end <= start:
@@ -47,7 +47,11 @@ class MatchTimePollService:
             if key in seen:
                 raise ValidationError({'options': 'Duplicate proposed start times are not allowed.'})
             seen.add(key)
-        MatchTimePoll.objects.select_for_update().filter(match=match, status=MatchTimePoll.Status.OPEN, deadline__lte=now).update(status=MatchTimePoll.Status.CLOSED, updated_at=now)
+        MatchTimePoll.objects.select_for_update().filter(
+            match=match,
+            status__in=[MatchTimePoll.Status.OPEN, MatchTimePoll.Status.TIE],
+            deadline__lte=now,
+        ).update(status=MatchTimePoll.Status.CLOSED, updated_at=now)
         active = MatchTimePoll.objects.select_for_update().filter(match=match, status__in=[MatchTimePoll.Status.OPEN, MatchTimePoll.Status.TIE], deadline__gt=now).first()
         if active:
             raise ValidationError('This match already has an open schedule poll.')
@@ -62,7 +66,7 @@ class MatchTimePollService:
             NotificationService.create_notification(
                 user=user, actor=actor, type='match_invite', title='Schedule poll opened',
                 body=f'Vote on a new time for your {match.sport.name} match before {deadline:%b %d, %Y %I:%M %p}.',
-                data={'match_id': match.public_id.hex, 'poll_id': poll.public_id.hex},
+                data={'match_id': str(match.public_id), 'poll_id': str(poll.public_id)},
                 event_key=f'match-time-poll:{poll.pk}:opened:{user.pk}',
             )
         return poll
@@ -77,6 +81,8 @@ class MatchTimePollService:
         now = timezone.now()
         if poll.status not in (MatchTimePoll.Status.OPEN, MatchTimePoll.Status.TIE) or poll.deadline <= now:
             raise ValidationError('This schedule poll is closed for voting.')
+        if poll.match.status != 'upcoming' or poll.match.date_time <= now:
+            raise ValidationError('Voting is unavailable because this match is no longer upcoming.')
         if not poll.eligible_voters.filter(user=actor).exists() or not cls._is_eligible(poll.match, actor):
             raise PermissionDenied('Only participants at poll creation can vote.')
         option = poll.options.filter(public_id=option_id).first()
@@ -113,9 +119,9 @@ class MatchTimePollService:
                     raise ValidationError('Only upcoming matches can be rescheduled.')
                 options = list(poll.options.all())
                 counts = Counter(poll.votes.filter(is_active=True).values_list('option_id', flat=True))
+                if not counts:
+                    raise ValidationError('At least one vote is required before finalization.')
                 if option_id is None:
-                    if not counts:
-                        raise ValidationError('At least one vote is required before finalization.')
                     max_votes = max(counts.values())
                     winners = [item for item in options if counts[item.id] == max_votes]
                     if len(winners) != 1:
@@ -125,9 +131,13 @@ class MatchTimePollService:
                         return poll, None
                     selected = winners[0]
                 else:
+                    if poll.status != MatchTimePoll.Status.TIE:
+                        raise ValidationError('An organizer choice is only allowed to resolve a tied poll.')
                     selected = next((item for item in options if item.public_id == option_id), None)
                     if not selected:
                         raise NotFound('Poll option not found.')
+                if selected.starts_at <= timezone.now():
+                    raise ValidationError('The selected poll option is no longer in the future. Create a new poll.')
                 conflict = Match.objects.select_for_update().filter(
                     ground_id=match.ground_id, status='upcoming', date_time__lt=selected.ends_at,
                     end_date_time__gt=selected.starts_at,
@@ -143,7 +153,7 @@ class MatchTimePollService:
                     NotificationService.create_notification(
                         user=user, actor=actor, type='match_invite', title='Match time finalized',
                         body=f'{match.sport.name} at {match.ground.name} is now scheduled for {selected.starts_at:%b %d, %Y %I:%M %p}.',
-                        data={'match_id': match.public_id.hex, 'poll_id': poll.public_id.hex},
+                        data={'match_id': str(match.public_id), 'poll_id': str(poll.public_id)},
                         event_key=f'match-time-poll:{poll.pk}:finalized:{user.pk}',
                     )
                 return poll, selected
@@ -173,13 +183,17 @@ class MatchTimePollService:
         counts = Counter(votes.values_list('option_id', flat=True))
         options = list(poll.options.all())
         current = votes.filter(voter=user).select_related('option').first() if user and user.is_authenticated else None
-        status = poll.status
-        if status == MatchTimePoll.Status.OPEN and poll.deadline <= timezone.now():
-            status = MatchTimePoll.Status.CLOSED
+        now = timezone.now()
+        voting_open = (
+            poll.status in (MatchTimePoll.Status.OPEN, MatchTimePoll.Status.TIE)
+            and poll.deadline > now
+            and poll.match.status == 'upcoming'
+            and poll.match.date_time > now
+        )
         return {
             'public_id': str(poll.public_id), 'match_id': str(poll.match.public_id),
             'creator_id': str(poll.creator.public_id), 'deadline': poll.deadline,
-            'status': status, 'version': poll.version,
+            'status': poll.status, 'voting_open': voting_open, 'version': poll.version,
             'finalized_option_id': str(poll.finalized_option.public_id) if poll.finalized_option_id else None,
             'finalized_at': poll.finalized_at,
             'my_vote_option_id': str(current.option.public_id) if current else None,

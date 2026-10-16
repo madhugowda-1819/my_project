@@ -4,7 +4,13 @@ from django.utils import timezone
 from rest_framework.exceptions import NotFound, PermissionDenied, ValidationError
 from my_app.models import Notification, NotificationPreference, UserDevice
 
-TYPE_CATEGORY={'message':'chat','game_joined':'game','game_cancelled':'game','booking_created':'booking','booking_cancelled':'booking','community_join_request':'community','community_joined':'community','event_registered':'event','event_waitlisted':'event','event_waitlist_promoted':'event','tournament_match_result':'tournament'}
+TYPE_CATEGORY={
+ 'message':'chat','match_invite':'game','game_joined':'game','game_cancelled':'game','game_updated':'game',
+ 'booking_created':'booking','booking_cancelled':'booking',
+ 'community_join_request':'community','community_joined':'community',
+ 'event_registered':'event','event_waitlisted':'event','event_promoted':'event','event_updated':'event','event_cancelled':'event',
+ 'tournament_match_result':'tournament',
+}
 class NotificationService:
  @staticmethod
  def _allowed(user,notification_type):
@@ -13,10 +19,14 @@ class NotificationService:
  @classmethod
  def create_notification(cls,*,user,type,title,body='',data=None,priority=1,actor=None,event_key=''):
   if not user.is_active or not cls._allowed(user,type): return None
+  defaults={'actor':actor,'type':type,'title':title[:200],'body':body,'data':data or {},'priority':priority}
   if event_key:
-   existing=Notification.objects.filter(user=user,event_key=event_key,deleted_at__isnull=True).first()
-   if existing:return existing
-  return Notification.objects.create(user=user,actor=actor,type=type,title=title[:200],body=body,data=data or {},priority=priority,event_key=event_key)
+   # The conditional DB constraint makes this idempotent even when retried
+   # concurrently. Include dismissed records: retrying an old event must not
+   # silently resurrect a notification the user already dismissed.
+   notification,_=Notification.objects.get_or_create(user=user,event_key=event_key,defaults=defaults)
+   return notification
+  return Notification.objects.create(user=user,event_key='',**defaults)
  @classmethod
  def create_bulk_notifications(cls,*,users,**kwargs): return [n for n in (cls.create_notification(user=u,**kwargs) for u in users) if n]
  @staticmethod

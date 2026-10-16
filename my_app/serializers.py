@@ -1,6 +1,7 @@
 from rest_framework import serializers
 from decimal import Decimal
 from django.contrib.auth import get_user_model
+from django.db.models import Q
 from django.utils import timezone
 from datetime import timedelta
 from django.core.validators import RegexValidator
@@ -22,7 +23,7 @@ from .models import (
     PlayerRating,
     MatchReflection,
     Achievement, UserAchievement,
-    Report, ModerationAction, UserModeration, VenueOwnerApplication,
+    SportChallenge,
 )
 from .models import UserSport
 from .models import Venue, VenueSport, VenueAmenity, VenueImage, VenueReview, Court, CourtBlockedPeriod
@@ -54,55 +55,6 @@ class SafeImageField(serializers.ImageField):
         if not width or not height or width > 8000 or height > 8000:
             raise serializers.ValidationError('Image dimensions are invalid or too large.')
         return value
-
-
-class ReportCreateSerializer(serializers.Serializer):
-    target_type = serializers.ChoiceField(choices=Report.TargetType.choices)
-    target_public_id = serializers.UUIDField()
-    reason = serializers.ChoiceField(choices=Report.Reason.choices)
-    description = serializers.CharField(required=False, allow_blank=True, max_length=2000)
-
-
-class ReportSerializer(serializers.ModelSerializer):
-    reporter_id = serializers.UUIDField(source='reporter.public_id', read_only=True)
-    assigned_moderator_id = serializers.UUIDField(source='assigned_moderator.public_id', read_only=True, allow_null=True)
-
-    class Meta:
-        model = Report
-        fields = ['public_id', 'reporter_id', 'target_type', 'target_public_id', 'reason', 'description', 'status', 'assigned_moderator_id', 'resolution', 'created_at', 'updated_at', 'resolved_at']
-        read_only_fields = fields
-
-
-class ReportUpdateSerializer(serializers.Serializer):
-    status = serializers.ChoiceField(choices=Report.Status.choices, required=False)
-    resolution = serializers.CharField(required=False, allow_blank=True, max_length=4000)
-    assigned_moderator_id = serializers.UUIDField(required=False, allow_null=True)
-    action = serializers.ChoiceField(choices=ModerationAction.Action.choices, required=False)
-    action_reason = serializers.CharField(required=False, allow_blank=True, max_length=2000)
-    ends_at = serializers.DateTimeField(required=False, allow_null=True)
-
-    def validate(self, attrs):
-        if not attrs:
-            raise serializers.ValidationError('At least one update is required.')
-        return attrs
-
-
-class ModerationActionSerializer(serializers.ModelSerializer):
-    moderator_id = serializers.UUIDField(source='moderator.public_id', read_only=True)
-    report_id = serializers.UUIDField(source='report.public_id', read_only=True, allow_null=True)
-
-    class Meta:
-        model = ModerationAction
-        fields = ['public_id', 'moderator_id', 'report_id', 'target_type', 'target_public_id', 'action', 'reason', 'previous_state', 'new_state', 'created_at']
-        read_only_fields = fields
-
-
-class AdminUserSerializer(serializers.ModelSerializer):
-    public_id = serializers.UUIDField(read_only=True)
-
-    class Meta:
-        model = User
-        fields = ['public_id', 'username', 'email', 'full_name', 'city', 'account_status', 'is_active', 'is_staff', 'date_joined', 'last_login']
 
 
 # ------------------------------------------------------------------
@@ -182,6 +134,48 @@ class NearbySearchSerializer(serializers.Serializer):
     skill_level = serializers.ChoiceField(choices=UserSport.SkillLevel.choices, required=False)
 
 
+class PlayerDirectoryQuerySerializer(serializers.Serializer):
+    q = serializers.CharField(required=False, allow_blank=True, max_length=100, trim_whitespace=True)
+    city = serializers.CharField(required=False, allow_blank=True, max_length=100, trim_whitespace=True)
+    sport = serializers.CharField(required=False, allow_blank=False, max_length=60, trim_whitespace=True)
+    skill_level = serializers.ChoiceField(choices=UserSport.SkillLevel.choices, required=False)
+    availability = serializers.ChoiceField(
+        choices=(('available', 'Available'), ('unavailable', 'Unavailable'), ('all', 'All')),
+        default='available',
+    )
+    sort = serializers.ChoiceField(
+        choices=(('distance', 'Distance'), ('name', 'Name'), ('rating', 'Rating')),
+        required=False,
+    )
+    latitude = serializers.FloatField(min_value=-90, max_value=90, required=False)
+    longitude = serializers.FloatField(min_value=-180, max_value=180, required=False)
+    # Keep the legacy Flutter query names working during client rollouts.
+    lat = serializers.FloatField(min_value=-90, max_value=90, required=False)
+    lng = serializers.FloatField(min_value=-180, max_value=180, required=False)
+    radius = serializers.FloatField(min_value=0.1, max_value=500, default=15)
+    page = serializers.IntegerField(min_value=1, required=False)
+    page_size = serializers.IntegerField(min_value=1, max_value=100, required=False)
+
+    def validate_sport(self, value):
+        if not Sport.objects.filter(is_active=True).filter(
+            Q(slug__iexact=value) | Q(name__iexact=value),
+        ).exists():
+            raise serializers.ValidationError('Select an active sport.')
+        return value
+
+    def validate(self, attrs):
+        if ('latitude' in attrs) != ('longitude' in attrs):
+            raise serializers.ValidationError('latitude and longitude must be supplied together.')
+        if ('lat' in attrs) != ('lng' in attrs):
+            raise serializers.ValidationError('lat and lng must be supplied together.')
+        if 'lat' in attrs:
+            if 'latitude' in attrs:
+                raise serializers.ValidationError('Use either lat/lng or latitude/longitude, not both.')
+            attrs['latitude'] = attrs.pop('lat')
+            attrs['longitude'] = attrs.pop('lng')
+        return attrs
+
+
 class PlayerRecommendationQuerySerializer(NearbySearchSerializer):
     sport = serializers.PrimaryKeyRelatedField(queryset=Sport.objects.filter(is_active=True))
     limit = serializers.IntegerField(min_value=1, max_value=50, default=20)
@@ -245,83 +239,12 @@ class VenueSerializer(serializers.ModelSerializer):
         return round(distance, 2) if distance is not None else None
 
 
-class VenueOwnerVenueWriteSerializer(serializers.ModelSerializer):
-    sport_ids = serializers.PrimaryKeyRelatedField(
-        source='sports', many=True, queryset=Sport.objects.filter(is_active=True), required=False,
-    )
-
-    class Meta:
-        model = Venue
-        fields = [
-            'name', 'description', 'address', 'city', 'latitude', 'longitude',
-            'phone', 'email', 'opening_time', 'closing_time', 'timezone', 'sport_ids',
-        ]
-
-    def validate(self, attrs):
-        opening = attrs.get('opening_time', getattr(self.instance, 'opening_time', None))
-        closing = attrs.get('closing_time', getattr(self.instance, 'closing_time', None))
-        if opening is not None and closing is not None and closing <= opening:
-            raise serializers.ValidationError({'closing_time': 'Closing time must be after opening time.'})
-        zone = attrs.get('timezone', getattr(self.instance, 'timezone', 'Asia/Kolkata'))
-        from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
-        try:
-            ZoneInfo(zone)
-        except (ZoneInfoNotFoundError, TypeError):
-            raise serializers.ValidationError({'timezone': 'Use a valid IANA timezone.'})
-        return attrs
-
-    def create(self, validated_data):
-        sports = validated_data.pop('sports', [])
-        venue = Venue.objects.create(**validated_data)
-        VenueSport.objects.bulk_create([VenueSport(venue=venue, sport=sport) for sport in sports])
-        return venue
-
-    def update(self, instance, validated_data):
-        sports = validated_data.pop('sports', None)
-        for field, value in validated_data.items():
-            setattr(instance, field, value)
-        instance.save()
-        if sports is not None:
-            VenueSport.objects.filter(venue=instance).delete()
-            VenueSport.objects.bulk_create([VenueSport(venue=instance, sport=sport) for sport in sports])
-        return instance
-
-
-class VenueOwnerCourtWriteSerializer(serializers.ModelSerializer):
-    sport_id = serializers.PrimaryKeyRelatedField(
-        source='sport', queryset=Sport.objects.filter(is_active=True),
-    )
-
-    class Meta:
-        model = Court
-        fields = ['name', 'sport_id', 'capacity', 'price_per_hour']
-
-    def validate_price_per_hour(self, value):
-        if value < 0:
-            raise serializers.ValidationError('Price cannot be negative.')
-        return value
-
-
-class VenueOwnerBlockedPeriodWriteSerializer(serializers.ModelSerializer):
-    class Meta:
-        model = CourtBlockedPeriod
-        fields = ['starts_at', 'ends_at', 'type', 'reason']
-
-    def validate(self, attrs):
-        starts = attrs.get('starts_at', getattr(self.instance, 'starts_at', None))
-        ends = attrs.get('ends_at', getattr(self.instance, 'ends_at', None))
-        if starts is None or ends is None or ends <= starts:
-            raise serializers.ValidationError({'ends_at': 'End time must be after start time.'})
-        if starts <= timezone.now():
-            raise serializers.ValidationError({'starts_at': 'Blocked periods must start in the future.'})
-        return attrs
-
-
 class VenueDiscoveryQuerySerializer(NearbySearchSerializer):
     latitude = serializers.FloatField(min_value=-90, max_value=90, required=False)
     longitude = serializers.FloatField(min_value=-180, max_value=180, required=False)
     longitude = serializers.FloatField(min_value=-180, max_value=180, required=False)
     radius = serializers.FloatField(min_value=0.1, max_value=500, required=False, default=15)
+    q = serializers.CharField(required=False, allow_blank=True, max_length=120, trim_whitespace=True)
     city = serializers.CharField(required=False)
     min_rating = serializers.DecimalField(max_digits=3, decimal_places=2, min_value=0, max_value=5, required=False)
     max_price = serializers.DecimalField(max_digits=10, decimal_places=2, min_value=0, required=False)
@@ -336,8 +259,10 @@ class VenueReviewCreateSerializer(serializers.Serializer):
 
 class VenueAvailabilityQuerySerializer(serializers.Serializer):
     date = serializers.DateField()
-    sport = serializers.PrimaryKeyRelatedField(queryset=Sport.objects.filter(is_active=True), required=False)
-    court = serializers.IntegerField(min_value=1, required=False)
+    # Accept both stable public identifiers returned by the availability API
+    # and legacy database IDs used by older clients.
+    sport = serializers.CharField(required=False, allow_blank=False, max_length=80)
+    court = serializers.CharField(required=False, allow_blank=False, max_length=64)
     duration = serializers.IntegerField(required=False, default=60)
 
 
@@ -462,6 +387,7 @@ class PlayerProfilePreferencesSerializer(serializers.ModelSerializer):
 class PublicPlayerSerializer(serializers.ModelSerializer):
     name = serializers.CharField(source='full_name')
     location = serializers.CharField(source='city')
+    avatar = serializers.SerializerMethodField()
     distance_km = serializers.SerializerMethodField()
     sports = UserSportSerializer(source='user_sports', many=True, read_only=True)
     availability = serializers.BooleanField(source='is_available', read_only=True)
@@ -469,7 +395,17 @@ class PublicPlayerSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = User
-        fields = ['public_id', 'name', 'username', 'location', 'distance_km', 'availability', 'bio', 'sports', 'rating_summary']
+        fields = ['public_id', 'name', 'username', 'location', 'avatar', 'distance_km', 'availability', 'bio', 'sports', 'rating_summary']
+
+    def get_avatar(self, obj):
+        if not obj.avatar:
+            return None
+        try:
+            url = obj.avatar.url
+        except ValueError:
+            return None
+        request = self.context.get('request')
+        return request.build_absolute_uri(url) if request else url
 
     def get_distance_km(self, obj):
         distance = getattr(obj, 'distance_km', None)
@@ -568,17 +504,6 @@ class RegistrationRequestSerializer(serializers.Serializer):
     )
 
 
-class VenueOwnerRegistrationSerializer(serializers.Serializer):
-    name = serializers.CharField(source='full_name', max_length=150)
-    username = serializers.CharField(max_length=150)
-    email = serializers.EmailField()
-    phone = serializers.CharField(max_length=20, validators=[phone_validator])
-    city = serializers.CharField(max_length=100)
-    password = serializers.CharField(write_only=True, trim_whitespace=False, min_length=8)
-    business_name = serializers.CharField(max_length=200)
-    address = serializers.CharField(max_length=255)
-
-
 class LoginRequestSerializer(serializers.Serializer):
     identifier = serializers.CharField(max_length=254, required=False)
     email = serializers.EmailField(required=False)
@@ -672,6 +597,7 @@ class MatchSerializer(serializers.ModelSerializer):
     status = serializers.SerializerMethodField()
     is_joined = serializers.SerializerMethodField()
     is_organizer = serializers.SerializerMethodField()
+    my_participation_status = serializers.SerializerMethodField()
 
     class Meta:
         model = Match
@@ -684,7 +610,7 @@ class MatchSerializer(serializers.ModelSerializer):
             'end_date_time',
             'total_players',
             'joinedPlayers',
-            'organizer', 'status', 'is_joined', 'is_organizer'
+            'organizer', 'status', 'is_joined', 'is_organizer', 'my_participation_status'
         ]
 
     def get_joinedPlayers(self, obj):
@@ -707,6 +633,13 @@ class MatchSerializer(serializers.ModelSerializer):
     def get_is_organizer(self, obj):
         user = self.context.get('request').user if self.context.get('request') else None
         return bool(user and user.is_authenticated and obj.organizer_id == user.pk)
+
+    def get_my_participation_status(self, obj):
+        user = self.context.get('request').user if self.context.get('request') else None
+        if not user or not user.is_authenticated:
+            return None
+        participation = obj.participation_history.filter(user=user).order_by('-created_at', '-pk').first()
+        return participation.status if participation else ('joined' if obj.joined_players.filter(pk=user.pk).exists() else None)
 
 
 class MatchParticipantSerializer(serializers.ModelSerializer):
@@ -789,6 +722,8 @@ class SportsGoalCreateSerializer(serializers.Serializer):
             raise serializers.ValidationError({'end_date': 'End date must be on or after start date.'})
         if attrs['progress_source'] != SportsGoal.Source.MANUAL and attrs['manual_progress']:
             raise serializers.ValidationError({'manual_progress': 'Only manual goals accept manually recorded progress.'})
+        if attrs['manual_progress'] > attrs['target']:
+            raise serializers.ValidationError({'manual_progress': 'Progress cannot exceed the target.'})
         if attrs['reminder_enabled'] and not attrs.get('reminder_time'):
             raise serializers.ValidationError({'reminder_time': 'Set a time to enable reminders.'})
         return attrs
@@ -804,6 +739,15 @@ class SportsGoalUpdateSerializer(serializers.Serializer):
     reminder_enabled = serializers.BooleanField(required=False)
     reminder_time = serializers.TimeField(required=False, allow_null=True)
     reminder_timezone = serializers.CharField(max_length=64, required=False)
+
+    def validate(self, attrs):
+        instance = self.context.get('goal')
+        if instance is not None:
+            target = attrs.get('target', instance.target)
+            progress = attrs.get('manual_progress', instance.manual_progress)
+            if progress > target:
+                raise serializers.ValidationError({'manual_progress': 'Progress cannot exceed the target.'})
+        return attrs
 
 
 class SportsGoalTransitionSerializer(serializers.Serializer):
@@ -830,7 +774,7 @@ class HealthActivityImportItemSerializer(serializers.Serializer):
     value = serializers.DecimalField(max_digits=12, decimal_places=2, min_value=Decimal('0.01'))
     recorded_date = serializers.DateField()
     external_record_id = serializers.CharField(max_length=255, allow_blank=False)
-    timezone = serializers.CharField(max_length=64, default='UTC')
+    timezone = serializers.CharField(max_length=64, default='Asia/Kolkata')
 
 
 class TrainingRecommendationInputSerializer(serializers.Serializer):
@@ -845,6 +789,7 @@ class TrainingRecommendationInputSerializer(serializers.Serializer):
     ])
     duration_minutes = serializers.IntegerField(min_value=15, max_value=120)
     days_per_week = serializers.IntegerField(min_value=1, max_value=7, required=False, default=3)
+    timezone = serializers.CharField(max_length=64, required=False, default='Asia/Kolkata')
 
     def validate_sport_id(self, value):
         from .models import Sport
@@ -883,6 +828,27 @@ class MatchCreateSerializer(serializers.ModelSerializer):
         if end <= attrs['date_time']:
             raise serializers.ValidationError({'end_date_time': 'End time must be after the match start time.'})
         attrs['end_date_time'] = end
+        return attrs
+
+
+class MatchUpdateSerializer(serializers.Serializer):
+    date_time = serializers.DateTimeField(required=False)
+    end_date_time = serializers.DateTimeField(required=False)
+    total_players = serializers.IntegerField(min_value=1, required=False)
+
+    def validate(self, attrs):
+        match = self.context['match']
+        start = attrs.get('date_time', match.date_time)
+        end = attrs.get('end_date_time', match.end_date_time)
+        capacity = attrs.get('total_players', match.total_players)
+        if not attrs:
+            raise serializers.ValidationError('Provide at least one editable match field.')
+        if start <= timezone.now():
+            raise serializers.ValidationError({'date_time': 'The match must remain in the future.'})
+        if end <= start:
+            raise serializers.ValidationError({'end_date_time': 'End time must be after the match start.'})
+        if capacity < match.joined_players.count():
+            raise serializers.ValidationError({'total_players': 'Capacity cannot be lower than the current joined player count.'})
         return attrs
 
 
@@ -1008,10 +974,11 @@ class MatchMyMoodQuerySerializer(GameRecommendationQuerySerializer):
 
 class GamePlayerSerializer(serializers.ModelSerializer):
     player = serializers.SerializerMethodField()
+    user_id = serializers.IntegerField(read_only=True)
 
     class Meta:
         model = GamePlayer
-        fields = ['public_id', 'player', 'status', 'joined_at', 'left_at']
+        fields = ['public_id', 'user_id', 'player', 'status', 'joined_at', 'left_at']
 
     def get_player(self, obj):
         return PublicPlayerSerializer(obj.user, context=self.context).data
@@ -1093,6 +1060,12 @@ class ConversationCreateSerializer(serializers.Serializer):
 
 class ConversationMessageCreateSerializer(serializers.Serializer):
     content = serializers.CharField(trim_whitespace=False, max_length=5000)
+    client_message_id = serializers.UUIDField(required=False)
+
+
+class LegacyMessageCreateSerializer(serializers.Serializer):
+    receiver = serializers.IntegerField(min_value=1)
+    content = serializers.CharField(trim_whitespace=False, max_length=2000)
 
 
 class ConversationMessageSerializer(serializers.ModelSerializer):
@@ -1102,7 +1075,7 @@ class ConversationMessageSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = Message
-        fields = ['public_id', 'sender', 'sender_name', 'message_type', 'content', 'created_at', 'updated_at', 'deleted_at', 'is_edited']
+        fields = ['public_id', 'sender', 'sender_name', 'message_type', 'content', 'client_message_id', 'created_at', 'updated_at', 'deleted_at', 'is_edited']
 
     def get_content(self, obj):
         return 'This message was deleted.' if obj.deleted_at else obj.content
@@ -1112,7 +1085,7 @@ class ConversationMessageSerializer(serializers.ModelSerializer):
 # COMMUNITIES
 # ------------------------------------------------------------------
 class CommunityCreateSerializer(serializers.Serializer):
-    name = serializers.CharField(max_length=150)
+    name = serializers.CharField(max_length=150, trim_whitespace=True)
     description = serializers.CharField(required=False, allow_blank=True, max_length=5000, default='')
     sport_id = serializers.PrimaryKeyRelatedField(source='sport', queryset=Sport.objects.filter(is_active=True), required=False, allow_null=True)
     city = serializers.CharField(required=False, allow_blank=True, max_length=100, default='')
@@ -1127,6 +1100,25 @@ class CommunityCreateSerializer(serializers.Serializer):
     def validate(self, attrs):
         if ('latitude' in attrs) != ('longitude' in attrs):
             raise serializers.ValidationError('latitude and longitude must be provided together.')
+        if not attrs['name']:
+            raise serializers.ValidationError({'name': 'A club or community name is required.'})
+        return attrs
+
+
+class CommunityDiscoveryQuerySerializer(serializers.Serializer):
+    sport = serializers.PrimaryKeyRelatedField(queryset=Sport.objects.filter(is_active=True), required=False)
+    city = serializers.CharField(max_length=100, required=False, allow_blank=True, trim_whitespace=True)
+    clubs = serializers.BooleanField(required=False, default=False)
+    communities = serializers.BooleanField(required=False, default=False)
+    latitude = serializers.FloatField(min_value=-90, max_value=90, required=False)
+    longitude = serializers.FloatField(min_value=-180, max_value=180, required=False)
+    radius = serializers.FloatField(min_value=0.1, max_value=100, required=False, default=20)
+
+    def validate(self, attrs):
+        if ('latitude' in attrs) != ('longitude' in attrs):
+            raise serializers.ValidationError('latitude and longitude must be provided together.')
+        if attrs.get('clubs') and attrs.get('communities'):
+            raise serializers.ValidationError('Choose clubs or communities, not both.')
         return attrs
 
 
@@ -1232,6 +1224,8 @@ class EventCreateSerializer(serializers.Serializer):
         raw=self.initial_data.get('registration_deadline')
         if not isinstance(raw,str) or not (raw.endswith('Z') or '+' in raw[10:] or '-' in raw[10:]):
             raise serializers.ValidationError({'registration_deadline':'Include a timezone offset, such as +05:30 or Z.'})
+        if attrs.get('visibility') == Event.Visibility.COMMUNITY and not attrs.get('community_id'):
+            raise serializers.ValidationError({'community_id': 'A community is required for community-only events.'})
         return attrs
 class EventSerializer(serializers.ModelSerializer):
     registered_count=serializers.SerializerMethodField(); available_slots=serializers.SerializerMethodField()
@@ -1239,9 +1233,10 @@ class EventSerializer(serializers.ModelSerializer):
     starts_at=serializers.DateTimeField(read_only=True); ends_at=serializers.DateTimeField(read_only=True)
     registration_status=serializers.SerializerMethodField(); reminder_at=serializers.SerializerMethodField()
     is_organizer=serializers.SerializerMethodField()
+    organizer_name=serializers.CharField(source='organizer.username',read_only=True)
     class Meta:
         model=Event
-        fields=['public_id','event_reference','title','description','sport','sport_name','community','venue','venue_name','venue_city','court','event_date','start_time','end_time','starts_at','ends_at','maximum_participants','minimum_participants','skill_level','visibility','event_type','status','registration_deadline','registered_count','available_slots','registration_status','reminder_at','is_organizer']
+        fields=['public_id','event_reference','title','description','sport','sport_name','community','venue','venue_name','venue_city','court','event_date','start_time','end_time','starts_at','ends_at','maximum_participants','minimum_participants','skill_level','visibility','event_type','status','registration_deadline','registered_count','available_slots','registration_status','reminder_at','is_organizer','organizer_name']
         read_only_fields=fields
     def get_registered_count(self,obj): return obj.participants.filter(status='registered').count()
     def get_available_slots(self,obj): return max(0,obj.maximum_participants-self.get_registered_count(obj))
@@ -1298,6 +1293,8 @@ class EventUpdateSerializer(serializers.Serializer):
         deadline = attrs.get('registration_deadline', event.registration_deadline)
         if deadline <= timezone.now():
             raise serializers.ValidationError({'registration_deadline': 'Must be in the future.'})
+        if attrs.get('visibility', event.visibility) == Event.Visibility.COMMUNITY and not event.community_id:
+            raise serializers.ValidationError({'visibility': 'A community is required for community-only events.'})
         return attrs
 class EventParticipantSerializer(serializers.ModelSerializer):
     username=serializers.CharField(source='user.username',read_only=True)
@@ -1323,6 +1320,8 @@ class TournamentCreateSerializer(serializers.Serializer):
             raise serializers.ValidationError({'end_date': 'End date must be on or after the start date.'})
         if attrs['registration_deadline'] <= timezone.now() or attrs['registration_deadline'].date() > attrs['start_date']:
             raise serializers.ValidationError({'registration_deadline': 'Deadline must be in the future and on or before the tournament start date.'})
+        if attrs['format'] == Tournament.Format.DOUBLE_ELIMINATION:
+            raise serializers.ValidationError({'format': 'Double elimination is not supported yet.'})
         return attrs
 
 
@@ -1355,19 +1354,38 @@ class TournamentUpdateSerializer(serializers.Serializer):
             raise serializers.ValidationError({'registration_deadline': 'Deadline must be in the future and on or before the tournament start date.'})
         if tournament.teams.filter(status=TournamentTeam.Status.ACTIVE).count() > maximum:
             raise serializers.ValidationError({'maximum_teams': 'Cannot be lower than the current active team count.'})
+        selected_format = attrs.get('format', tournament.format)
+        if selected_format == Tournament.Format.DOUBLE_ELIMINATION:
+            raise serializers.ValidationError({'format': 'Double elimination is not supported yet.'})
+        if 'format' in attrs and tournament.matches.exists() and selected_format != tournament.format:
+            raise serializers.ValidationError({'format': 'Format cannot change after fixtures are generated.'})
         return attrs
 
 
 class TournamentRegistrationSerializer(serializers.Serializer):
     team_name = serializers.CharField(max_length=120, required=False, allow_blank=True, default='')
+
+
+class TournamentResultSerializer(serializers.Serializer):
+    score_a = serializers.IntegerField(min_value=0)
+    score_b = serializers.IntegerField(min_value=0)
 class TournamentSerializer(serializers.ModelSerializer):
-    sport_name=serializers.CharField(source='sport.name',read_only=True); venue_name=serializers.CharField(source='venue.name',read_only=True); venue_city=serializers.CharField(source='venue.city',read_only=True)
+    sport_name=serializers.CharField(source='sport.name',read_only=True); venue_name=serializers.SerializerMethodField(); venue_city=serializers.SerializerMethodField(); nearby_ground_id=serializers.IntegerField(read_only=True)
     registration_status=serializers.SerializerMethodField()
+    registered_team_count=serializers.SerializerMethodField()
+    available_team_slots=serializers.SerializerMethodField()
+    registration_eligible=serializers.SerializerMethodField()
+    eligibility_reason=serializers.SerializerMethodField()
     is_organizer=serializers.SerializerMethodField()
     class Meta:
         model=Tournament
-        fields=['public_id','tournament_reference','name','sport','sport_name','venue','venue_name','venue_city','start_date','end_date','registration_deadline','maximum_teams','format','skill_level','status','registration_status','is_inter_college','is_organizer']
+        fields=['public_id','tournament_reference','name','sport','sport_name','venue','nearby_ground_id','venue_name','venue_city','start_date','end_date','registration_deadline','maximum_teams','format','skill_level','status','registration_status','registered_team_count','available_team_slots','registration_eligible','eligibility_reason','is_inter_college','is_organizer']
         read_only_fields=fields
+    def get_venue_name(self,obj):
+        if obj.venue_id:return obj.venue.name
+        return obj.nearby_ground.name if obj.nearby_ground_id else None
+    def get_venue_city(self,obj):
+        return obj.venue.city if obj.venue_id else None
     def get_is_organizer(self,obj):
         request=self.context.get('request')
         return bool(request and request.user.is_authenticated and obj.organizer_id==request.user.id)
@@ -1376,6 +1394,23 @@ class TournamentSerializer(serializers.ModelSerializer):
         if not request or not request.user.is_authenticated:return None
         if obj.teams.filter(members__user=request.user,members__status=TournamentTeamMember.Status.ACTIVE).exists():return 'registered'
         return 'not_registered'
+    def get_registered_team_count(self,obj):
+        return obj.teams.filter(status=TournamentTeam.Status.ACTIVE).count()
+    def get_available_team_slots(self,obj):
+        return max(0,obj.maximum_teams-self.get_registered_team_count(obj))
+    def get_eligibility_reason(self,obj):
+        request=self.context.get('request')
+        if obj.is_inter_college:return 'Register through the college competition flow.'
+        if obj.status not in (Tournament.Status.OPEN,Tournament.Status.FULL) or obj.registration_deadline<=timezone.now():return 'Registration is closed.'
+        if self.get_registration_status(obj)=='registered':return 'Already registered.'
+        if self.get_available_team_slots(obj)<=0:return 'Tournament is full.'
+        if obj.skill_level and request and request.user.is_authenticated:
+            level=UserSport.objects.filter(user=request.user,sport=obj.sport).values_list('skill_level',flat=True).first()
+            if level is None:return 'Add this sport to your profile to check eligibility.'
+            if level!=obj.skill_level:return f'Requires {obj.skill_level} skill level.'
+        return None
+    def get_registration_eligible(self,obj):
+        return self.get_eligibility_reason(obj) is None
 class TournamentTeamSerializer(serializers.ModelSerializer):
     class Meta: model=TournamentTeam; fields=['public_id','name','captain','seed','status']
 class TournamentMatchSerializer(serializers.ModelSerializer):
@@ -1390,7 +1425,7 @@ class CollegeSubmitSerializer(serializers.Serializer):
     country = serializers.CharField(max_length=100, required=False, default='India')
     description = serializers.CharField(required=False, allow_blank=True, default='')
     approved_email_domain = serializers.CharField(max_length=255, required=False, allow_blank=True, default='')
-    verification_evidence = serializers.URLField(max_length=500, required=False, allow_blank=True, default='')
+    verification_evidence = serializers.URLField(max_length=500)
 
     def validate_approved_email_domain(self, value):
         value = value.strip().lower().lstrip('@')
@@ -1401,12 +1436,28 @@ class CollegeSubmitSerializer(serializers.Serializer):
 
 class CollegeSerializer(serializers.ModelSerializer):
     active_members = serializers.SerializerMethodField()
+    my_membership_status = serializers.SerializerMethodField()
+    my_membership_role = serializers.SerializerMethodField()
+    is_my_submission = serializers.SerializerMethodField()
     class Meta:
         model = College
-        fields = ['public_id', 'name', 'slug', 'city', 'state', 'country', 'description', 'approved_email_domain', 'verification_status', 'rejection_reason', 'active_members']
+        fields = ['public_id', 'name', 'slug', 'city', 'state', 'country', 'description', 'approved_email_domain', 'verification_status', 'verification_evidence', 'rejection_reason', 'active_members', 'my_membership_status', 'my_membership_role', 'is_my_submission']
         read_only_fields = fields
     def get_active_members(self, obj):
         return obj.memberships.filter(status=CollegeMembership.Status.ACTIVE).count()
+    def get_my_membership_status(self, obj):
+        user = self.context.get('request').user if self.context.get('request') else None
+        if not user or not user.is_authenticated:
+            return None
+        return obj.memberships.filter(user=user).values_list('status', flat=True).first()
+    def get_my_membership_role(self, obj):
+        user = self.context.get('request').user if self.context.get('request') else None
+        if not user or not user.is_authenticated:
+            return None
+        return obj.memberships.filter(user=user).values_list('role', flat=True).first()
+    def get_is_my_submission(self, obj):
+        user = self.context.get('request').user if self.context.get('request') else None
+        return bool(user and user.is_authenticated and obj.submitted_by_id == user.id)
 
 
 class CollegeMembershipSerializer(serializers.ModelSerializer):
@@ -1420,11 +1471,13 @@ class CollegeMembershipSerializer(serializers.ModelSerializer):
 class CollegeChallengeSerializer(serializers.ModelSerializer):
     challenger_name = serializers.CharField(source='challenger.name', read_only=True)
     challenged_name = serializers.CharField(source='challenged.name', read_only=True)
+    challenger_public_id = serializers.UUIDField(source='challenger.public_id', read_only=True)
+    challenged_public_id = serializers.UUIDField(source='challenged.public_id', read_only=True)
     sport_name = serializers.CharField(source='sport.name', read_only=True)
     tournament_id = serializers.UUIDField(source='tournament.public_id', read_only=True)
     class Meta:
         model = CollegeChallenge
-        fields = ['public_id', 'challenger', 'challenged', 'challenger_name', 'challenged_name', 'sport', 'sport_name', 'message', 'status', 'tournament_id', 'created_at']
+        fields = ['public_id', 'challenger', 'challenged', 'challenger_name', 'challenged_name', 'challenger_public_id', 'challenged_public_id', 'sport', 'sport_name', 'message', 'status', 'tournament_id', 'created_at']
         read_only_fields = fields
 
 
@@ -1451,11 +1504,24 @@ class CollegeRosterAddSerializer(serializers.Serializer):
     user_id = serializers.IntegerField()
 
 
+class CollegeTeamMemberSerializer(serializers.ModelSerializer):
+    username = serializers.CharField(source='user.username', read_only=True)
+    user_id = serializers.IntegerField(source='user.id', read_only=True)
+    class Meta:
+        model = TournamentTeamMember
+        fields = ['user_id', 'username', 'role', 'status', 'joined_at']
+        read_only_fields = fields
+
+
 class CollegeResultDisputeSerializer(serializers.ModelSerializer):
     raised_by_name = serializers.CharField(source='raised_by.username', read_only=True)
+    match_public_id = serializers.UUIDField(source='match.public_id', read_only=True)
+    tournament_name = serializers.CharField(source='match.tournament.name', read_only=True)
+    team_a_name = serializers.CharField(source='match.team_a.name', read_only=True, allow_null=True)
+    team_b_name = serializers.CharField(source='match.team_b.name', read_only=True, allow_null=True)
     class Meta:
         model = CollegeResultDispute
-        fields = ['public_id', 'match', 'raised_by', 'raised_by_name', 'reason', 'status', 'resolution', 'created_at']
+        fields = ['public_id', 'match', 'match_public_id', 'tournament_name', 'team_a_name', 'team_b_name', 'raised_by', 'raised_by_name', 'reason', 'status', 'resolution', 'created_at']
         read_only_fields = ['public_id', 'match', 'raised_by', 'raised_by_name', 'status', 'resolution', 'created_at']
 
 
@@ -1574,6 +1640,16 @@ class AchievementSerializer(serializers.ModelSerializer):
 class UserAchievementSerializer(serializers.ModelSerializer):
     achievement=AchievementSerializer(read_only=True)
     class Meta: model=UserAchievement;fields=['achievement','progress','unlocked','unlocked_at','updated_at']
+
+
+class ChallengeListQuerySerializer(serializers.Serializer):
+    sport_id = serializers.IntegerField(min_value=1, required=False)
+    kind = serializers.ChoiceField(choices=SportChallenge.Kind.choices, required=False)
+    status = serializers.ChoiceField(choices=('upcoming', 'active', 'completed', 'cancelled'), required=False)
+
+
+class ChallengeJoinSerializer(serializers.Serializer):
+    team_id = serializers.UUIDField(required=False)
 
 
 # ------------------------------------------------------------------

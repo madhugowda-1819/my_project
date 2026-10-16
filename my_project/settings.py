@@ -55,7 +55,11 @@ INSTALLED_APPS = [
     'corsheaders',
 
     # Local
-    'my_app',
+    'my_app.apps.MyAppConfig',
+    # Portal applications own their API route namespaces.  The shared my_app
+    # application remains the source of truth for cross-portal domain data.
+    'my_app_admin_portal.apps.MyAppAdminPortalConfig',
+    'my_app_venue_portal.apps.MyAppVenuePortalConfig',
 ]
 
 MIDDLEWARE = [
@@ -118,6 +122,7 @@ USE_I18N = True
 USE_TZ = True
 
 STATIC_URL = 'static/'
+STATIC_ROOT = BASE_DIR / 'staticfiles'
 # Keep media links rooted at the site, rather than relative to an /api/
 # endpoint that serialized the avatar field.
 MEDIA_URL = '/media/'

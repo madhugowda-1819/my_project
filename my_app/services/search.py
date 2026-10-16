@@ -1,6 +1,6 @@
 """Permission-aware deterministic global search; deliberately not AI search."""
 from django.db.models import Q
-from my_app.models import Community, Event, Game, Sport, Tournament, User, Venue
+from my_app.models import Community, Event, Game, Sport, Tournament, User, UserBlock, Venue
 from my_app.services.locations import nearby_queryset, validate_coordinates
 
 VALID_TYPES={'player','sport','venue','game','community','event','tournament'}
@@ -25,7 +25,13 @@ class GlobalSearchService:
     if score or not q:results.append({'type':kind,'id':str(obj.public_id),'title':title(obj),'description':description(obj),'image':str(getattr(obj,image,'')) if image else None,'metadata':({'distance_km':round(distance,2)} if distance is not None else {}),'_score':score})
   text=Q(name__icontains=q)|Q(description__icontains=q) if q else Q()
   if 'sport'in types:add('sport',Sport.objects.filter((Q(name__icontains=q)|Q(description__icontains=q)) if q else Q(),is_active=True)[:50],lambda x:x.name,lambda x:x.description)
-  if 'player'in types:add('player',User.objects.filter((Q(username__icontains=q)|Q(full_name__icontains=q)) if q else Q(),is_active=True,account_status='active')[:50],lambda x:x.full_name or x.username,lambda x:x.city)
+  if 'player'in types:
+   blocked_ids=UserBlock.objects.filter(user=user).values('blocked_user_id')
+   blocked_by_ids=UserBlock.objects.filter(blocked_user=user).values('user_id')
+   players=User.objects.filter((Q(username__icontains=q)|Q(full_name__icontains=q)) if q else Q(),is_active=True,account_status='active',profile__profile_visibility='public').exclude(pk=user.pk).exclude(pk__in=blocked_ids).exclude(pk__in=blocked_by_ids).select_related('profile')
+   if city:players=players.filter(city__icontains=city)
+   if location:players=nearby_queryset(players,latitude=latitude,longitude=longitude,radius=radius)
+   add('player',players[:50],lambda x:x.full_name or x.username,lambda x:x.city,'avatar')
   if location:venues=nearby_queryset(venues,latitude=latitude,longitude=longitude,radius=radius)
   if city:venues=venues.filter(city__iexact=city)
   if 'venue'in types:add('venue',venues[:100],lambda x:x.name,lambda x:x.description,'',lambda x:float(x.rating))

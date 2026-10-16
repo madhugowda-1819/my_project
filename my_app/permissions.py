@@ -45,37 +45,3 @@ class IsActiveAccount(BasePermission):
             and user.account_status == user.AccountStatus.ACTIVE
         )
 
-
-class IsPlatformModerator(BasePermission):
-    message = 'Platform moderator permission is required.'
-
-    def has_permission(self, request, view):
-        return has_platform_role(request.user, MODERATOR_GROUPS)
-
-
-class IsPlatformAdmin(BasePermission):
-    message = 'Platform administrator permission is required.'
-
-    def has_permission(self, request, view):
-        return bool(
-            request.user and request.user.is_authenticated and (
-                request.user.is_superuser
-                or request.user.groups.filter(name__in=ADMIN_GROUPS).exists()
-            )
-        )
-
-
-class IsApprovedVenueOwner(BasePermission):
-    """Allows accounts explicitly approved for venue-owner operations."""
-
-    message = 'Approved venue-owner access is required.'
-
-    def has_permission(self, request, view):
-        user = request.user
-        return bool(
-            user and user.is_authenticated and user.is_active
-            and user.account_status == user.AccountStatus.ACTIVE
-            and user.groups.filter(name=VENUE_OWNER_GROUP).exists()
-            and not user.is_superuser
-            and not user.groups.filter(name__in=ADMIN_GROUPS).exists()
-        )

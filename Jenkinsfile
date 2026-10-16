@@ -45,7 +45,6 @@ pipeline {
                 )
             }
         }
-        
 
         stage('Set up CI & Test') {
             steps {

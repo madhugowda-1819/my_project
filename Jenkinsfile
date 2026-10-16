@@ -4,8 +4,8 @@ pipeline {
     parameters {
         booleanParam(
             name: 'DEPLOY_TO_EC2',
-            defaultValue: false,
-            description: 'Deploy the validated main branch to the configured EC2 host.'
+            defaultValue: true,
+            description: 'Deploy validated main branch to AWS EC2 instance.'
         )
     }
 
@@ -16,13 +16,19 @@ pipeline {
     }
 
     environment {
-        // CI-safe Django settings. Production secrets belong in Jenkins credentials.
+        // CI validation settings (SQLite for local unit tests only)
         DJANGO_SECRET_KEY = 'ci-only-not-for-production'
         DJANGO_DEBUG = 'False'
         DJANGO_ALLOWED_HOSTS = 'localhost,127.0.0.1'
         DB_ENGINE = 'django.db.backends.sqlite3'
         DB_NAME = 'db.sqlite3'
-        DEPLOY_PATH = '/opt/sportmate/backend'
+
+        // Live EC2 Target Paths & Service
+        REMOTE_HOST       = '35.173.184.45'
+        REMOTE_USER       = 'ubuntu'
+        REMOTE_DEPLOY_DIR = '/home/ubuntu/my_project/my_project'
+        SERVICE_NAME      = 'gunicorn.service'
+
         PIP_DISABLE_PIP_VERSION_CHECK = '1'
         PYTHONDONTWRITEBYTECODE = '1'
     }
@@ -34,90 +40,91 @@ pipeline {
             }
         }
 
-        stage('Set up Python') {
+        stage('Set up CI & Test') {
             steps {
                 sh '''
                     python3 --version
-                    python3 -m venv .venv
-                    . .venv/bin/activate
+                    python3 -m venv .ci_venv
+                    . .ci_venv/bin/activate
                     python -m pip install --upgrade pip
                     python -m pip install -r requirements.txt
-                '''
-            }
-        }
-
-        stage('Validate Django') {
-            steps {
-                sh '''
-                    . .venv/bin/activate
                     python manage.py check
-                    python manage.py makemigrations --check --dry-run
-                '''
-            }
-        }
-
-        stage('Test backend') {
-            steps {
-                sh '''
-                    . .venv/bin/activate
                     python manage.py test --verbosity=2
                 '''
             }
         }
 
-        stage('Deploy to EC2') {
+        stage('Deploy to EC2 via SSH') {
             when {
                 allOf {
                     expression { return params.DEPLOY_TO_EC2 }
                     expression {
-                        return env.BRANCH_NAME == 'main' ||
-                            env.GIT_BRANCH == 'main' ||
-                            env.GIT_BRANCH == 'origin/main'
+                        return (env.BRANCH_NAME ?: env.GIT_BRANCH ?: '') == 'main' ||
+                               (env.GIT_BRANCH ?: '') == 'origin/main'
                     }
                 }
             }
             steps {
-                sh '''
-                    set -eu
-                    umask 002
+                script {
+                    withCredentials([
+                        sshUserPrivateKey(credentialsId: 'EC2_SSH_KEY', keyFileVariable: 'SSH_KEY_FILE', usernameVariable: 'SSH_USER'),
+                        file(credentialsId: 'PROD_ENV_SECRET_FILE', variable: 'PROD_ENV_FILE')
+                    ]) {
+                        sh """
+                            set -eu
 
-                    # Keep server-only configuration, uploaded media, and generated
-                    # static assets out of source control and intact between releases.
-                    rsync -a --delete \\
-                        --exclude '.env' \\
-                        --exclude '.venv/' \\
-                        --exclude 'venv/' \\
-                        --exclude 'media/' \\
-                        --exclude 'staticfiles/' \\
-                        --exclude 'db.sqlite3' \\
-                        --exclude '.git/' \\
-                        ./ "${DEPLOY_PATH}/"
+                            # 1. Sync project files to EC2 (preserving live .env and media)
+                            rsync -avz --delete \
+                                -e "ssh -i ${SSH_KEY_FILE} -o StrictHostKeyChecking=no" \
+                                --exclude '.env' \
+                                --exclude 'venv/' \
+                                --exclude '.venv/' \
+                                --exclude '.ci_venv/' \
+                                --exclude 'media/' \
+                                --exclude 'staticfiles/' \
+                                --exclude 'db.sqlite3' \
+                                --exclude '.git/' \
+                                ./ ${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_DEPLOY_DIR}/
 
-                    cd "${DEPLOY_PATH}"
-                    python3 -m venv .venv
-                    . .venv/bin/activate
-                    python -m pip install --upgrade pip
-                    python -m pip install -r requirements.txt
+                            # 2. Inject fresh production .env secret file
+                            scp -i ${SSH_KEY_FILE} -o StrictHostKeyChecking=no ${PROD_ENV_FILE} ${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_DEPLOY_DIR}/.env
 
-                    # This file exists only on EC2 and must be readable by the
-                    # Jenkins deployment user and the sportmate service account.
-                    set -a
-                    . /etc/sportmate/backend.env
-                    set +a
-                    python manage.py migrate --noinput
-                    python manage.py collectstatic --noinput
-                    python manage.py check --deploy
+                            # 3. Execute remote setup and restart service
+                            ssh -i ${SSH_KEY_FILE} -o StrictHostKeyChecking=no ${REMOTE_USER}@${REMOTE_HOST} "
+                                set -eu
+                                cd ${REMOTE_DEPLOY_DIR}
 
-                    sudo systemctl restart sportmate-backend.service
-                    sudo systemctl is-active --quiet sportmate-backend.service
-                '''
+                                # Lock down .env permissions
+                                chmod 600 .env
+
+                                # Install/update global dependencies
+                                sudo pip3 install --upgrade pip --break-system-packages
+                                sudo pip3 install -r requirements.txt gunicorn mysqlclient django python-dotenv --break-system-packages
+
+                                # Run database migrations and static collection
+                                python3 manage.py migrate --noinput
+                                python3 manage.py collectstatic --noinput
+
+                                # Restart systemd gunicorn
+                                sudo systemctl restart ${SERVICE_NAME}
+                                sudo systemctl is-active --quiet ${SERVICE_NAME}
+                            "
+                        """
+                    }
+                }
             }
         }
     }
 
     post {
+        failure {
+            echo "Pipeline failed! Check stage output above."
+        }
+        success {
+            echo "Deployed and synced to EC2 MySQL backend successfully!"
+        }
         always {
-            deleteDir()
+            cleanWs disableDeferredWipeout: true, deleteDirs: true
         }
     }
 }

@@ -38,7 +38,11 @@ def env_bool(name, default=False):
 
 SECRET_KEY = env('DJANGO_SECRET_KEY', required=True)
 DEBUG = env_bool('DJANGO_DEBUG', False)
-ALLOWED_HOSTS = [host.strip() for host in env('DJANGO_ALLOWED_HOSTS', 'localhost,127.0.0.1').split(',') if host.strip()]
+ALLOWED_HOSTS = [
+    host.strip() for host in env('DJANGO_ALLOWED_HOSTS', '35.173.184.45,localhost,127.0.0.1').split(',') if host.strip()
+]
+if not ALLOWED_HOSTS:
+    ALLOWED_HOSTS = ['35.173.184.45', 'localhost', '127.0.0.1']
 
 INSTALLED_APPS = [
     'django.contrib.admin',

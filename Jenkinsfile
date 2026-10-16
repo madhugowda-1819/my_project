@@ -37,7 +37,7 @@ pipeline {
         stage('Checkout') {
             steps {
                 checkout scmGit(
-                    branches: [[name: '*/main']],
+                    branches: [[name: 'main']],
                     userRemoteConfigs: [[
                         url: 'https://github.com',
                         credentialsId: 'GITHUB_CREDENTIALS_ID'

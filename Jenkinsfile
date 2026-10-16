@@ -39,7 +39,7 @@ pipeline {
                 checkout scmGit(
                     branches: [[name: 'main']],
                     userRemoteConfigs: [[
-                        url: 'https://github.com',
+                        url: 'https://github.com/madhugowda-1819/my_project.git',
                         credentialsId: 'GITHUB_CREDENTIALS_ID'
                     ]]
                 )

@@ -16,6 +16,37 @@ AUTO_GAME_DURATION_MINUTES = 60
 
 
 class AutoGameService:
+    # Standard team sizes. Auto-created games start at the normal roster size
+    # and allow up to three substitute/extra players when the court supports it.
+    STANDARD_ROSTERS = {
+        'cricket': 11,
+        'badminton': 2,
+        'kabaddi': 7,
+        'football': 11,
+        'soccer': 11,
+        'hockey': 11,
+        'basketball': 5,
+        'volleyball': 6,
+        'kho kho': 9,
+        'kho-kho': 9,
+        'khokho': 9,
+        'tennis': 2,
+        'table tennis': 2,
+        'table-tennis': 2,
+        'pickleball': 2,
+        'carrom': 2,
+        'chess': 2,
+        'swimming': 1,
+    }
+
+    @classmethod
+    def _roster_limits(cls, sport, court_capacity):
+        base = cls.STANDARD_ROSTERS.get(sport.name.lower(), 2)
+        # Never create a game larger than the verified court inventory allows.
+        if court_capacity < base:
+            return min(2, court_capacity), court_capacity
+        return base, min(base + 3, court_capacity)
+
     @staticmethod
     def _sports_for(user, sport=None):
         entries = UserSport.objects.filter(user=user, sport__is_active=True).select_related('sport')
@@ -86,6 +117,8 @@ class AutoGameService:
                     preferred = [slot for slot in candidates if cls._preferred_slot(slot, preferences)]
                     for slot in preferred or candidates:
                         try:
+                            min_players, max_players = cls._roster_limits(
+                                selected_sport, slot['court'].capacity)
                             game = GameService.create(
                                 host=user,
                                 sport_id=selected_sport.id,
@@ -94,8 +127,8 @@ class AutoGameService:
                                 game_date=date_value,
                                 start_time=slot['start_time'],
                                 end_time=slot['end_time'],
-                                min_players=min(2, slot['court'].capacity),
-                                max_players=slot['court'].capacity,
+                                min_players=min_players,
+                                max_players=max_players,
                                 skill_level=user_sport.skill_level,
                                 description='Automatically created from your SportMate preferences.',
                                 visibility=Game.Visibility.PUBLIC,

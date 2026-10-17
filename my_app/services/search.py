@@ -32,6 +32,7 @@ class GlobalSearchService:
    if city:players=players.filter(city__icontains=city)
    if location:players=nearby_queryset(players,latitude=latitude,longitude=longitude,radius=radius)
    add('player',players[:50],lambda x:x.full_name or x.username,lambda x:x.city,'avatar')
+  venues=Venue.objects.filter(active=True)
   if location:venues=nearby_queryset(venues,latitude=latitude,longitude=longitude,radius=radius)
   if city:venues=venues.filter(city__iexact=city)
   if 'venue'in types:add('venue',venues[:100],lambda x:x.name,lambda x:x.description,'',lambda x:float(x.rating))

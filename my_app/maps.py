@@ -75,6 +75,12 @@ def find_live_sports_grounds(*, latitude=None, longitude=None, sport=None,
                     )
                 except MapsProviderError:
                     pass
+            # A provider quota/rate limit must not prevent a venue owner from
+            # completing the form manually. Return an empty result for text
+            # searches without coordinates; the API can then respond normally
+            # and the client keeps the editable venue fields available.
+            if error.code == 429:
+                return []
             raise MapsProviderError(f'Place search is temporarily unavailable ({error.code}).') from error
         except (URLError, TimeoutError) as error:
             if latitude is not None and longitude is not None:

@@ -3341,13 +3341,26 @@ class AiMatchView(APIView):
             radius=getattr(getattr(user, 'profile', None), 'preferred_distance', 15) or 15,
             limit=10,
         )
+        recommended_games = [item['game'] for item in results]
+        # Always show games created by the current player (including games
+        # created through “Create for me”). The matcher intentionally excludes
+        # the host's own games, which previously made a successful auto-create
+        # appear to vanish from this screen.
+        own_games = list(Game.objects.filter(
+            host=user,
+            status__in=[Game.Status.OPEN, Game.Status.ALMOST_FULL],
+            ends_at__gt=timezone.now(),
+        ).select_related('sport', 'venue', 'court__sport', 'host').order_by('starts_at')[:10])
+        games = own_games + [game for game in recommended_games if game.pk not in {item.pk for item in own_games}]
         response = GameSerializer(
-            [item['game'] for item in results], many=True,
+            games[:10], many=True,
             context={'request': request},
         ).data
-        for serialized, item in zip(response, results):
-            serialized['match_score'] = item['match_score']
-            serialized['reasons'] = item['reasons']
+        result_by_id = {item['game'].pk: item for item in results}
+        for serialized, game in zip(response, games[:10]):
+            item = result_by_id.get(game.pk)
+            serialized['match_score'] = item['match_score'] if item else 100
+            serialized['reasons'] = item['reasons'] if item else ['Created from your preferences']
         return Response(response)
 
     def calculate_distance(self, lat1, lon1, lat2, lon2):

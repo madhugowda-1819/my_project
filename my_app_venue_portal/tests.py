@@ -21,7 +21,7 @@ from django.contrib.auth import get_user_model
 from django.contrib.auth.models import Group
 from django.utils import timezone
 from rest_framework.test import APITestCase
-from my_app.models import Court, CourtBooking, Sport, Venue, VenueSport
+from my_app.models import Court, CourtBooking, Ground, Sport, Venue, VenueSport
 
 User = get_user_model()
 
@@ -58,6 +58,20 @@ class VenueOwnerOperationsTests(APITestCase):
         deactivated = self.client.delete(f"/api/v1/venue-owner/courts/{court.data['data']['public_id']}/")
         self.assertEqual(deactivated.status_code, 200)
         self.assertFalse(Court.objects.get(public_id=court.data['data']['public_id']).active)
+
+    def test_owner_can_link_a_live_place_and_duplicate_place_is_rejected(self):
+        self.client.force_authenticate(self.owner)
+        payload = {
+            'name': 'Mapped Cricket Demo', 'address': 'Hoodi, Bengaluru', 'city': 'Bengaluru',
+            'latitude': 12.99, 'longitude': 77.70, 'opening_time': '06:00', 'closing_time': '22:00',
+            'timezone': 'Asia/Kolkata', 'sport_ids': [self.sport.id], 'maps_place_id': 'ChIJdemo-place-1',
+        }
+        created = self.client.post('/api/v1/venue-owner/venues/', payload, format='json')
+        self.assertEqual(created.status_code, 201, created.data)
+        venue = Venue.objects.get(public_id=created.data['data']['public_id'])
+        self.assertEqual(venue.source_ground.maps_place_id, 'ChIJdemo-place-1')
+        duplicate = self.client.post('/api/v1/venue-owner/venues/', {**payload, 'name': 'Duplicate'}, format='json')
+        self.assertEqual(duplicate.status_code, 400)
 
     def test_owner_is_scoped_and_cannot_approve_venue(self):
         self.client.force_authenticate(self.other_owner)

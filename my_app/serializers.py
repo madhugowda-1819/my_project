@@ -219,11 +219,12 @@ class VenueSerializer(serializers.ModelSerializer):
     images = VenueImageSerializer(many=True, read_only=True)
     reviews = VenueReviewSerializer(many=True, read_only=True)
     distance_km = serializers.SerializerMethodField()
+    maps_place_id = serializers.SerializerMethodField()
 
     class Meta:
         model = Venue
         fields = [
-            'public_id', 'name', 'description', 'address', 'city', 'latitude', 'longitude', 'phone', 'email', 'rating',
+            'public_id', 'name', 'description', 'address', 'city', 'latitude', 'longitude', 'phone', 'email', 'rating', 'maps_place_id',
             'opening_time', 'closing_time', 'active', 'sports', 'amenities', 'courts', 'images',
             'reviews', 'distance_km',
         ]
@@ -237,6 +238,9 @@ class VenueSerializer(serializers.ModelSerializer):
     def get_distance_km(self, obj):
         distance = getattr(obj, 'distance_km', None)
         return round(distance, 2) if distance is not None else None
+
+    def get_maps_place_id(self, obj):
+        return obj.source_ground.maps_place_id if obj.source_ground_id else None
 
 
 class VenueDiscoveryQuerySerializer(NearbySearchSerializer):
@@ -298,12 +302,14 @@ class BookingSerializer(serializers.ModelSerializer):
     court_name = serializers.CharField(source='court.name', read_only=True)
     sport_id = serializers.IntegerField(source='court.sport_id', read_only=True)
     sport_name = serializers.CharField(source='court.sport.name', read_only=True)
+    ground_id = serializers.IntegerField(source='venue.source_ground_id', read_only=True)
+    ground_name = serializers.CharField(source='venue.source_ground.name', read_only=True)
     payment_status = serializers.SerializerMethodField()
 
     class Meta:
         model = CourtBooking
         fields = [
-            'public_id', 'booking_reference', 'venue_id', 'venue_name', 'court_id', 'court_name', 'sport_id', 'sport_name',
+            'public_id', 'booking_reference', 'venue_id', 'venue_name', 'court_id', 'court_name', 'sport_id', 'sport_name', 'ground_id', 'ground_name',
             'booking_date', 'start_time', 'end_time', 'base_price', 'additional_fees', 'discount',
             'final_amount', 'status', 'payment_status', 'cancellation_reason', 'cancelled_at', 'created_at', 'updated_at',
         ]

@@ -5,19 +5,27 @@ from django.core.validators import RegexValidator
 from django.utils import timezone
 from rest_framework import serializers
 
-from my_app.models import Court, CourtBlockedPeriod, Sport, Venue, VenueSport
+from my_app.models import Court, CourtBlockedPeriod, Ground, Sport, Venue, VenueSport
 
 phone_validator = RegexValidator(regex=r'^\+?[0-9 ()-]{7,20}$', message='Enter a valid phone number.')
 
 
 class VenueOwnerVenueWriteSerializer(serializers.ModelSerializer):
     sport_ids = serializers.PrimaryKeyRelatedField(source='sports', many=True, queryset=Sport.objects.filter(is_active=True), required=False)
+    maps_place_id = serializers.CharField(required=False, allow_blank=True, write_only=True, max_length=255)
 
     class Meta:
         model = Venue
-        fields = ['name', 'description', 'address', 'city', 'latitude', 'longitude', 'phone', 'email', 'opening_time', 'closing_time', 'timezone', 'sport_ids']
+        fields = ['name', 'description', 'address', 'city', 'latitude', 'longitude', 'phone', 'email', 'opening_time', 'closing_time', 'timezone', 'sport_ids', 'maps_place_id']
 
     def validate(self, attrs):
+        place_id = attrs.get('maps_place_id', '').strip()
+        if place_id:
+            existing_ground = Ground.objects.filter(maps_place_id=place_id).select_related('verified_venue').first()
+            if existing_ground and existing_ground.verified_venue and (
+                not self.instance or existing_ground.verified_venue.pk != self.instance.pk
+            ):
+                raise serializers.ValidationError({'maps_place_id': 'This Google Maps place is already linked to another SportMate venue.'})
         opening = attrs.get('opening_time', getattr(self.instance, 'opening_time', None))
         closing = attrs.get('closing_time', getattr(self.instance, 'closing_time', None))
         if opening is not None and closing is not None and closing <= opening:
@@ -31,12 +39,33 @@ class VenueOwnerVenueWriteSerializer(serializers.ModelSerializer):
 
     def create(self, validated_data):
         sports = validated_data.pop('sports', [])
+        place_id = validated_data.pop('maps_place_id', '').strip()
+        source_ground = Ground.objects.filter(maps_place_id=place_id).first() if place_id else None
+        if place_id and source_ground is None:
+            source_ground = Ground.objects.create(
+                name=validated_data['name'], city=validated_data['city'], address=validated_data['address'],
+                latitude=validated_data['latitude'], longitude=validated_data['longitude'],
+                maps_place_id=place_id, source='google_maps_live',
+            )
+        if source_ground:
+            validated_data['source_ground'] = source_ground
         venue = Venue.objects.create(**validated_data)
         VenueSport.objects.bulk_create([VenueSport(venue=venue, sport=sport) for sport in sports])
         return venue
 
     def update(self, instance, validated_data):
         sports = validated_data.pop('sports', None)
+        place_id = validated_data.pop('maps_place_id', None)
+        if place_id is not None:
+            place_id = place_id.strip()
+            source_ground = Ground.objects.filter(maps_place_id=place_id).first() if place_id else None
+            if place_id and source_ground is None:
+                source_ground = Ground.objects.create(
+                    name=validated_data.get('name', instance.name), city=validated_data.get('city', instance.city),
+                    address=validated_data.get('address', instance.address), latitude=validated_data.get('latitude', instance.latitude),
+                    longitude=validated_data.get('longitude', instance.longitude), maps_place_id=place_id, source='google_maps_live',
+                )
+            validated_data['source_ground'] = source_ground
         for field, value in validated_data.items():
             setattr(instance, field, value)
         instance.save()

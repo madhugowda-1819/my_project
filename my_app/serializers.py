@@ -550,6 +550,7 @@ class CurrentUserSerializer(serializers.ModelSerializer):
     name = serializers.CharField(source='full_name', required=False)
     phone = serializers.CharField(required=False, allow_blank=True, validators=[phone_validator])
     roles = serializers.SerializerMethodField()
+    is_player = serializers.SerializerMethodField()
     matching_mood = serializers.SerializerMethodField()
     preferred_distance = serializers.SerializerMethodField()
     preferred_play_times = serializers.SerializerMethodField()
@@ -558,7 +559,7 @@ class CurrentUserSerializer(serializers.ModelSerializer):
         model = User
         fields = [
             'public_id', 'name', 'username', 'email', 'phone', 'avatar', 'city',
-            'latitude', 'longitude', 'bio', 'date_joined', 'is_active', 'account_status', 'roles',
+            'latitude', 'longitude', 'bio', 'date_joined', 'is_active', 'account_status', 'roles', 'is_player',
             'matching_mood', 'preferred_distance', 'preferred_play_times',
         ]
         read_only_fields = ['public_id', 'username', 'email', 'date_joined', 'is_active', 'account_status']
@@ -568,6 +569,9 @@ class CurrentUserSerializer(serializers.ModelSerializer):
         if obj.is_superuser and 'SportMate Admins' not in roles:
             roles.append('SportMate Admins')
         return roles
+
+    def get_is_player(self, obj):
+        return PlayerProfile.objects.filter(user_id=obj.id).exists()
 
     def get_matching_mood(self, obj):
         profile = getattr(obj, 'profile', None)

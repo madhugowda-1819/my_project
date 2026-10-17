@@ -3341,17 +3341,15 @@ class AiMatchView(APIView):
             radius=getattr(getattr(user, 'profile', None), 'preferred_distance', 15) or 15,
             limit=10,
         )
-        recommended_games = [item['game'] for item in results]
-        # Always show games created by the current player (including games
-        # created through “Create for me”). The matcher intentionally excludes
-        # the host's own games, which previously made a successful auto-create
-        # appear to vanish from this screen.
-        own_games = list(Game.objects.filter(
-            host=user,
-            status__in=[Game.Status.OPEN, Game.Status.ALMOST_FULL],
-            ends_at__gt=timezone.now(),
-        ).select_related('sport', 'venue', 'court__sport', 'host').order_by('starts_at')[:10])
-        games = own_games + [game for game in recommended_games if game.pk not in {item.pk for item in own_games}]
+        games = [item['game'] for item in results]
+        if request.query_params.get('include_owned', '').lower() in {'1', 'true', 'yes'}:
+            owned = list(Game.objects.filter(
+                host=user,
+                status__in=[Game.Status.OPEN, Game.Status.ALMOST_FULL],
+                ends_at__gt=timezone.now(),
+            ).select_related('sport', 'venue', 'court__sport', 'host').order_by('starts_at')[:10])
+            owned_ids = {game.pk for game in owned}
+            games = owned + [game for game in games if game.pk not in owned_ids]
         response = GameSerializer(
             games[:10], many=True,
             context={'request': request},

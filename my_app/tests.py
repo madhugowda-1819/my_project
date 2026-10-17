@@ -1289,6 +1289,31 @@ class PlayerProfileApiTests(APITestCase):
         self.assertEqual(protected_stats.status_code, 200)
         self.assertEqual(UserSport.objects.get(user=self.user, sport=self.sport).wins, 0)
 
+    def test_sport_skill_is_player_selected_and_completed_matches_are_counted(self):
+        UserSport.objects.create(
+            user=self.user, sport=self.sport,
+            skill_level=UserSport.SkillLevel.INTERMEDIATE,
+        )
+        ground = Ground.objects.create(
+            name='Profile statistics ground', city='Bengaluru',
+            latitude=12.97, longitude=77.59,
+        )
+        match = Match.objects.create(
+            organizer=self.user, sport=self.sport, ground=ground,
+            date_time=timezone.now() - timedelta(hours=2),
+            end_date_time=timezone.now() - timedelta(hours=1),
+            total_players=2, status='completed',
+        )
+        match.joined_players.add(self.user)
+
+        response = self.client.get('/api/v1/users/me/sports/')
+
+        self.assertEqual(response.status_code, 200)
+        item = response.data['data'][0]
+        self.assertEqual(item['skill_level'], 'intermediate')
+        self.assertEqual(item['matches_played'], 1)
+        self.assertEqual(item['wins'], 0)
+
     def test_player_profile_update_and_public_privacy(self):
         update = self.client.patch('/api/v1/users/me/player-profile/', {
             'bio': 'Available evenings', 'preferred_distance': 25,

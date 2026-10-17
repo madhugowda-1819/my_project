@@ -296,12 +296,14 @@ class BookingSerializer(serializers.ModelSerializer):
     court_id = serializers.UUIDField(source='court.public_id', read_only=True)
     venue_name = serializers.CharField(source='venue.name', read_only=True)
     court_name = serializers.CharField(source='court.name', read_only=True)
+    sport_id = serializers.IntegerField(source='court.sport_id', read_only=True)
+    sport_name = serializers.CharField(source='court.sport.name', read_only=True)
     payment_status = serializers.SerializerMethodField()
 
     class Meta:
         model = CourtBooking
         fields = [
-            'public_id', 'booking_reference', 'venue_id', 'venue_name', 'court_id', 'court_name',
+            'public_id', 'booking_reference', 'venue_id', 'venue_name', 'court_id', 'court_name', 'sport_id', 'sport_name',
             'booking_date', 'start_time', 'end_time', 'base_price', 'additional_fees', 'discount',
             'final_amount', 'status', 'payment_status', 'cancellation_reason', 'cancelled_at', 'created_at', 'updated_at',
         ]
@@ -348,11 +350,52 @@ class PlayerProfileSerializer(serializers.ModelSerializer):
 
 class UserSportSerializer(serializers.ModelSerializer):
     sport = SportSerializer(read_only=True)
+    # These are derived from completed activities so players cannot alter
+    # their match record while they may still choose their own skill level.
+    matches_played = serializers.SerializerMethodField()
+    wins = serializers.SerializerMethodField()
+    losses = serializers.SerializerMethodField()
 
     class Meta:
         model = UserSport
         fields = ['public_id', 'sport', 'skill_level', 'rating', 'matches_played', 'wins', 'losses', 'preferred']
         read_only_fields = ['public_id', 'matches_played', 'wins', 'losses']
+
+    def _completed_tournament_matches(self, obj):
+        membership = TournamentTeamMember.objects.filter(
+            user=obj.user,
+            status=TournamentTeamMember.Status.ACTIVE,
+            team__tournament__sport=obj.sport,
+        )
+        return TournamentMatch.objects.filter(
+            status=TournamentMatch.Status.COMPLETED,
+        ).filter(Q(team_a__members__in=membership) | Q(team_b__members__in=membership)).distinct()
+
+    def get_matches_played(self, obj):
+        games = GamePlayer.objects.filter(
+            user=obj.user,
+            status=GamePlayer.Status.CONFIRMED,
+            game__sport=obj.sport,
+            game__status=Game.Status.COMPLETED,
+        ).values('game_id').distinct().count()
+        legacy_matches = Match.objects.filter(
+            status='completed',
+            sport=obj.sport,
+        ).filter(Q(organizer=obj.user) | Q(joined_players=obj.user)).distinct().count()
+        return games + legacy_matches + self._completed_tournament_matches(obj).count()
+
+    def get_wins(self, obj):
+        return self._completed_tournament_matches(obj).filter(
+            winner__members__user=obj.user,
+            winner__members__status=TournamentTeamMember.Status.ACTIVE,
+        ).distinct().count()
+
+    def get_losses(self, obj):
+        matches = self._completed_tournament_matches(obj).exclude(winner__isnull=True)
+        return matches.exclude(
+            winner__members__user=obj.user,
+            winner__members__status=TournamentTeamMember.Status.ACTIVE,
+        ).distinct().count()
 
 
 class UserSportWriteSerializer(serializers.Serializer):

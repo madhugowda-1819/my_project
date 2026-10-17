@@ -45,6 +45,11 @@ class VenueOwnerApplicationView(APIView):
         missing = [field for field in required if not str(request.data.get(field, '')).strip()]
         if missing:
             raise ValidationError({field: ['This field is required.'] for field in missing})
+        if VenueOwnerApplication.objects.filter(
+            applicant=request.user,
+            status__in=[VenueOwnerApplication.Status.PENDING, VenueOwnerApplication.Status.APPROVED],
+        ).exists():
+            raise ValidationError({'detail': 'You already have a pending or approved venue-owner application.'})
         item = VenueOwnerApplication.objects.create(applicant=request.user, **{field: str(request.data[field]).strip() for field in required})
         return Response({'success': True, 'data': {'public_id': str(item.public_id), 'status': item.status}}, status=201)
 

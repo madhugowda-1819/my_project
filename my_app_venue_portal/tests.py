@@ -155,3 +155,15 @@ class VenueOwnerOperationsTests(APITestCase):
     def test_non_owner_cannot_read_owner_dashboard(self):
         self.client.force_authenticate(User.objects.create_user(username='regular-player', password='StrongPass!123'))
         self.assertEqual(self.client.get('/api/v1/venue-owner/dashboard/').status_code, 403)
+
+    def test_approved_owner_cannot_submit_duplicate_application(self):
+        self.client.force_authenticate(self.owner)
+        from my_app_venue_portal.models import VenueOwnerApplication
+        VenueOwnerApplication.objects.create(
+            applicant=self.owner, business_name='Already approved', phone='9999999999',
+            city='Bengaluru', address='Existing address', status=VenueOwnerApplication.Status.APPROVED,
+        )
+        response = self.client.post('/api/v1/users/me/venue-owner-applications/', {
+            'business_name': 'Duplicate', 'phone': '9999999999', 'city': 'Bengaluru', 'address': 'New address',
+        }, format='json')
+        self.assertEqual(response.status_code, 400)

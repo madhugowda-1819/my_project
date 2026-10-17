@@ -129,6 +129,13 @@ def find_live_sports_grounds(*, latitude=None, longitude=None, sport=None,
                 results = _find_nominatim_places(query, latitude=latitude, longitude=longitude)
             except MapsProviderError:
                 pass
+    # Name lookup is also needed when Google is not configured and the local
+    # Overpass search has no tagged result.
+    if not results and query:
+        try:
+            results = _find_nominatim_places(query, latitude=latitude, longitude=longitude)
+        except MapsProviderError:
+            pass
     return results
 
 

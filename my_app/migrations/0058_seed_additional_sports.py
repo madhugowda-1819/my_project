@@ -14,10 +14,7 @@ def seed_additional_sports(apps, schema_editor):
     for name, slug in ADDITIONAL_SPORTS:
         Sport.objects.update_or_create(
             slug=slug,
-            defaults={
-                'name': name,
-                'is_active': True,
-            },
+            defaults={'name': name, 'is_active': True},
         )
 
 
@@ -28,7 +25,7 @@ def remove_additional_sports(apps, schema_editor):
 
 class Migration(migrations.Migration):
     dependencies = [
-        ('my_app', '0051_tournament_external_ground'),
+        ('my_app', '0057_challenge_reward_grant'),
     ]
 
     operations = [

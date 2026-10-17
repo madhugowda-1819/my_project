@@ -51,11 +51,9 @@ pipeline {
                 sh '''
                     python3 --version
                     python3 -m venv .ci_venv
-                    . .ci_venv/bin/activate
-                    python -m pip install --upgrade pip
-                    python -m pip install -r requirements.txt
-                    python manage.py check
-                    python manage.py test --verbosity=2
+                    .ci_venv/bin/python -m pip install -r requirements.txt
+                    .ci_venv/bin/python manage.py check
+                    .ci_venv/bin/python manage.py test --verbosity=2
                 '''
             }
         }
@@ -95,7 +93,7 @@ pipeline {
                             # 2. Inject fresh production .env secret file
                             scp -i ${SSH_KEY_FILE} -o StrictHostKeyChecking=no ${PROD_ENV_FILE} ${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_DEPLOY_DIR}/.env
 
-                            # 3. Execute remote setup and restart service
+                            # 3. Execute remote setup
                             ssh -i ${SSH_KEY_FILE} -o StrictHostKeyChecking=no ${REMOTE_USER}@${REMOTE_HOST} "
                                 set -eu
                                 cd ${REMOTE_DEPLOY_DIR}
@@ -103,19 +101,43 @@ pipeline {
                                 # Lock down .env permissions
                                 chmod 600 .env
 
-                                # Install/update global dependencies
-                                sudo pip3 install --upgrade pip --break-system-packages
-                                sudo pip3 install -r requirements.txt gunicorn mysqlclient django python-dotenv --break-system-packages
+                                # Install dependencies in the project virtual environment.
+                                # Do not modify Debian's system-managed pip.
+                                python3 -m venv .venv
+                                .venv/bin/python -m pip install -r requirements.txt
+                                .venv/bin/python -m pip install gunicorn mysqlclient django python-dotenv
 
                                 # Run database migrations and static collection
-                                python3 manage.py migrate --noinput
-                                python3 manage.py collectstatic --noinput
+                                .venv/bin/python manage.py migrate --noinput
+                                .venv/bin/python manage.py collectstatic --noinput
 
-                                # Restart systemd gunicorn
-                                sudo systemctl restart ${SERVICE_NAME}
-                                sudo systemctl is-active --quiet ${SERVICE_NAME}
                             "
                         """
+                    }
+                }
+            }
+        }
+
+        stage('Restart Gunicorn Service') {
+            when {
+                allOf {
+                    expression { return params.DEPLOY_TO_EC2 }
+                    expression {
+                        return (env.BRANCH_NAME ?: env.GIT_BRANCH ?: '') == 'main' ||
+                               (env.GIT_BRANCH ?: '') == 'origin/main'
+                    }
+                }
+            }
+            steps {
+                script {
+                    withCredentials([
+                        sshUserPrivateKey(credentialsId: 'EC2_SSH_KEY', keyFileVariable: 'SSH_KEY_FILE', usernameVariable: 'SSH_USER')
+                    ]) {
+                        sh '''
+                            set -eu
+                            ssh -i "$SSH_KEY_FILE" -o StrictHostKeyChecking=no "$REMOTE_USER@$REMOTE_HOST" \
+                                "sudo systemctl restart '$SERVICE_NAME' && sudo systemctl is-active --quiet '$SERVICE_NAME'"
+                        '''
                     }
                 }
             }

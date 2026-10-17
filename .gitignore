@@ -12,3 +12,4 @@ staticfiles/
 .DS_Store
 .idea/
 .vscode/
+.env.example

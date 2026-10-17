@@ -8,6 +8,7 @@ urlpatterns = [
     path('auth/register/venue-owner/', views.VenueOwnerRegisterView.as_view()),
     path('users/me/venue-owner-applications/', views.VenueOwnerApplicationView.as_view()),
     path('venue-owner/dashboard/', views.VenueOwnerDashboardView.as_view()),
+    path('venue-owner/reports/', views.VenueOwnerReportsView.as_view()),
     path('venue-owner/venues/', views.VenueOwnerVenuesView.as_view()),
     path('venue-owner/venues/<uuid:public_id>/', views.VenueOwnerVenueDetailView.as_view()),
     path('venue-owner/venues/<uuid:public_id>/courts/', views.VenueOwnerCourtsView.as_view()),

@@ -140,6 +140,17 @@ class ModerationService:
     @classmethod
     @transaction.atomic
     def update_report(cls, *, report, moderator, status, resolution='', assigned_moderator=None):
+        report = Report.objects.select_for_update().get(pk=report.pk)
+        valid_transitions = {
+            Report.Status.PENDING: {Report.Status.UNDER_REVIEW, Report.Status.RESOLVED, Report.Status.DISMISSED},
+            Report.Status.UNDER_REVIEW: {Report.Status.RESOLVED, Report.Status.DISMISSED},
+            Report.Status.RESOLVED: set(),
+            Report.Status.DISMISSED: set(),
+        }
+        if status != report.status and status not in valid_transitions[report.status]:
+            raise ValidationError({'status': [f'Cannot change a {report.status} report to {status}.']})
+        if status in (Report.Status.RESOLVED, Report.Status.DISMISSED) and not resolution.strip():
+            raise ValidationError({'resolution': ['A resolution note is required when closing a report.']})
         if assigned_moderator is not None:
             report.assigned_moderator = assigned_moderator
         report.status = status

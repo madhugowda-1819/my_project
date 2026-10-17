@@ -1,5 +1,8 @@
 """Venue-owner portal controllers; shared records remain in ``my_app``."""
+from datetime import date, timedelta
+
 from django.db import transaction
+from django.db.models import Count
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
 from rest_framework.exceptions import ValidationError
@@ -53,6 +56,53 @@ class VenueOwnerDashboardView(APIView):
         return Response({'success': True, 'data': {'venues': venues.count(), 'active_venues': venues.filter(active=True).count(), 'pending_venues': venues.filter(active=False).count(), 'courts': Court.objects.filter(venue__in=venue_ids).count(), 'active_courts': Court.objects.filter(venue__in=venue_ids, active=True).count(), 'upcoming_bookings': bookings.filter(status__in=[CourtBooking.Status.PENDING, CourtBooking.Status.CONFIRMED], ends_at__gt=timezone.now()).count(), 'bookings_total': bookings.count()}})
 
 
+class VenueOwnerReportsView(APIView):
+    """Owner-scoped operational metrics, based solely on booking records.
+
+    Utilization is booked confirmed/completed court-hours divided by the
+    opening-hours capacity of active courts in the requested inclusive range.
+    """
+    permission_classes = [IsApprovedVenueOwner]
+
+    def get(self, request):
+        from_date = request.query_params.get('from')
+        to_date = request.query_params.get('to')
+        try:
+            start = date.fromisoformat(from_date) if from_date else timezone.localdate() - timedelta(days=29)
+            end = date.fromisoformat(to_date) if to_date else timezone.localdate()
+        except ValueError:
+            raise ValidationError({'date_range': 'Use ISO dates: YYYY-MM-DD.'})
+        if end < start:
+            raise ValidationError({'date_range': 'The end date must not precede the start date.'})
+        if (end - start).days > 366:
+            raise ValidationError({'date_range': 'Reports support a maximum range of 366 days.'})
+
+        bookings = CourtBooking.objects.filter(
+            venue__owner=request.user, booking_date__range=(start, end),
+        )
+        status_counts = {item['status']: item['count'] for item in bookings.values('status').annotate(count=Count('id'))}
+        courts = Court.objects.filter(venue__owner=request.user, active=True).select_related('venue')
+        booked_seconds = sum(
+            max(0, (booking.ends_at - booking.starts_at).total_seconds())
+            for booking in bookings.filter(status__in=[CourtBooking.Status.CONFIRMED, CourtBooking.Status.COMPLETED]).only('starts_at', 'ends_at')
+        )
+        days = (end - start).days + 1
+        capacity_seconds = sum(
+            max(0, (court.venue.closing_time.hour * 3600 + court.venue.closing_time.minute * 60) -
+                (court.venue.opening_time.hour * 3600 + court.venue.opening_time.minute * 60)) * days
+            for court in courts
+        )
+        by_day = list(bookings.values('booking_date').annotate(count=Count('id')).order_by('booking_date'))
+        return Response({'success': True, 'data': {
+            'from': start, 'to': end, 'bookings_total': bookings.count(),
+            'status_counts': {status: status_counts.get(status, 0) for status in CourtBooking.Status.values},
+            'cancelled_bookings': status_counts.get(CourtBooking.Status.CANCELLED, 0),
+            'booked_hours': round(booked_seconds / 3600, 2),
+            'utilization_percent': round((booked_seconds / capacity_seconds * 100) if capacity_seconds else 0, 2),
+            'bookings_by_date': by_day,
+        }})
+
+
 class VenueOwnerVenuesView(APIView):
     permission_classes = [IsApprovedVenueOwner]
     def get(self, request):
@@ -92,17 +142,26 @@ class VenueOwnerCourtDetailView(APIView):
     def get_court(self, request, public_id): return get_object_or_404(Court.objects.select_related('venue', 'sport'), public_id=public_id, venue__owner=request.user)
     @transaction.atomic
     def patch(self, request, public_id):
-        court = self.get_court(request, public_id); payload = request.data.copy(); active = payload.pop('active', None); serializer = VenueOwnerCourtWriteSerializer(court, data=payload, partial=True); serializer.is_valid(raise_exception=True)
+        court = get_object_or_404(Court.objects.select_for_update().select_related('venue', 'sport'), public_id=public_id, venue__owner=request.user); payload = request.data.copy(); active = payload.pop('active', None); serializer = VenueOwnerCourtWriteSerializer(court, data=payload, partial=True); serializer.is_valid(raise_exception=True)
         if not court.venue.venue_sports.filter(sport=serializer.validated_data.get('sport', court.sport)).exists(): raise ValidationError({'sport_id': 'Add this sport to the venue profile before assigning it to a court.'})
         court = serializer.save()
         if active is not None:
             if not isinstance(active, bool): raise ValidationError({'active': 'Must be true or false.'})
+            if not active and CourtBooking.objects.filter(
+                court=court, status__in=[CourtBooking.Status.PENDING, CourtBooking.Status.CONFIRMED], ends_at__gt=timezone.now(),
+            ).exists():
+                raise ValidationError({'active': 'This court has upcoming active bookings and cannot be deactivated.'})
             if active and not court.venue.active: raise ValidationError({'active': 'A court cannot be activated while its venue is awaiting approval or inactive.'})
             court.active = active; court.save(update_fields=['active', 'updated_at'])
         return Response({'success': True, 'data': CourtSerializer(court).data})
     @transaction.atomic
     def delete(self, request, public_id):
-        court = self.get_court(request, public_id); court.active = False; court.save(update_fields=['active', 'updated_at']); return Response({'success': True, 'detail': 'Court deactivated; booking history was preserved.'})
+        court = get_object_or_404(Court.objects.select_for_update(), public_id=public_id, venue__owner=request.user)
+        if CourtBooking.objects.filter(
+            court=court, status__in=[CourtBooking.Status.PENDING, CourtBooking.Status.CONFIRMED], ends_at__gt=timezone.now(),
+        ).exists():
+            raise ValidationError({'detail': 'This court has upcoming active bookings and cannot be deactivated.'})
+        court.active = False; court.save(update_fields=['active', 'updated_at']); return Response({'success': True, 'detail': 'Court deactivated; booking history was preserved.'})
 
 
 class VenueOwnerBookingsView(APIView):
@@ -113,6 +172,14 @@ class VenueOwnerBookingsView(APIView):
             if status not in CourtBooking.Status.values: raise ValidationError({'status': 'Choose a valid booking status.'})
             queryset = queryset.filter(status=status)
         if request.query_params.get('venue'): queryset = queryset.filter(venue__public_id=request.query_params['venue'])
+        if request.query_params.get('court'): queryset = queryset.filter(court__public_id=request.query_params['court'])
+        for parameter, lookup in (('from', 'booking_date__gte'), ('to', 'booking_date__lte')):
+            value = request.query_params.get(parameter)
+            if value:
+                try:
+                    queryset = queryset.filter(**{lookup: date.fromisoformat(value)})
+                except ValueError:
+                    raise ValidationError({parameter: 'Use an ISO date: YYYY-MM-DD.'})
         return Response({'success': True, 'data': [{'public_id': str(x.public_id), 'booking_reference': x.booking_reference, 'venue_id': str(x.venue.public_id), 'venue_name': x.venue.name, 'court_name': x.court.name, 'sport': x.court.sport.name, 'customer': x.user.username, 'booking_date': x.booking_date, 'start_time': x.start_time, 'end_time': x.end_time, 'starts_at': x.starts_at, 'ends_at': x.ends_at, 'status': x.status, 'amount': x.final_amount} for x in queryset[:200]]})
 
 
@@ -124,6 +191,8 @@ class VenueOwnerBlockedPeriodsView(APIView):
     @transaction.atomic
     def post(self, request, venue_id, court_id):
         court = get_object_or_404(Court.objects.select_for_update().select_related('venue'), public_id=court_id, venue__public_id=venue_id, venue__owner=request.user); serializer = VenueOwnerBlockedPeriodWriteSerializer(data=request.data); serializer.is_valid(raise_exception=True); start, end = serializer.validated_data['starts_at'], serializer.validated_data['ends_at']
+        if CourtBlockedPeriod.objects.filter(court=court, starts_at__lt=end, ends_at__gt=start).exists():
+            raise ValidationError({'starts_at': 'This period overlaps an existing blocked or maintenance period.'})
         if CourtBooking.objects.filter(court=court, status__in=[CourtBooking.Status.PENDING, CourtBooking.Status.CONFIRMED], starts_at__lt=end, ends_at__gt=start).exists(): raise ValidationError({'starts_at': 'This period overlaps a customer booking. Resolve the booking before blocking this time.'})
         if Game.objects.filter(court=court, status__in=ACTIVE_GAME_STATUSES, starts_at__lt=end, ends_at__gt=start).exists(): raise ValidationError({'starts_at': 'This period overlaps an active match.'})
         period = serializer.save(court=court); return Response({'success': True, 'data': {'public_id': str(period.public_id), 'starts_at': period.starts_at, 'ends_at': period.ends_at, 'type': period.type, 'reason': period.reason}}, status=201)

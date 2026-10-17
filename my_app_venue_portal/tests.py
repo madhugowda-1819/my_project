@@ -110,6 +110,48 @@ class VenueOwnerOperationsTests(APITestCase):
         removed = self.client.delete(f"/api/v1/venue-owner/blocked-periods/{created.data['data']['public_id']}/")
         self.assertEqual(removed.status_code, 204)
 
+    def test_owner_reports_are_scoped_and_blocked_periods_cannot_overlap(self):
+        self.client.force_authenticate(self.owner)
+        now = timezone.now()
+        booking = CourtBooking.objects.create(
+            user=self.other_owner, court=self.court, venue=self.venue,
+            booking_date=timezone.localdate(), starts_at=now + timedelta(hours=2),
+            ends_at=now + timedelta(hours=3), status=CourtBooking.Status.CONFIRMED,
+        )
+        report = self.client.get('/api/v1/venue-owner/reports/', {
+            'from': str(booking.booking_date), 'to': str(booking.booking_date),
+        })
+        self.assertEqual(report.status_code, 200, report.data)
+        self.assertEqual(report.data['data']['bookings_total'], 1)
+        self.assertEqual(report.data['data']['booked_hours'], 1.0)
+
+        starts = now + timedelta(days=3)
+        first = self.client.post(
+            f'/api/v1/venue-owner/venues/{self.venue.public_id}/courts/{self.court.public_id}/blocked-periods/',
+            {'starts_at': starts.isoformat(), 'ends_at': (starts + timedelta(hours=2)).isoformat(), 'type': 'maintenance'}, format='json',
+        )
+        self.assertEqual(first.status_code, 201, first.data)
+        overlapping = self.client.post(
+            f'/api/v1/venue-owner/venues/{self.venue.public_id}/courts/{self.court.public_id}/blocked-periods/',
+            {'starts_at': (starts + timedelta(hours=1)).isoformat(), 'ends_at': (starts + timedelta(hours=3)).isoformat(), 'type': 'blocked'}, format='json',
+        )
+        self.assertEqual(overlapping.status_code, 400)
+
+    def test_owner_cannot_deactivate_court_with_upcoming_booking(self):
+        self.client.force_authenticate(self.owner)
+        now = timezone.now()
+        CourtBooking.objects.create(
+            user=self.other_owner, court=self.court, venue=self.venue,
+            booking_date=timezone.localdate() + timedelta(days=1), starts_at=now + timedelta(days=1),
+            ends_at=now + timedelta(days=1, hours=1), status=CourtBooking.Status.CONFIRMED,
+        )
+        response = self.client.delete(f'/api/v1/venue-owner/courts/{self.court.public_id}/')
+        self.assertEqual(response.status_code, 400, response.data)
+        patch_response = self.client.patch(f'/api/v1/venue-owner/courts/{self.court.public_id}/', {'active': False}, format='json')
+        self.assertEqual(patch_response.status_code, 400, patch_response.data)
+        self.court.refresh_from_db()
+        self.assertTrue(self.court.active)
+
     def test_non_owner_cannot_read_owner_dashboard(self):
         self.client.force_authenticate(User.objects.create_user(username='regular-player', password='StrongPass!123'))
         self.assertEqual(self.client.get('/api/v1/venue-owner/dashboard/').status_code, 403)

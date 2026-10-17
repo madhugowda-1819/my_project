@@ -8,7 +8,7 @@ from django.db.models import Q, Count
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
 from rest_framework import generics
-from rest_framework.exceptions import APIException, PermissionDenied, ValidationError
+from rest_framework.exceptions import PermissionDenied, ValidationError
 from rest_framework.response import Response
 from rest_framework.throttling import ScopedRateThrottle
 from rest_framework.views import APIView
@@ -118,7 +118,15 @@ class CollegeVerificationView(APIView):
         approve = request.data.get('approve')
         if not isinstance(approve, bool):
             raise ValidationError({'approve': 'Must be true or false.'})
-        college = CollegeService.review(college=college, actor=request.user, approve=approve, reason=request.data.get('reason', ''))
+        reason = str(request.data.get('reason', '')).strip()
+        if not approve and not reason:
+            raise ValidationError({'reason': 'A rejection reason is required.'})
+        with transaction.atomic():
+            college = CollegeService.review(college=college, actor=request.user, approve=approve, reason=reason)
+            RoleAuditLog.objects.create(
+                actor=request.user, target_user=college.submitted_by,
+                role='college_verification', action='approve' if approve else 'reject', reason=reason,
+            )
         return Response({'success': True, 'data': CollegeSerializer(college).data})
 
 
@@ -129,7 +137,12 @@ class CollegeResultDisputeResolveView(APIView):
         dispute = get_object_or_404(CollegeResultDispute, public_id=public_id)
         serializer = CollegeDisputeResolveSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
-        dispute = CollegeService.resolve_dispute(dispute=dispute, actor=request.user, **serializer.validated_data)
+        with transaction.atomic():
+            dispute = CollegeService.resolve_dispute(dispute=dispute, actor=request.user, **serializer.validated_data)
+            RoleAuditLog.objects.create(
+                actor=request.user, target_user=dispute.raised_by, role='college_result_dispute',
+                action=dispute.status, reason=dispute.resolution,
+            )
         return Response({'success': True, 'data': CollegeResultDisputeSerializer(dispute).data})
 
 
@@ -207,6 +220,8 @@ class ReportDetailView(APIView):
             if assigned and not has_platform_role(assigned, MODERATOR_GROUPS):
                 raise ValidationError({'assigned_moderator_id': ['Assignee must be a platform moderator.']})
         if data.get('action'):
+            if report.status in (Report.Status.RESOLVED, Report.Status.DISMISSED):
+                raise ValidationError({'action': ['Closed reports cannot receive further moderation actions.']})
             ModerationService.apply_action(
                 moderator=request.user, report=report, target_type=report.target_type,
                 target_public_id=report.target_public_id, action=data['action'],
@@ -312,6 +327,8 @@ class VenueOwnerApplicationReviewView(APIView):
         review_note = str(request.data.get('review_note', '')).strip()
         if len(review_note) > 500:
             raise ValidationError({'review_note': ['Use 500 characters or fewer.']})
+        if status == VenueOwnerApplication.Status.REJECTED and not review_note:
+            raise ValidationError({'review_note': ['A rejection reason is required.']})
         applicant = item.applicant
         applicant_name = applicant.full_name.strip() or applicant.username
         decision = 'approved' if status == VenueOwnerApplication.Status.APPROVED else 'rejected'
@@ -328,6 +345,7 @@ class VenueOwnerApplicationReviewView(APIView):
             + 'Thank you,\nSportMate Admin Team'
         )
 
+        recipient_email = applicant.email
         with transaction.atomic():
             if status == VenueOwnerApplication.Status.APPROVED:
                 item.status = status
@@ -344,24 +362,28 @@ class VenueOwnerApplicationReviewView(APIView):
                     reason=review_note or 'Venue-owner application approved.',
                 )
             else:
-                # Delete the rejected applicant. The application is removed by
-                # its CASCADE relationship to the applicant account.
+                RoleAuditLog.objects.create(
+                    actor=request.user, target_user=applicant, role=VENUE_OWNER_GROUP,
+                    action='reject', reason=review_note,
+                )
+                # The audit entry remains after this account is removed.
                 applicant.delete()
-
+        try:
             sent_count = send_mail(
                 subject=f'SportMate venue-owner application {decision}',
                 message=email_body,
                 from_email=settings.DEFAULT_FROM_EMAIL,
-                recipient_list=[applicant.email],
+                recipient_list=[recipient_email],
                 fail_silently=False,
             )
-            if sent_count != 1:
-                raise APIException('The decision email could not be sent. No account or application changes were made.')
+            email_sent = sent_count == 1
+        except Exception:
+            email_sent = False
 
         return Response({
             'success': True,
             'status': status,
-            'email_sent': True,
+            'email_sent': email_sent,
             'account_deleted': status == VenueOwnerApplication.Status.REJECTED,
         })
 
@@ -383,6 +405,8 @@ class AdminDashboardView(APIView):
             'suspended_users': User.objects.filter(account_status__in=[User.AccountStatus.SUSPENDED, User.AccountStatus.DEACTIVATED]).count(),
             'venues': Venue.objects.count(), 'active_venues': Venue.objects.filter(active=True).count(),
             'pending_venues': Venue.objects.filter(active=False).count(),
+            'pending_college_verifications': College.objects.filter(verification_status=College.VerificationStatus.PENDING).count(),
+            'open_college_result_disputes': CollegeResultDispute.objects.filter(status=CollegeResultDispute.Status.OPEN).count(),
         }})
 
 

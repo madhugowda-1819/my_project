@@ -20,7 +20,7 @@ class AdminPortalRouteTests(SimpleTestCase):
 from django.contrib.auth import get_user_model
 from django.contrib.auth.models import Group
 from rest_framework.test import APITestCase
-from my_app_admin_portal.models import ModerationAction
+from my_app_admin_portal.models import ModerationAction, Report, RoleAuditLog
 
 User = get_user_model()
 
@@ -57,7 +57,10 @@ class ModerationApiTests(APITestCase):
         self.target.refresh_from_db()
         self.assertEqual(self.target.account_status, User.AccountStatus.ACTIVE)
         self.client.force_authenticate(self.admin)
-        self.assertEqual(self.client.get('/api/v1/admin/dashboard/').status_code, 200)
+        dashboard = self.client.get('/api/v1/admin/dashboard/')
+        self.assertEqual(dashboard.status_code, 200)
+        self.assertIn('pending_college_verifications', dashboard.data['data'])
+        self.assertIn('open_college_result_disputes', dashboard.data['data'])
         self.assertEqual(self.client.get('/api/v1/admin/moderation/actions/').status_code, 200)
 
     def test_normal_user_cannot_access_another_report(self):
@@ -65,3 +68,30 @@ class ModerationApiTests(APITestCase):
         report_id = created.data['data']['public_id']
         self.client.force_authenticate(self.target)
         self.assertEqual(self.client.get(f'/api/v1/reports/{report_id}/').status_code, 404)
+
+    def test_closed_report_cannot_be_reopened_or_moderated_again(self):
+        created = self.create_report()
+        report_id = created.data['data']['public_id']
+        self.client.force_authenticate(self.moderator)
+        closed = self.client.patch(
+            f'/api/v1/reports/{report_id}/',
+            {'status': 'dismissed', 'resolution': 'Insufficient evidence.'}, format='json',
+        )
+        self.assertEqual(closed.status_code, 200, closed.data)
+        reopen = self.client.patch(
+            f'/api/v1/reports/{report_id}/', {'status': 'pending'}, format='json',
+        )
+        self.assertEqual(reopen.status_code, 400)
+        action = self.client.patch(
+            f'/api/v1/reports/{report_id}/', {'action': 'suspend', 'action_reason': 'Late action'}, format='json',
+        )
+        self.assertEqual(action.status_code, 400)
+        self.assertEqual(ModerationAction.objects.count(), 0)
+
+    def test_role_audit_log_survives_target_removal(self):
+        log = RoleAuditLog.objects.create(
+            actor=self.admin, target_user=self.target, role='venue_owner', action='reject', reason='Incomplete evidence.',
+        )
+        self.target.delete()
+        log.refresh_from_db()
+        self.assertIsNone(log.target_user)

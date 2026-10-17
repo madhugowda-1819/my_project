@@ -24,7 +24,7 @@ pipeline {
         DB_NAME = 'db.sqlite3'
 
         // Live EC2 Target Paths & Service
-        REMOTE_HOST       = '35.173.184.45'
+        REMOTE_HOST = '127.0.0.1'
         REMOTE_USER       = 'ubuntu'
         REMOTE_DEPLOY_DIR = '/home/ubuntu/my_project/my_project'
         SERVICE_NAME      = 'gunicorn.service'

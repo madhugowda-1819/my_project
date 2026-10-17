@@ -1179,7 +1179,10 @@ class LiveGroundListView(APIView):
             distance = None
             if latitude is not None:
                 distance = haversine_distance(latitude, longitude, place_latitude, place_longitude)
-                if distance > radius:
+                # A named venue search should be allowed to find the exact
+                # place even when it is outside the nearby-radius filter.
+                # Radius remains enforced for location/category-only searches.
+                if not query and distance > radius:
                     continue
             normalized = {
                 'id': place.get('id'), 'source_id': place.get('id'),

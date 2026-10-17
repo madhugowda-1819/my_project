@@ -56,7 +56,8 @@ def find_live_sports_grounds(*, latitude=None, longitude=None, sport=None,
                 'X-Goog-Api-Key': api_key,
                 'X-Goog-FieldMask': (
                     'places.id,places.displayName,places.formattedAddress,'
-                    'places.location,places.types,places.googleMapsUri,places.websiteUri'
+                    'places.location,places.types,places.googleMapsUri,places.websiteUri,'
+                    'places.nationalPhoneNumber,places.internationalPhoneNumber'
                 ),
             }, method='POST',
         )
@@ -108,8 +109,21 @@ def find_live_sports_grounds(*, latitude=None, longitude=None, sport=None,
                 'address': place.get('formattedAddress'),
                 'latitude': location.get('latitude'), 'longitude': location.get('longitude'),
                 'types': place.get('types') or [], 'mapsUrl': place.get('googleMapsUri'),
-                'websiteUrl': place.get('websiteUri'), 'source': 'google_maps_live',
+                'websiteUrl': place.get('websiteUri'),
+                'phone': place.get('internationalPhoneNumber') or place.get('nationalPhoneNumber'),
+                'source': 'google_maps_live',
             })
+        # Google can legally return an empty/filtered response even when the
+        # provider is healthy. Use the coordinate-based OSM search as a
+        # secondary source so venue owners still receive named nearby grounds.
+        if not results and latitude is not None and longitude is not None:
+            try:
+                results = _find_openstreetmap_sports_grounds(
+                    latitude=latitude, longitude=longitude, sport=sport,
+                    radius_km=radius_km, query=query, category=category,
+                )
+            except MapsProviderError:
+                pass
     return results
 
 

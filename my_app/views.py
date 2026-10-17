@@ -1191,6 +1191,7 @@ class LiveGroundListView(APIView):
                 'sports': [], 'category': (place.get('types') or [None])[0],
                 'source': place.get('source'), 'maps_url': place.get('mapsUrl'),
                 'website_url': place.get('websiteUrl'),
+                'phone': place.get('phone'),
                 'verification_status': 'external_unverified',
                 'booking_supported': False,
             }

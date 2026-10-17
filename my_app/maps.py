@@ -124,6 +124,40 @@ def find_live_sports_grounds(*, latitude=None, longitude=None, sport=None,
                 )
             except MapsProviderError:
                 pass
+        if not results and query:
+            try:
+                results = _find_nominatim_places(query, latitude=latitude, longitude=longitude)
+            except MapsProviderError:
+                pass
+    return results
+
+
+def _find_nominatim_places(query, *, latitude=None, longitude=None):
+    """Small, provider-neutral name fallback when Places returns no matches."""
+    params = {'q': query, 'format': 'jsonv2', 'limit': 8, 'addressdetails': 1}
+    if latitude is not None and longitude is not None:
+        params['viewbox'] = f'{longitude - .5},{latitude + .5},{longitude + .5},{latitude - .5}'
+        params['bounded'] = 0
+    request = Request('https://nominatim.openstreetmap.org/search?' + urlencode(params),
+                      headers={'User-Agent': 'SportMate/1.0 (venue-search)'})
+    try:
+        with urlopen(request, timeout=settings.MAPS_PROVIDER_TIMEOUT_SECONDS) as response:
+            payload = json.loads(response.read().decode('utf-8'))
+    except (HTTPError, URLError, TimeoutError, json.JSONDecodeError) as error:
+        raise MapsProviderError('Name search unavailable.') from error
+    results = []
+    for item in payload if isinstance(payload, list) else []:
+        try:
+            item_lat, item_lng = float(item['lat']), float(item['lon'])
+        except (KeyError, TypeError, ValueError):
+            continue
+        name = str(item.get('name') or item.get('display_name', '').split(',')[0]).strip()
+        if name:
+            results.append({'id': f"nominatim:{item.get('osm_type')}:{item.get('osm_id')}",
+                            'name': name, 'address': item.get('display_name'),
+                            'latitude': item_lat, 'longitude': item_lng,
+                            'types': [item.get('type')], 'mapsUrl': None,
+                            'source': 'openstreetmap_live'})
     return results
 
 

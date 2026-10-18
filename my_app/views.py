@@ -3361,7 +3361,7 @@ class AiMatchView(APIView):
         if request.query_params.get('include_owned', '').lower() in {'1', 'true', 'yes'}:
             owned = list(Game.objects.filter(
                 host=user,
-                status__in=[Game.Status.SCHEDULED, Game.Status.OPEN, Game.Status.ALMOST_FULL],
+                status__in=[Game.Status.OPEN, Game.Status.ALMOST_FULL],
                 starts_at__gt=timezone.now(),
             ).select_related('sport', 'venue', 'court__sport', 'host').order_by('starts_at')[:10])
             owned_ids = {game.pk for game in owned}

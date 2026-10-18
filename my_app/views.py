@@ -3379,7 +3379,7 @@ class AiMatchView(APIView):
                 response.append({
                     'public_id': str(game.public_id),
                     'game_reference': game.game_reference,
-                    'sport': game.sport.name if game.sport_id else None,
+                    'sport': getattr(getattr(game, 'sport', None), 'name', None),
                     'game_date': game.game_date,
                     'status': game.status,
                 })

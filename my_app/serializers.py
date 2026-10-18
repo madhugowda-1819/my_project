@@ -226,8 +226,11 @@ class VenueSerializer(serializers.ModelSerializer):
         fields = [
             'public_id', 'name', 'description', 'address', 'city', 'latitude', 'longitude', 'phone', 'email', 'rating', 'maps_place_id',
             'opening_time', 'closing_time', 'active', 'sports', 'amenities', 'courts', 'images',
-            'reviews', 'distance_km',
+            'reviews', 'distance_km', 'ground_id', 'ground_name',
         ]
+
+    ground_id = serializers.IntegerField(source='source_ground_id', read_only=True)
+    ground_name = serializers.CharField(source='source_ground.name', read_only=True)
 
     def get_rating(self, obj):
         return float(obj.rating) if obj.rating and obj.rating > 0 else None

@@ -3341,19 +3341,24 @@ class AiMatchView(APIView):
         # Match rows. Use the shared matcher so capacity, privacy, blocks,
         # preferences and upcoming-state rules stay consistent with the
         # recommendations feed rather than returning full/started games.
-        results = GameMatchingService.get_recommendations(
-            user=user,
-            latitude=user.latitude if user.latitude is not None and user.longitude is not None else None,
-            longitude=user.longitude if user.latitude is not None and user.longitude is not None else None,
-            radius=getattr(getattr(user, 'profile', None), 'preferred_distance', 15) or 15,
-            limit=10,
-        )
+        try:
+            results = GameMatchingService.get_recommendations(
+                user=user,
+                latitude=user.latitude if user.latitude is not None and user.longitude is not None else None,
+                longitude=user.longitude if user.latitude is not None and user.longitude is not None else None,
+                radius=getattr(getattr(user, 'profile', None), 'preferred_distance', 15) or 15,
+                limit=10,
+            )
+        except (TypeError, ValueError, ValidationError):
+            # A malformed legacy preference must not break the AI Matches
+            # screen; return an empty recommendation set instead.
+            results = []
         games = [item['game'] for item in results]
         if request.query_params.get('include_owned', '').lower() in {'1', 'true', 'yes'}:
             owned = list(Game.objects.filter(
                 host=user,
                 status__in=[Game.Status.SCHEDULED, Game.Status.OPEN, Game.Status.ALMOST_FULL],
-                ends_at__gt=timezone.now(),
+                starts_at__gt=timezone.now(),
             ).select_related('sport', 'venue', 'court__sport', 'host').order_by('starts_at')[:10])
             owned_ids = {game.pk for game in owned}
             games = owned + [game for game in games if game.pk not in owned_ids]

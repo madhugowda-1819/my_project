@@ -3309,10 +3309,6 @@ class AvailabilityView(APIView):
         serializer.is_valid(raise_exception=True)
 
         user = request.user
-        try:
-            user_profile = user.profile
-        except Exception:
-            user_profile = None
 
         if 'is_available' in serializer.validated_data:
             user.is_available = serializer.validated_data['is_available']
@@ -3341,6 +3337,10 @@ class AiMatchView(APIView):
 
     def get(self, request):
         user = request.user
+        try:
+            user_profile = user.profile
+        except Exception:
+            user_profile = None
         # This client consumes court-backed games, not legacy ground-based
         # Match rows. Use the shared matcher so capacity, privacy, blocks,
         # preferences and upcoming-state rules stay consistent with the

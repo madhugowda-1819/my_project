@@ -186,7 +186,11 @@ class GameMatchingService:
         slots = list(AvailabilitySlot.objects.filter(user=user))
         # Older accounts may predate PlayerProfile creation. Recommendations
         # remain read-only and use neutral time scoring for those accounts.
-        profile = getattr(user, 'profile', None)
+        try:
+            profile = user.profile
+        except Exception:
+            # Older accounts may not have a PlayerProfile row yet.
+            profile = None
         preferred_times = profile.preferred_play_times if profile else []
         profile_availability = profile.availability if profile else {}
         results = []

@@ -3309,6 +3309,10 @@ class AvailabilityView(APIView):
         serializer.is_valid(raise_exception=True)
 
         user = request.user
+        try:
+            user_profile = user.profile
+        except Exception:
+            user_profile = None
 
         if 'is_available' in serializer.validated_data:
             user.is_available = serializer.validated_data['is_available']
@@ -3346,7 +3350,7 @@ class AiMatchView(APIView):
                 user=user,
                 latitude=user.latitude if user.latitude is not None and user.longitude is not None else None,
                 longitude=user.longitude if user.latitude is not None and user.longitude is not None else None,
-                radius=getattr(getattr(user, 'profile', None), 'preferred_distance', 15) or 15,
+                radius=getattr(user_profile, 'preferred_distance', 15) or 15,
                 limit=10,
             )
         except (TypeError, ValueError, ValidationError):

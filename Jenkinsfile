@@ -28,6 +28,7 @@ pipeline {
         REMOTE_USER       = 'ubuntu'
         REMOTE_DEPLOY_DIR = '/home/ubuntu/my_project/my_project'
         SERVICE_NAME      = 'gunicorn.service'
+        NGINX_SERVICE_NAME = 'nginx.service'
 
         PIP_DISABLE_PIP_VERSION_CHECK = '1'
         PYTHONDONTWRITEBYTECODE = '1'
@@ -118,7 +119,7 @@ pipeline {
             }
         }
 
-        stage('Restart Gunicorn Service') {
+        stage('Restart Gunicorn and Nginx Services') {
             when {
                 allOf {
                     expression { return params.DEPLOY_TO_EC2 }
@@ -136,7 +137,7 @@ pipeline {
                         sh '''
                             set -eu
                             ssh -i "$SSH_KEY_FILE" -o StrictHostKeyChecking=no "$REMOTE_USER@$REMOTE_HOST" \
-                                "sudo systemctl restart '$SERVICE_NAME' && sudo systemctl is-active --quiet '$SERVICE_NAME'"
+                                "sudo systemctl restart '$SERVICE_NAME' && sudo systemctl is-active --quiet '$SERVICE_NAME' && sudo systemctl restart '$NGINX_SERVICE_NAME' && sudo systemctl is-active --quiet '$NGINX_SERVICE_NAME'"
                         '''
                     }
                 }

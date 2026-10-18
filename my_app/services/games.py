@@ -145,7 +145,10 @@ class GameService:
                 GamePlayer.objects.create(game=game, user=host)
                 from my_app.services.chat import ConversationService, MessageService
                 conversation = ConversationService.sync_game_member(game=game, user=host, active=True)
-                MessageService.system_message(conversation=conversation, content=f'{host.username} created the game.')
+                MessageService.system_message(
+                    conversation=conversation,
+                    content=f'{host.username} created the {game.sport.name} match.',
+                )
                 return GameLifecycleService.refresh(game)
             except IntegrityError:
                 # Only expected for the short random reference collision; any

@@ -2702,7 +2702,13 @@ class ConversationListCreateView(generics.GenericAPIView):
             'type': conversation.conversation_type,
             'active': conversation.active,
             'other_user': ({'public_id': str(other.public_id), 'username': other.username, 'name': other.full_name} if other else None),
-            'game': ({'public_id': str(conversation.game.public_id), 'game_reference': conversation.game.game_reference} if conversation.game_id else None),
+            'game': ({
+                'public_id': str(conversation.game.public_id),
+                'game_reference': conversation.game.game_reference,
+                'sport': conversation.game.sport.name,
+                'venue': conversation.game.venue.name if conversation.game.venue_id else None,
+                'host': conversation.game.host.full_name or conversation.game.host.username,
+            } if conversation.game_id else None),
             'latest_message': ConversationMessageSerializer(latest).data if latest else None,
             'latest_message_at': latest.created_at if latest else conversation.updated_at,
             'unread_count': getattr(conversation, 'unread_count', 0),
@@ -3346,7 +3352,7 @@ class AiMatchView(APIView):
         if request.query_params.get('include_owned', '').lower() in {'1', 'true', 'yes'}:
             owned = list(Game.objects.filter(
                 host=user,
-                status__in=[Game.Status.OPEN, Game.Status.ALMOST_FULL],
+                status__in=[Game.Status.SCHEDULED, Game.Status.OPEN, Game.Status.ALMOST_FULL],
                 ends_at__gt=timezone.now(),
             ).select_related('sport', 'venue', 'court__sport', 'host').order_by('starts_at')[:10])
             owned_ids = {game.pk for game in owned}

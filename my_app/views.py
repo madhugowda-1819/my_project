@@ -3366,10 +3366,23 @@ class AiMatchView(APIView):
             ).select_related('sport', 'venue', 'court__sport', 'host').order_by('starts_at')[:10])
             owned_ids = {game.pk for game in owned}
             games = owned + [game for game in games if game.pk not in owned_ids]
-        response = GameSerializer(
-            games[:10], many=True,
-            context={'request': request},
-        ).data
+        try:
+            response = GameSerializer(
+                games[:10], many=True,
+                context={'request': request},
+            ).data
+        except Exception:
+            # Do not fail the entire AI page because one legacy game has
+            # incomplete venue/court metadata.
+            response = []
+            for game in games[:10]:
+                response.append({
+                    'public_id': str(game.public_id),
+                    'game_reference': game.game_reference,
+                    'sport': game.sport.name if game.sport_id else None,
+                    'game_date': game.game_date,
+                    'status': game.status,
+                })
         result_by_id = {item['game'].pk: item for item in results}
         for serialized, game in zip(response, games[:10]):
             item = result_by_id.get(game.pk)

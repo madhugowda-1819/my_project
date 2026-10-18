@@ -3353,7 +3353,7 @@ class AiMatchView(APIView):
                 radius=getattr(user_profile, 'preferred_distance', 15) or 15,
                 limit=10,
             )
-        except (TypeError, ValueError, ValidationError):
+        except Exception:
             # A malformed legacy preference must not break the AI Matches
             # screen; return an empty recommendation set instead.
             results = []

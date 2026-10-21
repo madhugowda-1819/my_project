@@ -1,6 +1,6 @@
 from django.contrib.auth import get_user_model
 from django.contrib.auth.models import Group
-from django.db.models import Q, Count, F, Avg, Prefetch
+from django.db.models import Q, Count, F, Avg, Prefetch, Case, When, IntegerField
 from django.db import connection, transaction, IntegrityError
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
@@ -33,7 +33,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 import requests
 
 from .models import (
-    Sport, UserSport, AvailabilitySlot, Match, Message, Notification, Ground, SportsGround, PlayerProfile,
+    Sport, SportFormat, UserSport, AvailabilitySlot, Match, Message, Notification, Ground, SportsGround, PlayerProfile,
     Venue, VenueSport, Court, CourtBlockedPeriod, VenueReview, CourtBooking, Game, GamePlayer, Conversation, ConversationMember, UserBlock,
     Community, CommunityMember, CommunityPost, CommunityComment, CommunityPostLike,
     Event, EventParticipant, EventReminder, Tournament, TournamentTeam, TournamentTeamMember, TournamentMatch, NotificationPreference, UserDevice, PlayerRating, Achievement, UserAchievement,
@@ -43,7 +43,7 @@ from .models import (
 )
 from .serializers import (
     RegistrationRequestSerializer, LoginRequestSerializer, CurrentUserSerializer,
-    UserSerializer, SportSerializer, PublicPlayerSerializer, UserSportSerializer,
+    UserSerializer, SportSerializer, SportFormatSerializer, PublicPlayerSerializer, UserSportSerializer,
     UserSportWriteSerializer, PlayerProfilePreferencesSerializer,
     NearbySearchSerializer, PlayerDirectoryQuerySerializer,
     PlayerRecommendationQuerySerializer, MatchMyMoodQuerySerializer,
@@ -414,6 +414,18 @@ class SportListView(generics.ListAPIView):
 
 class SportDetailView(generics.RetrieveAPIView):
     queryset = Sport.objects.filter(is_active=True)
+
+
+class SportFormatListView(generics.ListAPIView):
+    serializer_class = SportFormatSerializer
+    permission_classes = [AllowAny]
+
+    def get_queryset(self):
+        queryset = SportFormat.objects.filter(is_active=True, sport__is_active=True).select_related('sport')
+        sport_id = self.request.query_params.get('sport')
+        if sport_id:
+            queryset = queryset.filter(sport_id=sport_id)
+        return queryset.order_by('sport__name', 'name')
     serializer_class = SportSerializer
     permission_classes = [AllowAny]
 
@@ -1017,7 +1029,9 @@ class UniversalGroundsView(APIView):
     def _nearby_cached(self, latitude, longitude):
         lat_delta = self.radius_km / 111.0
         lon_delta = self.radius_km / max(111.0 * math.cos(math.radians(latitude)), 0.000001)
+        from django.utils import timezone
         candidates = SportsGround.objects.exclude(osm_id__startswith='google/').filter(
+            Q(expires_at__isnull=True) | Q(expires_at__gte=timezone.now()),
             latitude__range=(latitude - lat_delta, latitude + lat_delta),
             longitude__range=(longitude - lon_delta, longitude + lon_delta),
         )
@@ -1026,6 +1040,8 @@ class UniversalGroundsView(APIView):
         return sorted((item for item in grounds if item[1] <= self.radius_km), key=lambda item: item[1])
 
     def _refresh_from_overpass(self, latitude, longitude):
+        from datetime import timedelta
+        from django.utils import timezone
         query = ('[out:json][timeout:30];('
                  f'nwr["leisure"~"^(pitch|sports_centre|stadium)$"]["name"](around:20000,{latitude},{longitude});'
                  f'nwr["sport"~"^(cricket|football|soccer|badminton|tennis|table_tennis|volleyball|pickleball|basketball)$",i]["name"](around:20000,{latitude},{longitude});'
@@ -1062,6 +1078,7 @@ class UniversalGroundsView(APIView):
                 defaults={'name': name,
                           'ground_type': str(tags.get('leisure') or 'sports_ground'),
                           'sport': str(tags.get('sport') or tags.get('sport:1') or 'multi-sport'),
+                          'expires_at': timezone.now() + timedelta(hours=24),
                           'latitude': element_latitude, 'longitude': element_longitude},
             )
 
@@ -1129,7 +1146,7 @@ class GroundListView(APIView):
 
 
 class LiveGroundListView(APIView):
-    """Returns current Google Maps results; it never reads Ground rows."""
+    """Returns cached live-provider results; approved venues remain separate."""
     permission_classes = [AllowAny]
     throttle_classes = [ScopedRateThrottle]
     throttle_scope = 'search'
@@ -1158,6 +1175,32 @@ class LiveGroundListView(APIView):
             return Response({'detail': 'Unsupported sports facility category.'}, status=400)
         if latitude is None and not query and not sport and not category:
             return Response({'detail': 'Provide coordinates or a venue, area, or sport search.'}, status=400)
+        # Coordinate-only discovery is backed by the 24-hour SportsGround
+        # cache. Text searches still query the provider directly because their
+        # result set is query-specific.
+        if latitude is not None and not query:
+            from django.utils import timezone
+            cached = SportsGround.objects.filter(
+                Q(expires_at__isnull=False, expires_at__gte=timezone.now()),
+                latitude__isnull=False, longitude__isnull=False,
+            )
+            cached = nearby_queryset(cached, latitude=latitude, longitude=longitude, radius=radius)
+            if sport:
+                cached = cached.filter(sport__icontains=sport)
+            if category:
+                cached = cached.filter(ground_type__icontains=category.split()[0])
+            cached = list(cached[:20])
+            if cached:
+                results = [{
+                    'id': item.osm_id, 'source_id': item.osm_id, 'name': item.name,
+                    'address': None, 'latitude': item.latitude, 'longitude': item.longitude,
+                    'sports': [item.sport], 'category': item.ground_type,
+                    'source': 'live_cache', 'verification_status': 'external_unverified',
+                    'booking_supported': False, 'distance_km': round(float(getattr(item, 'distance_km', 0)), 2),
+                } for item in cached]
+                return Response({'count': len(results), 'results': results,
+                                 'booking_supported': False, 'verification_status': 'external_unverified',
+                                 'cache': 'fresh'})
         try:
             places = find_live_sports_grounds(
                 latitude=latitude, longitude=longitude,
@@ -1199,6 +1242,21 @@ class LiveGroundListView(APIView):
                 normalized['distance_km'] = round(distance, 2)
             results.append(normalized)
         results.sort(key=lambda item: item.get('distance_km', float('inf')))
+        if latitude is not None and not query:
+            from django.utils import timezone
+            expires_at = timezone.now() + timedelta(hours=24)
+            for item in results:
+                source_id = str(item.get('source_id') or item.get('id') or '').strip()
+                if not source_id:
+                    continue
+                SportsGround.objects.update_or_create(
+                    osm_id=f"provider/{item.get('source') or 'unknown'}/{source_id}"[:64],
+                    defaults={
+                        'name': item['name'], 'ground_type': item.get('category') or 'sports_ground',
+                        'sport': (sport or 'multi-sport'), 'latitude': item['latitude'],
+                        'longitude': item['longitude'], 'expires_at': expires_at,
+                    },
+                )
         return Response({
             'count': len(results),
             'results': results,
@@ -1269,14 +1327,67 @@ class MatchHistoryView(generics.ListAPIView):
         ).prefetch_related('joined_players').distinct().order_by('-date_time')
 
 
+class MyMatchesView(APIView):
+    """Unified private list of matches/games owned or joined by the player."""
+    permission_classes = [IsActiveAccount]
+
+    def get(self, request):
+        user = request.user
+        matches = Match.objects.filter(
+            Q(organizer=user) | Q(joined_players=user)
+        ).select_related('sport', 'ground', 'organizer').prefetch_related(
+            'joined_players', 'participation_history'
+        ).distinct().order_by('-date_time')
+        games = Game.objects.filter(
+            Q(host=user) | Q(game_players__user=user, game_players__status=GamePlayer.Status.CONFIRMED)
+        ).select_related('sport', 'venue', 'court__sport', 'host').prefetch_related(
+            'game_players__user__user_sports__sport'
+        ).distinct().order_by('-starts_at')
+
+        for game in games[:100]:
+            GameLifecycleService.refresh(game)
+
+        serialized_matches = MatchSerializer(
+            matches, many=True, context={'request': request}
+        ).data
+        serialized_games = GameSerializer(
+            games, many=True, context={'request': request}
+        ).data
+
+        hosted = []
+        joined = []
+        for item, match in zip(serialized_matches, matches):
+            item = dict(item)
+            item['source'] = 'manual_match'
+            item['identity'] = f'match:{match.public_id}'
+            (hosted if match.organizer_id == user.id else joined).append(item)
+        for item, game in zip(serialized_games, games):
+            item = dict(item)
+            item['source'] = 'ai_game'
+            item['identity'] = f'game:{game.public_id}'
+            (hosted if game.host_id == user.id else joined).append(item)
+
+        return Response({
+            'hosted': hosted,
+            'joined': joined,
+            'matches': serialized_matches,
+            'games': serialized_games,
+        })
+
+
 class CreateMatchView(APIView):
     permission_classes = [IsActiveAccount]
 
     def post(self, request):
         serializer = MatchCreateSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
-        match = serializer.save(organizer=request.user)
-        return Response({'match': MatchSerializer(match).data}, status=201)
+        from my_app.services.matches import create_match
+        match_data = dict(serializer.validated_data)
+        match_data.pop('latitude', None)
+        match_data.pop('longitude', None)
+        match_data.pop('radius', None)
+        match = create_match(organizer=request.user, validated_data=match_data)
+        return Response({'match': MatchSerializer(match, context={'request': request}).data}, status=201)
 
 
 class MatchDetailView(APIView):
@@ -1298,7 +1409,10 @@ class MatchDetailView(APIView):
         match = get_object_or_404(Match, pk=match_id)
         serializer = MatchUpdateSerializer(data=request.data, context={'match': match})
         serializer.is_valid(raise_exception=True)
-        match = update_match(match_id=match_id, organizer=request.user, changes=serializer.validated_data)
+        changes = dict(serializer.validated_data)
+        for key in ('latitude', 'longitude', 'radius'):
+            changes.pop(key, None)
+        match = update_match(match_id=match_id, organizer=request.user, changes=changes)
         return Response({'success': True, 'match': MatchSerializer(match, context={'request': request}).data})
 
 
@@ -1575,8 +1689,17 @@ class MatchParticipantsView(APIView):
     permission_classes = [IsActiveAccount]
 
     def get(self, request, match_id):
-        match = get_object_or_404(Match.objects.prefetch_related('joined_players'), pk=match_id)
-        return Response({'success': True, 'data': MatchParticipantSerializer(match.joined_players.all(), many=True).data})
+        match = get_object_or_404(
+            Match.objects.select_related('sport', 'organizer').prefetch_related(
+                Prefetch('joined_players', queryset=User.objects.prefetch_related('user_sports__sport'))
+            ), pk=match_id
+        )
+        players = list(match.joined_players.all())
+        players.sort(key=lambda player: (0 if player.pk == match.organizer_id else 1, player.pk))
+        return Response({'success': True, 'data': MatchParticipantSerializer(
+            players, many=True,
+            context={'request': request, 'sport_id': match.sport_id, 'host_id': match.organizer_id},
+        ).data})
 
 
 class MatchTimePollListCreateView(APIView):
@@ -1788,7 +1911,11 @@ class GamePlayersView(APIView):
             | Q(game_players__user=request.user, game_players__status=GamePlayer.Status.CONFIRMED)
         )
         game = get_object_or_404(Game.objects.filter(visible_to_requester).distinct(), public_id=public_id)
-        players = GamePlayer.objects.filter(game=game, status=GamePlayer.Status.CONFIRMED).select_related('user').prefetch_related('user__user_sports__sport')
+        players = GamePlayer.objects.filter(game=game, status=GamePlayer.Status.CONFIRMED).select_related(
+            'user', 'game__host'
+        ).prefetch_related('user__user_sports__sport').order_by(
+            Case(When(user_id=game.host_id, then=0), default=1, output_field=IntegerField()), 'joined_at', 'pk'
+        )
         return Response({'success': True, 'results': GamePlayerSerializer(players, many=True, context={'request': request}).data})
 
 
@@ -3358,14 +3485,8 @@ class AiMatchView(APIView):
             # screen; return an empty recommendation set instead.
             results = []
         games = [item['game'] for item in results]
-        if request.query_params.get('include_owned', '').lower() in {'1', 'true', 'yes'}:
-            owned = list(Game.objects.filter(
-                host=user,
-                status__in=[Game.Status.OPEN, Game.Status.ALMOST_FULL],
-                starts_at__gt=timezone.now(),
-            ).select_related('sport', 'venue', 'court__sport', 'host').order_by('starts_at')[:10])
-            owned_ids = {game.pk for game in owned}
-            games = owned + [game for game in games if game.pk not in owned_ids]
+        # Ownership is intentionally excluded.  The AI Match tab is a
+        # recommendation feed; hosted and joined records belong to My Matches.
         try:
             response = GameSerializer(
                 games[:10], many=True,

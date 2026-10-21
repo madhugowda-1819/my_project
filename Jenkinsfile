@@ -7,6 +7,11 @@ pipeline {
             defaultValue: true,
             description: 'Deploy validated main branch to AWS EC2 instance.'
         )
+        string(
+            name: 'EC2_HOST',
+            defaultValue: '127.0.0.1',
+            description: 'EC2 public DNS name or private IP reachable by this Jenkins agent.'
+        )
     }
 
     options {
@@ -24,7 +29,7 @@ pipeline {
         DB_NAME = 'db.sqlite3'
 
         // Live EC2 Target Paths & Service
-        REMOTE_HOST = '127.0.0.1'
+        REMOTE_HOST = "${params.EC2_HOST}"
         REMOTE_USER       = 'ubuntu'
         REMOTE_DEPLOY_DIR = '/home/ubuntu/my_project/my_project'
         SERVICE_NAME      = 'gunicorn.service'
@@ -47,13 +52,22 @@ pipeline {
             }
         }
 
-        stage('Set up CI & Test') {
+        stage('Setup CI') {
             steps {
                 sh '''
                     python3 --version
                     python3 -m venv .ci_venv
                     .ci_venv/bin/python -m pip install -r requirements.txt
+                '''
+            }
+        }
+
+        stage('Run Django Checks and Tests') {
+            steps {
+                sh '''
+                    set -eu
                     .ci_venv/bin/python manage.py check
+                    .ci_venv/bin/python manage.py makemigrations --check --dry-run
                     .ci_venv/bin/python manage.py test --verbosity=2
                 '''
             }
@@ -111,6 +125,15 @@ pipeline {
                                 # Run database migrations and static collection
                                 .venv/bin/python manage.py migrate --noinput
                                 .venv/bin/python manage.py collectstatic --noinput
+
+                                # Install and enable the hourly live-ground cache cleanup.
+                                # The installer uses the deployed virtualenv and the SSH user
+                                # so no system Python or password prompt is required.
+                                chmod +x deployment/linux/install_ground_cache_cleanup.sh
+                                sudo deployment/linux/install_ground_cache_cleanup.sh "${REMOTE_DEPLOY_DIR}" "${REMOTE_DEPLOY_DIR}/.venv" "${REMOTE_USER}"
+                                sudo systemctl start sportmate-ground-cache-cleanup.service
+                                sudo systemctl is-enabled --quiet sportmate-ground-cache-cleanup.timer
+                                sudo systemctl is-active --quiet sportmate-ground-cache-cleanup.timer
 
                             "
                         """

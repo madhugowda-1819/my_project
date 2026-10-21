@@ -8,6 +8,7 @@ from math import cos, radians
 from django.db.models import ExpressionWrapper, F, FloatField, Value
 from django.db.models.functions import ASin, Cos, Power, Radians, Sin, Sqrt
 from rest_framework.exceptions import ValidationError
+from .radius_policy import MIN_RADIUS_KM, MAX_RADIUS_KM
 
 
 EARTH_RADIUS_KM = 6371.0
@@ -22,8 +23,8 @@ def validate_coordinates(latitude, longitude, radius):
         raise ValidationError({'latitude': ['Latitude must be between -90 and 90.']})
     if not -180 <= longitude <= 180:
         raise ValidationError({'longitude': ['Longitude must be between -180 and 180.']})
-    if not 0 < radius <= 500:
-        raise ValidationError({'radius': ['Radius must be greater than 0 and at most 500 km.']})
+    if not MIN_RADIUS_KM <= radius <= MAX_RADIUS_KM:
+        raise ValidationError({'radius': [f'Radius must be between {MIN_RADIUS_KM:g} and {MAX_RADIUS_KM:g} km.']})
     return latitude, longitude, radius
 
 

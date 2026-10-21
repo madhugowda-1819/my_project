@@ -84,6 +84,7 @@ urlpatterns = [
     # ---------------- SPORTS ----------------
     path('sports/', views.SportListView.as_view()),
     path('sports/<int:pk>/', views.SportDetailView.as_view()),
+    path('sport-formats/', views.SportFormatListView.as_view()),
     path('achievements/', views.AchievementListView.as_view()),
     path('achievements/<uuid:public_id>/', views.AchievementDetailView.as_view()),
 
@@ -97,6 +98,7 @@ urlpatterns = [
     # ---------------- MATCHES ----------------
     path('matches/', views.MatchListView.as_view()),
     path('matches/history/', views.MatchHistoryView.as_view()),
+    path('matches/mine/', views.MyMatchesView.as_view()),
     path('matches/create/', views.CreateMatchView.as_view()),
     path('matches/public/<uuid:public_id>/', views.MatchPublicDetailView.as_view()),
     path('matches/<int:match_id>/', views.MatchDetailView.as_view()),

@@ -7,7 +7,7 @@ from datetime import timedelta
 from django.core.validators import RegexValidator
 from django.core.files.images import get_image_dimensions
 from .models import (
-    Sport, PlayerProfile, AvailabilitySlot,
+    Sport, SportFormat, PlayerProfile, AvailabilitySlot,
     Match, Message, Notification, Ground, Game, GamePlayer, Conversation, ConversationMember,
     Community, CommunityMember, CommunityPost, CommunityComment, CommunityPostLike,
     Event, EventParticipant, EventReminder, Tournament, TournamentTeam, TournamentTeamMember, TournamentMatch,
@@ -72,6 +72,14 @@ class SportSerializer(serializers.ModelSerializer):
         return obj.players.count()
 
 
+class SportFormatSerializer(serializers.ModelSerializer):
+    sport_id = serializers.IntegerField(source='sport_id', read_only=True)
+
+    class Meta:
+        model = SportFormat
+        fields = ['id', 'public_id', 'sport_id', 'name', 'minimum_players', 'maximum_players', 'default_capacity', 'is_active']
+
+
 # ------------------------------------------------------------------
 # 🔥 GROUND (NEW)
 # ------------------------------------------------------------------
@@ -108,7 +116,7 @@ class GroundSerializer(serializers.ModelSerializer):
 class GroundDiscoverySerializer(serializers.Serializer):
     latitude = serializers.FloatField(min_value=-90, max_value=90)
     longitude = serializers.FloatField(min_value=-180, max_value=180)
-    radius = serializers.FloatField(min_value=0.1, max_value=50, default=10)
+    radius = serializers.FloatField(min_value=1, max_value=100, default=15)
     sport = serializers.CharField(required=False, allow_blank=False, max_length=60)
 
 
@@ -116,7 +124,7 @@ class AutoGameCreateSerializer(serializers.Serializer):
     sport_id = serializers.PrimaryKeyRelatedField(
         source='sport', queryset=Sport.objects.filter(is_active=True), required=False,
     )
-    radius = serializers.FloatField(min_value=0.1, max_value=100, required=False)
+    radius = serializers.FloatField(min_value=1, max_value=100, required=False)
     latitude = serializers.FloatField(min_value=-90, max_value=90, required=False)
     longitude = serializers.FloatField(min_value=-180, max_value=180, required=False)
 
@@ -129,7 +137,7 @@ class AutoGameCreateSerializer(serializers.Serializer):
 class NearbySearchSerializer(serializers.Serializer):
     latitude = serializers.FloatField(min_value=-90, max_value=90)
     longitude = serializers.FloatField(min_value=-180, max_value=180)
-    radius = serializers.FloatField(min_value=0.1, max_value=500, default=15)
+    radius = serializers.FloatField(min_value=1, max_value=100, default=15)
     sport = serializers.CharField(required=False)
     skill_level = serializers.ChoiceField(choices=UserSport.SkillLevel.choices, required=False)
 
@@ -152,7 +160,7 @@ class PlayerDirectoryQuerySerializer(serializers.Serializer):
     # Keep the legacy Flutter query names working during client rollouts.
     lat = serializers.FloatField(min_value=-90, max_value=90, required=False)
     lng = serializers.FloatField(min_value=-180, max_value=180, required=False)
-    radius = serializers.FloatField(min_value=0.1, max_value=500, default=15)
+    radius = serializers.FloatField(min_value=1, max_value=100, default=15)
     page = serializers.IntegerField(min_value=1, required=False)
     page_size = serializers.IntegerField(min_value=1, max_value=100, required=False)
 
@@ -250,7 +258,7 @@ class VenueDiscoveryQuerySerializer(NearbySearchSerializer):
     latitude = serializers.FloatField(min_value=-90, max_value=90, required=False)
     longitude = serializers.FloatField(min_value=-180, max_value=180, required=False)
     longitude = serializers.FloatField(min_value=-180, max_value=180, required=False)
-    radius = serializers.FloatField(min_value=0.1, max_value=500, required=False, default=15)
+    radius = serializers.FloatField(min_value=1, max_value=100, required=False, default=15)
     q = serializers.CharField(required=False, allow_blank=True, max_length=120, trim_whitespace=True)
     city = serializers.CharField(required=False)
     min_rating = serializers.DecimalField(max_digits=3, decimal_places=2, min_value=0, max_value=5, required=False)
@@ -654,6 +662,8 @@ class MatchSerializer(serializers.ModelSerializer):
     is_joined = serializers.SerializerMethodField()
     is_organizer = serializers.SerializerMethodField()
     my_participation_status = serializers.SerializerMethodField()
+    current_players = serializers.SerializerMethodField()
+    available_slots = serializers.SerializerMethodField()
 
     class Meta:
         model = Match
@@ -664,13 +674,20 @@ class MatchSerializer(serializers.ModelSerializer):
             'groundLocation',
             'date_time',
             'end_date_time',
+            'title', 'description',
             'total_players',
-            'joinedPlayers',
+            'joinedPlayers', 'current_players', 'available_slots',
             'organizer', 'status', 'is_joined', 'is_organizer', 'my_participation_status'
         ]
 
     def get_joinedPlayers(self, obj):
         return obj.joined_players.count()
+
+    def get_current_players(self, obj):
+        return obj.joined_players.count()
+
+    def get_available_slots(self, obj):
+        return max(0, obj.total_players - obj.joined_players.count())
 
     def get_status(self, obj):
         # Legacy matches retain their stored status, but an unprocessed match
@@ -699,9 +716,22 @@ class MatchSerializer(serializers.ModelSerializer):
 
 
 class MatchParticipantSerializer(serializers.ModelSerializer):
+    skill_level = serializers.SerializerMethodField()
+    is_host = serializers.SerializerMethodField()
+
     class Meta:
         model = User
-        fields = ['id', 'public_id', 'username', 'full_name', 'avatar']
+        fields = ['id', 'public_id', 'username', 'full_name', 'avatar', 'skill_level', 'is_host']
+
+    def get_skill_level(self, obj):
+        sport_id = self.context.get('sport_id')
+        if not sport_id:
+            return None
+        entry = next((item for item in obj.user_sports.all() if item.sport_id == sport_id), None)
+        return entry.skill_level if entry else None
+
+    def get_is_host(self, obj):
+        return obj.pk == self.context.get('host_id')
 
 
 class MatchReplacementInvitationSerializer(serializers.ModelSerializer):
@@ -867,10 +897,13 @@ class MatchCreateSerializer(serializers.ModelSerializer):
     sport = serializers.PrimaryKeyRelatedField(queryset=Sport.objects.filter(is_active=True))
     ground = serializers.PrimaryKeyRelatedField(queryset=Ground.objects.all())
     end_date_time = serializers.DateTimeField(required=False)
+    latitude = serializers.FloatField(required=False, write_only=True)
+    longitude = serializers.FloatField(required=False, write_only=True)
+    radius = serializers.FloatField(required=False, write_only=True, min_value=1, max_value=100, default=15)
 
     class Meta:
         model = Match
-        fields = ['sport', 'ground', 'date_time', 'end_date_time', 'total_players']
+        fields = ['sport', 'ground', 'date_time', 'end_date_time', 'title', 'description', 'total_players', 'latitude', 'longitude', 'radius']
 
     def validate_date_time(self, value):
         if value <= timezone.now():
@@ -884,13 +917,32 @@ class MatchCreateSerializer(serializers.ModelSerializer):
         if end <= attrs['date_time']:
             raise serializers.ValidationError({'end_date_time': 'End time must be after the match start time.'})
         attrs['end_date_time'] = end
+        from my_app.services.matches import sport_match_capacity
+        from my_app.services.venue_eligibility import validate_approved_ground
+        from my_app.services.radius_policy import validate_radius
+        configured = sport_match_capacity(attrs['sport'])
+        if configured is not None and attrs['total_players'] > configured:
+            raise serializers.ValidationError({'total_players': f'This sport supports at most {configured} players.'})
+        validate_approved_ground(ground=attrs['ground'], sport=attrs['sport'])
+        if ('latitude' in attrs) != ('longitude' in attrs):
+            raise serializers.ValidationError({'location': 'latitude and longitude must be provided together.'})
+        if 'latitude' in attrs:
+            lat, lng, selected_radius = validate_radius(attrs['latitude'], attrs['longitude'], attrs.get('radius', 15))
+            if attrs['ground'].distance_to(lat, lng) > selected_radius:
+                raise serializers.ValidationError({'ground': 'The selected ground is outside the selected radius.'})
         return attrs
 
 
 class MatchUpdateSerializer(serializers.Serializer):
+    title = serializers.CharField(required=False, allow_blank=True, max_length=200)
+    description = serializers.CharField(required=False, allow_blank=True, max_length=5000)
     date_time = serializers.DateTimeField(required=False)
     end_date_time = serializers.DateTimeField(required=False)
     total_players = serializers.IntegerField(min_value=1, required=False)
+    ground = serializers.PrimaryKeyRelatedField(queryset=Ground.objects.all(), required=False)
+    latitude = serializers.FloatField(required=False, write_only=True)
+    longitude = serializers.FloatField(required=False, write_only=True)
+    radius = serializers.FloatField(required=False, write_only=True, min_value=1, max_value=100, default=15)
 
     def validate(self, attrs):
         match = self.context['match']
@@ -905,6 +957,17 @@ class MatchUpdateSerializer(serializers.Serializer):
             raise serializers.ValidationError({'end_date_time': 'End time must be after the match start.'})
         if capacity < match.joined_players.count():
             raise serializers.ValidationError({'total_players': 'Capacity cannot be lower than the current joined player count.'})
+        if 'ground' in attrs or 'latitude' in attrs or 'longitude' in attrs:
+            ground = attrs.get('ground', match.ground)
+            from my_app.services.venue_eligibility import validate_approved_ground
+            from my_app.services.radius_policy import validate_radius
+            validate_approved_ground(ground=ground, sport=match.sport)
+            if ('latitude' in attrs) != ('longitude' in attrs):
+                raise serializers.ValidationError({'location': 'latitude and longitude must be provided together.'})
+            if 'latitude' in attrs:
+                lat, lng, radius = validate_radius(attrs['latitude'], attrs['longitude'], attrs.get('radius', 15))
+                if ground.distance_to(lat, lng) > radius:
+                    raise serializers.ValidationError({'ground': 'The selected ground is outside the selected radius.'})
         return attrs
 
 
@@ -966,6 +1029,14 @@ class GameCreateSerializer(serializers.Serializer):
 
 
 class GameUpdateSerializer(serializers.Serializer):
+    venue_id = serializers.UUIDField(required=False)
+    court_id = serializers.UUIDField(required=False)
+    game_date = serializers.DateField(required=False)
+    start_time = serializers.TimeField(required=False)
+    end_time = serializers.TimeField(required=False)
+    latitude = serializers.FloatField(required=False, write_only=True)
+    longitude = serializers.FloatField(required=False, write_only=True)
+    radius = serializers.FloatField(required=False, write_only=True, min_value=1, max_value=100, default=15)
     min_players = serializers.IntegerField(min_value=1, required=False)
     max_players = serializers.IntegerField(min_value=1, required=False)
     skill_level = serializers.ChoiceField(choices=UserSport.SkillLevel.choices, required=False, allow_blank=True)
@@ -975,6 +1046,8 @@ class GameUpdateSerializer(serializers.Serializer):
     def validate(self, attrs):
         if not attrs:
             raise serializers.ValidationError('Provide at least one editable game field.')
+        if ('latitude' in attrs) != ('longitude' in attrs):
+            raise serializers.ValidationError({'location': 'latitude and longitude must be provided together.'})
         return attrs
 
 
@@ -987,7 +1060,7 @@ class GameQuerySerializer(serializers.Serializer):
     status = serializers.ChoiceField(choices=Game.Status.choices, required=False)
     latitude = serializers.FloatField(min_value=-90, max_value=90, required=False)
     longitude = serializers.FloatField(min_value=-180, max_value=180, required=False)
-    radius = serializers.FloatField(min_value=0.1, max_value=500, required=False, default=15)
+    radius = serializers.FloatField(min_value=1, max_value=100, required=False, default=15)
     upcoming = serializers.BooleanField(required=False)
 
     def validate(self, attrs):
@@ -1000,7 +1073,7 @@ class GameRecommendationQuerySerializer(serializers.Serializer):
     sport = serializers.PrimaryKeyRelatedField(queryset=Sport.objects.filter(is_active=True), required=False)
     latitude = serializers.FloatField(min_value=-90, max_value=90, required=False)
     longitude = serializers.FloatField(min_value=-180, max_value=180, required=False)
-    radius = serializers.FloatField(min_value=0.1, max_value=500, required=False, default=20)
+    radius = serializers.FloatField(min_value=1, max_value=100, required=False, default=15)
     date = serializers.DateField(required=False)
     skill_level = serializers.ChoiceField(choices=UserSport.SkillLevel.choices, required=False)
     limit = serializers.IntegerField(min_value=1, max_value=50, required=False, default=20)
@@ -1031,13 +1104,23 @@ class MatchMyMoodQuerySerializer(GameRecommendationQuerySerializer):
 class GamePlayerSerializer(serializers.ModelSerializer):
     player = serializers.SerializerMethodField()
     user_id = serializers.IntegerField(read_only=True)
+    skill_level = serializers.SerializerMethodField()
+    is_host = serializers.SerializerMethodField()
 
     class Meta:
         model = GamePlayer
-        fields = ['public_id', 'user_id', 'player', 'status', 'joined_at', 'left_at']
+        fields = ['public_id', 'user_id', 'player', 'skill_level', 'is_host', 'status', 'joined_at', 'left_at']
 
     def get_player(self, obj):
         return PublicPlayerSerializer(obj.user, context=self.context).data
+
+    def get_skill_level(self, obj):
+        sport_id = getattr(obj.game, 'sport_id', None)
+        entry = next((item for item in obj.user.user_sports.all() if item.sport_id == sport_id), None)
+        return entry.skill_level if entry else None
+
+    def get_is_host(self, obj):
+        return obj.user_id == obj.game.host_id
 
 
 class GameSerializer(serializers.ModelSerializer):

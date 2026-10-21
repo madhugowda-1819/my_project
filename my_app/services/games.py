@@ -4,6 +4,7 @@ The service deliberately owns all capacity, schedule and lifecycle decisions;
 views only parse HTTP requests and serialize results.
 """
 import secrets
+from math import radians, sin, cos, asin, sqrt
 
 from django.conf import settings
 from django.db import IntegrityError, transaction
@@ -120,6 +121,8 @@ class GameService:
             venue = Venue.objects.select_for_update().get(public_id=venue_id)
         except Venue.DoesNotExist as exc:
             raise NotFound('Venue not found.') from exc
+        from my_app.services.venue_eligibility import validate_approved_venue
+        validate_approved_venue(venue=venue, sport=sport)
         try:
             court = Court.objects.select_for_update().get(public_id=court_id)
         except Court.DoesNotExist as exc:
@@ -293,13 +296,54 @@ class GameService:
         GameLifecycleService.refresh(game)
         if game.status in (Game.Status.CANCELLED, Game.Status.COMPLETED, Game.Status.STARTED):
             raise GameError('This game can no longer be updated.')
+        from my_app.services.venue_eligibility import validate_approved_venue
+        from my_app.services.radius_policy import validate_radius
+        next_venue = game.venue
+        next_court = game.court
+        if 'venue_id' in changes:
+            next_venue = Venue.objects.select_for_update().filter(public_id=changes.pop('venue_id')).first()
+            if next_venue is None:
+                raise ValidationError({'venue_id': ['Venue not found.']})
+        if 'court_id' in changes:
+            next_court = Court.objects.select_for_update().filter(public_id=changes.pop('court_id')).first()
+            if next_court is None:
+                raise ValidationError({'court_id': ['Court not found.']})
+        validate_approved_venue(venue=next_venue, sport=game.sport)
+        if next_court.venue_id != next_venue.id or next_court.sport_id != game.sport_id or not next_court.active:
+            raise ValidationError({'court_id': ['Choose an active court for the selected sport and venue.']})
+        if 'latitude' in changes:
+            lat, lng, radius = validate_radius(changes.pop('latitude'), changes.pop('longitude'), changes.pop('radius', 15))
+            dlat = radians(next_venue.latitude - lat)
+            dlng = radians(next_venue.longitude - lng)
+            value = sin(dlat / 2) ** 2 + cos(radians(lat)) * cos(radians(next_venue.latitude)) * sin(dlng / 2) ** 2
+            distance = 6371 * 2 * asin(sqrt(value))
+            if distance > radius:
+                raise ValidationError({'venue_id': ['The selected venue is outside the selected radius.']})
+        next_date = changes.get('game_date', game.game_date)
+        next_start = changes.get('start_time', game.start_time)
+        next_end = changes.get('end_time', game.end_time)
         confirmed = game.game_players.filter(status=GamePlayer.Status.CONFIRMED).count()
         if changes.get('max_players', game.max_players) < confirmed:
             raise ValidationError({'max_players': ['max_players cannot be below confirmed players.']})
         if changes.get('min_players', game.min_players) > changes.get('max_players', game.max_players):
             raise ValidationError({'min_players': ['min_players cannot exceed max_players.']})
-        if changes.get('max_players', game.max_players) > game.court.capacity:
+        # AI games use sport roster capacity rather than the venue's physical
+        # court inventory capacity (for example cricket recruitment is 11–15
+        # players even when the court record has a legacy capacity of 2).
+        is_auto_game = game.description.startswith('Automatically created from your SportMate preferences.')
+        if not is_auto_game and changes.get('max_players', game.max_players) > next_court.capacity:
             raise ValidationError({'max_players': ['max_players cannot exceed court capacity.']})
+        schedule_changed = ({'venue', 'court', 'game_date', 'start_time', 'end_time'} & set(changes))
+        if schedule_changed:
+            starts_at, ends_at = cls._validate_slot(
+                venue=next_venue, court=next_court, game_date=next_date,
+                start_time=next_start, end_time=next_end, exclude_game_id=game.pk,
+            )
+        else:
+            starts_at, ends_at = game.starts_at, game.ends_at
+        changes.update({'venue': next_venue, 'court': next_court, 'game_date': next_date,
+                        'start_time': next_start, 'end_time': next_end,
+                        'starts_at': starts_at, 'ends_at': ends_at})
         for field, value in changes.items():
             setattr(game, field, value)
         game.save(update_fields=[*changes.keys(), 'updated_at'])

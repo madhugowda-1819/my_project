@@ -112,6 +112,23 @@ class Sport(TimestampedPublicModel):
         ordering = ['name']
 
 
+class SportFormat(TimestampedPublicModel):
+    sport = models.ForeignKey(Sport, on_delete=models.CASCADE, related_name='formats')
+    name = models.CharField(max_length=80)
+    minimum_players = models.PositiveIntegerField()
+    maximum_players = models.PositiveIntegerField()
+    default_capacity = models.PositiveIntegerField()
+    is_active = models.BooleanField(default=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(fields=['sport', 'name'], name='unique_sport_format_name'),
+            models.CheckConstraint(check=models.Q(minimum_players__gt=0), name='sport_format_min_positive'),
+            models.CheckConstraint(check=models.Q(minimum_players__lte=models.F('maximum_players')), name='sport_format_min_lte_max'),
+            models.CheckConstraint(check=models.Q(default_capacity__gte=models.F('minimum_players'), default_capacity__lte=models.F('maximum_players')), name='sport_format_default_in_range'),
+        ]
+
+
 # ---------------------------------------------------------------------------
 # PLAYER PROFILE
 # ---------------------------------------------------------------------------
@@ -449,6 +466,7 @@ class SportsGround(models.Model):
     google_photo_name = models.CharField(max_length=512, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
+    expires_at = models.DateTimeField(null=True, blank=True, db_index=True)
 
     class Meta:
         indexes = [
@@ -504,6 +522,8 @@ class Match(TimestampedPublicModel):
 
     date_time = models.DateTimeField()
     end_date_time = models.DateTimeField()
+    title = models.CharField(max_length=200, blank=True, default='')
+    description = models.TextField(blank=True, default='')
     total_players = models.IntegerField()
 
     joined_players = models.ManyToManyField(

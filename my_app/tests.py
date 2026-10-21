@@ -452,6 +452,13 @@ class MatchApiTests(APITestCase):
             name='Central Ground', city='Bengaluru', latitude=12.9716,
             longitude=77.5946, price_per_hour=500,
         )
+        self.venue = Venue.objects.create(
+            source_ground=self.ground, name='Central Approved Venue',
+            address='1 Central Road', city='Bengaluru', latitude=12.9716,
+            longitude=77.5946, opening_time='06:00', closing_time='23:00',
+            active=True,
+        )
+        VenueSport.objects.create(venue=self.venue, sport=self.sport)
         self.organizer = User.objects.create_user(username='organizer', email='organizer@example.com', password='pw123456')
         self.player = User.objects.create_user(username='player', email='player@example.com', password='pw123456')
         PlayerProfile.objects.create(user=self.organizer)
@@ -505,7 +512,12 @@ class MatchApiTests(APITestCase):
 
         self.assertEqual(first_join.status_code, 200)
         self.assertEqual(second_join.status_code, 200)
-        self.assertEqual(Match.objects.get(pk=match_id).joined_count(), 1)
+        # The organizer is registered atomically as participant one during
+        # creation; the second user fills the next slot.
+        match = Match.objects.get(pk=match_id)
+        self.assertEqual(match.joined_count(), 2)
+        self.assertTrue(match.joined_players.filter(pk=self.organizer.pk).exists())
+        self.assertTrue(match.joined_players.filter(pk=self.player.pk).exists())
         self.assertEqual(self.organizer.notifications.count(), 1)
         notification=self.organizer.notifications.get()
         self.assertEqual(notification.data['match_id'],str(Match.objects.get(pk=match_id).public_id))

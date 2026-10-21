@@ -1,0 +1,11 @@
+[Unit]
+Description=Run SportMate ground-cache cleanup hourly
+
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=1h
+Persistent=true
+Unit=sportmate-ground-cache-cleanup.service
+
+[Install]
+WantedBy=timers.target

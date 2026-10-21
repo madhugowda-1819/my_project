@@ -40,11 +40,12 @@ class AutoGameService:
 
     @classmethod
     def _roster_limits(cls, sport, court_capacity):
-        base = cls.STANDARD_ROSTERS.get(sport.name.lower(), 2)
-        # Court.capacity describes the venue inventory, not the sport roster.
-        # A cricket court may be configured as capacity 2 while the match still
-        # needs the normal 11-player roster.
-        return base, base
+        configured = sport.formats.filter(is_active=True).order_by('id').first()
+        if configured:
+            return configured.minimum_players, configured.maximum_players
+        # Compatibility for a sport added before capacity configuration is
+        # migrated; configured production sports never use this fallback.
+        return 2, min(2, court_capacity)
 
     @staticmethod
     def _sports_for(user, sport=None):
@@ -80,9 +81,13 @@ class AutoGameService:
     def create(cls, *, user, sport=None, radius=15):
         if user.latitude is None or user.longitude is None:
             raise ValidationError({'location': ['Enable location so SportMate can find a nearby verified court.']})
-        # Avoid accidental duplicate games caused by repeated taps/retries.
+        selected_entries = cls._sports_for(user, sport)
+        requested_sport = selected_entries[0].sport
+        # Avoid accidental duplicate games caused by repeated taps/retries;
+        # reuse is strictly scoped to the requested sport.
         existing = Game.objects.filter(
             host=user,
+            sport=requested_sport,
             status__in=[Game.Status.OPEN, Game.Status.ALMOST_FULL],
             ends_at__gt=timezone.now(),
         ).select_related('sport', 'venue', 'court').order_by('starts_at').first()
@@ -91,16 +96,17 @@ class AutoGameService:
 
         preferences = getattr(getattr(user, 'profile', None), 'preferred_play_times', []) or []
         venues = nearby_queryset(
-            Venue.objects.filter(active=True).prefetch_related('courts__sport'),
+            Venue.objects.filter(active=True, is_demo=False).prefetch_related('courts__sport'),
             latitude=user.latitude,
             longitude=user.longitude,
             radius=radius,
         )[:50]
         venues = list(venues)
+        venues.sort(key=lambda venue: (round(float(getattr(venue, 'distance_km', 0) or 0), 6), venue.pk))
         if not venues:
             raise ValidationError({'location': ['No verified active venues were found within your selected distance.']})
 
-        for user_sport in cls._sports_for(user, sport):
+        for user_sport in selected_entries:
             selected_sport = user_sport.sport
             for venue in venues:
                 courts = [court for court in venue.courts.all() if court.active and court.sport_id == selected_sport.id]

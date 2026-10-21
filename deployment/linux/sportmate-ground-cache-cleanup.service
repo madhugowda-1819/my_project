@@ -1,0 +1,13 @@
+[Unit]
+Description=SportMate expired live-ground cache cleanup
+After=network-online.target
+
+[Service]
+Type=oneshot
+# The installer replaces these paths with the actual EC2 deployment paths.
+WorkingDirectory=/opt/sportmate/backend/my_project
+ExecStart=/opt/sportmate/venv/bin/python manage.py cleanup_expired_sports_grounds
+User=sportmate
+Group=sportmate
+StandardOutput=journal
+StandardError=journal

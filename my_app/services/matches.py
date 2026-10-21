@@ -7,7 +7,7 @@ from rest_framework.exceptions import APIException, NotFound, PermissionDenied
 
 from my_app.models import (AvailabilitySlot, Match, MatchParticipation, MatchReplacementHistory,
                            MatchReplacementInvitation, MatchReplacementOpportunity,
-                           User, UserBlock, UserSport)
+                           User, UserBlock, UserSport, SportFormat)
 from my_app.utils import create_notification
 from my_app.services.notifications import NotificationService
 from my_app.services.locations import nearby_queryset
@@ -17,6 +17,10 @@ class MatchUnavailable(APIException):
     status_code = 409
     default_code = 'BOOKING_UNAVAILABLE'
     default_detail = 'The selected match is no longer available.'
+
+def sport_match_capacity(sport):
+    configured = SportFormat.objects.filter(sport=sport, is_active=True).order_by('id').first()
+    return configured.maximum_players if configured else None
 
 
 def _close_full_match_rescues(match, now=None):
@@ -32,7 +36,10 @@ def _close_full_match_rescues(match, now=None):
 
 @transaction.atomic
 def create_match(*, organizer, validated_data):
-    return Match.objects.create(organizer=organizer, **validated_data)
+    match = Match.objects.create(organizer=organizer, **validated_data)
+    match.joined_players.add(organizer)
+    MatchParticipation.objects.create(match=match, user=organizer)
+    return match
 
 
 @transaction.atomic
@@ -375,7 +382,7 @@ def remove_player(*, match_id, organizer, player_id, reason=''):
 @transaction.atomic
 def cancel_match(*, match_id, organizer):
     try:
-        match = Match.objects.select_for_update().select_related('sport').get(pk=match_id)
+        match = Match.objects.select_for_update().select_related('sport', 'ground').get(pk=match_id)
     except Match.DoesNotExist as exc:
         raise NotFound('Match not found.') from exc
     if match.organizer_id != organizer.id:
@@ -421,14 +428,15 @@ def update_match(*, match_id, organizer, changes):
     capacity = changes.get('total_players', match.total_players)
     if capacity < match.joined_players.count():
         raise MatchUnavailable('Capacity cannot be lower than the current joined player count.')
+    material_fields = {'title', 'description', 'ground', 'date_time', 'end_date_time', 'total_players'}
     for field, value in changes.items():
         setattr(match, field, value)
     match.save(update_fields=[*changes.keys(), 'updated_at'])
-    if {'date_time', 'end_date_time'} & changes.keys():
+    if material_fields & changes.keys():
         for participant in match.joined_players.exclude(pk=organizer.pk).iterator():
             NotificationService.create_notification(
-                user=participant, actor=organizer, type='match_invite', title='Match schedule updated',
-                body=f'The organizer changed the schedule for the {match.sport.name} match.',
+                user=participant, actor=organizer, type='match_invite', title='Match details updated',
+                body=f'The organizer updated the {match.sport.name} match details.',
                 data={'match_id': str(match.public_id)},
                 event_key=f'match-updated:{match.pk}:{match.updated_at.isoformat()}:{participant.pk}',
             )

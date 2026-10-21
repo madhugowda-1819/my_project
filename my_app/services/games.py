@@ -110,7 +110,8 @@ class GameService:
     @classmethod
     @transaction.atomic
     def create(cls, *, host, sport_id, venue_id, court_id, game_date, start_time, end_time,
-               min_players, max_players, skill_level='', description='', visibility=Game.Visibility.PUBLIC):
+               min_players, max_players, skill_level='', description='', visibility=Game.Visibility.PUBLIC,
+               enforce_court_capacity=True):
         try:
             sport = Sport.objects.get(pk=sport_id, is_active=True)
         except Sport.DoesNotExist as exc:
@@ -127,7 +128,7 @@ class GameService:
             raise GameError('The selected court does not support this sport.')
         if min_players > max_players:
             raise ValidationError({'min_players': ['min_players cannot exceed max_players.']})
-        if max_players > court.capacity:
+        if enforce_court_capacity and max_players > court.capacity:
             raise ValidationError({'max_players': ['max_players cannot exceed court capacity.']})
         cls._require_sport_eligibility(user=host, sport=sport, required_skill=skill_level)
         starts_at, ends_at = cls._validate_slot(

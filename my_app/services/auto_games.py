@@ -16,8 +16,7 @@ AUTO_GAME_DURATION_MINUTES = 60
 
 
 class AutoGameService:
-    # Standard team sizes. Auto-created games start at the normal roster size
-    # and allow up to three substitute/extra players when the court supports it.
+    # Standard match rosters. The host counts as one of these players.
     STANDARD_ROSTERS = {
         'cricket': 11,
         'badminton': 2,
@@ -42,10 +41,10 @@ class AutoGameService:
     @classmethod
     def _roster_limits(cls, sport, court_capacity):
         base = cls.STANDARD_ROSTERS.get(sport.name.lower(), 2)
-        # Never create a game larger than the verified court inventory allows.
-        if court_capacity < base:
-            return min(2, court_capacity), court_capacity
-        return base, min(base + 3, court_capacity)
+        # Court.capacity describes the venue inventory, not the sport roster.
+        # A cricket court may be configured as capacity 2 while the match still
+        # needs the normal 11-player roster.
+        return base, base
 
     @staticmethod
     def _sports_for(user, sport=None):
@@ -132,6 +131,7 @@ class AutoGameService:
                                 skill_level=user_sport.skill_level,
                                 description='Automatically created from your SportMate preferences.',
                                 visibility=Game.Visibility.PUBLIC,
+                                enforce_court_capacity=False,
                             )
                             return game, True
                         except GameConflict:

@@ -92,6 +92,18 @@ class AutoGameService:
             ends_at__gt=timezone.now(),
         ).select_related('sport', 'venue', 'court').order_by('starts_at').first()
         if existing:
+            # Older auto-created games may have been made before the
+            # database-backed format rules were seeded (Cricket could be
+            # stored as a two-player game). Repair only an open, upcoming
+            # auto-game when its current occupancy still fits the configured
+            # default; historical/completed games remain unchanged.
+            configured = requested_sport.formats.filter(is_active=True).order_by('id').first()
+            if configured and existing.max_players < configured.default_capacity:
+                confirmed = existing.game_players.filter(status='confirmed').count()
+                if confirmed <= configured.default_capacity:
+                    existing.max_players = configured.default_capacity
+                    existing.min_players = configured.minimum_players
+                    existing.save(update_fields=['max_players', 'min_players', 'updated_at'])
             return existing, False
 
         preferences = getattr(getattr(user, 'profile', None), 'preferred_play_times', []) or []

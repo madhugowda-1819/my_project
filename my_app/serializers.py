@@ -717,11 +717,12 @@ class MatchSerializer(serializers.ModelSerializer):
 
 class MatchParticipantSerializer(serializers.ModelSerializer):
     skill_level = serializers.SerializerMethodField()
+    performance = serializers.SerializerMethodField()
     is_host = serializers.SerializerMethodField()
 
     class Meta:
         model = User
-        fields = ['id', 'public_id', 'username', 'full_name', 'avatar', 'skill_level', 'is_host']
+        fields = ['id', 'public_id', 'username', 'full_name', 'avatar', 'skill_level', 'performance', 'is_host']
 
     def get_skill_level(self, obj):
         sport_id = self.context.get('sport_id')
@@ -732,6 +733,21 @@ class MatchParticipantSerializer(serializers.ModelSerializer):
 
     def get_is_host(self, obj):
         return obj.pk == self.context.get('host_id')
+
+    def get_performance(self, obj):
+        sport_id = self.context.get('sport_id')
+        entry = next((item for item in obj.user_sports.all() if item.sport_id == sport_id), None)
+        if not entry:
+            return None
+        played = entry.matches_played or 0
+        wins = entry.wins or 0
+        return {
+            'matches_played': played,
+            'wins': wins,
+            'losses': entry.losses or 0,
+            'win_rate': round((wins / played) * 100, 1) if played else 0,
+            'rating': float(entry.rating or 0),
+        }
 
 
 class MatchReplacementInvitationSerializer(serializers.ModelSerializer):
@@ -1105,11 +1121,12 @@ class GamePlayerSerializer(serializers.ModelSerializer):
     player = serializers.SerializerMethodField()
     user_id = serializers.IntegerField(read_only=True)
     skill_level = serializers.SerializerMethodField()
+    performance = serializers.SerializerMethodField()
     is_host = serializers.SerializerMethodField()
 
     class Meta:
         model = GamePlayer
-        fields = ['public_id', 'user_id', 'player', 'skill_level', 'is_host', 'status', 'joined_at', 'left_at']
+        fields = ['public_id', 'user_id', 'player', 'skill_level', 'performance', 'is_host', 'status', 'joined_at', 'left_at']
 
     def get_player(self, obj):
         return PublicPlayerSerializer(obj.user, context=self.context).data
@@ -1121,6 +1138,20 @@ class GamePlayerSerializer(serializers.ModelSerializer):
 
     def get_is_host(self, obj):
         return obj.user_id == obj.game.host_id
+
+    def get_performance(self, obj):
+        entry = next((item for item in obj.user.user_sports.all() if item.sport_id == obj.game.sport_id), None)
+        if not entry:
+            return None
+        played = entry.matches_played or 0
+        wins = entry.wins or 0
+        return {
+            'matches_played': played,
+            'wins': wins,
+            'losses': entry.losses or 0,
+            'win_rate': round((wins / played) * 100, 1) if played else 0,
+            'rating': float(entry.rating or 0),
+        }
 
 
 class GameSerializer(serializers.ModelSerializer):

@@ -37,7 +37,7 @@ from .models import (
     Venue, VenueSport, Court, CourtBlockedPeriod, VenueReview, CourtBooking, Game, GamePlayer, Conversation, ConversationMember, UserBlock,
     Community, CommunityMember, CommunityPost, CommunityComment, CommunityPostLike,
     Event, EventParticipant, EventReminder, Tournament, TournamentTeam, TournamentTeamMember, TournamentMatch, NotificationPreference, UserDevice, PlayerRating, Achievement, UserAchievement,
-    College, CollegeMembership, CollegeChallenge, CollegeResultDispute, MatchTimePoll, MatchReflection,
+    College, CollegeMembership, CollegeChallenge, CollegeResultDispute, MatchTimePoll, MatchReflection, MatchParticipation,
     HealthActivityRecord,
     SportChallenge, ChallengeEntry,
 )
@@ -1700,6 +1700,60 @@ class MatchParticipantsView(APIView):
             players, many=True,
             context={'request': request, 'sport_id': match.sport_id, 'host_id': match.organizer_id},
         ).data})
+
+
+class MatchAttendanceView(APIView):
+    """Host-only final attendance marking after a match/game has ended."""
+    permission_classes = [IsActiveAccount]
+
+    def post(self, request, match_id):
+        match = get_object_or_404(Match.objects.select_for_update(), pk=match_id)
+        if match.organizer_id != request.user.id:
+            raise PermissionDenied('Only the host can finalize attendance.')
+        if match.end_date_time > timezone.now():
+            raise ValidationError({'attendance': 'Attendance can be finalized after the match ends.'})
+        rows = request.data.get('participants')
+        if not isinstance(rows, list):
+            raise ValidationError({'participants': 'Provide a participant attendance list.'})
+        allowed = {'attended', 'no_show'}
+        with transaction.atomic():
+            for row in rows:
+                if not isinstance(row, dict) or row.get('attendance') not in allowed:
+                    raise ValidationError({'participants': 'Each participant must be attended or no_show.'})
+                participation = MatchParticipation.objects.select_for_update().filter(
+                    match=match, user_id=row.get('user_id'), status=MatchParticipation.Status.JOINED,
+                ).first()
+                if not participation:
+                    raise ValidationError({'participants': f"User {row.get('user_id')} is not an active participant."})
+                participation.attendance = row['attendance']
+                participation.save(update_fields=['attendance', 'updated_at'])
+        return Response({'success': True, 'message': 'Attendance finalized.'})
+
+
+class GameAttendanceView(APIView):
+    permission_classes = [IsActiveAccount]
+
+    def post(self, request, public_id):
+        game = get_object_or_404(Game.objects.select_for_update(), public_id=public_id)
+        if game.host_id != request.user.id:
+            raise PermissionDenied('Only the host can finalize attendance.')
+        if game.ends_at > timezone.now():
+            raise ValidationError({'attendance': 'Attendance can be finalized after the game ends.'})
+        rows = request.data.get('participants')
+        if not isinstance(rows, list):
+            raise ValidationError({'participants': 'Provide a participant attendance list.'})
+        with transaction.atomic():
+            for row in rows:
+                if not isinstance(row, dict) or row.get('attendance') not in {'attended', 'no_show'}:
+                    raise ValidationError({'participants': 'Each participant must be attended or no_show.'})
+                player = GamePlayer.objects.select_for_update().filter(
+                    game=game, user_id=row.get('user_id'), status=GamePlayer.Status.CONFIRMED,
+                ).first()
+                if not player:
+                    raise ValidationError({'participants': f"User {row.get('user_id')} is not a confirmed player."})
+                player.attendance = row['attendance']
+                player.save(update_fields=['attendance', 'updated_at'])
+        return Response({'success': True, 'message': 'Attendance finalized.'})
 
 
 class MatchTimePollListCreateView(APIView):

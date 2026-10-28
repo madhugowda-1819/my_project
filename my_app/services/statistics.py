@@ -13,7 +13,7 @@ class RatingService:
  def rate_player(cls,*,reviewer,player,game,playing_performance,teamwork,sportsmanship,punctuality,review=''):
   if reviewer.id==player.id: raise ValidationError('You cannot rate yourself.')
   if not player.is_active: raise ValidationError('Player is inactive.')
-  if game.status!=Game.Status.COMPLETED or not GamePlayer.objects.filter(game=game,user=reviewer,status='confirmed').exists() or not GamePlayer.objects.filter(game=game,user=player,status='confirmed').exists(): raise PermissionDenied('A completed shared game is required.')
+  if game.status!=Game.Status.COMPLETED or not GamePlayer.objects.filter(game=game,user=reviewer,status='confirmed',attendance='attended').exists() or not GamePlayer.objects.filter(game=game,user=player,status='confirmed',attendance='attended').exists(): raise PermissionDenied('A completed shared game with attended players is required.')
   if len(review)>2000: raise ValidationError({'review':['Review cannot exceed 2000 characters.']})
   # Four equally weighted criteria; persist a predictable one-decimal score.
   overall=cls.calculate_overall(playing_performance=playing_performance,teamwork=teamwork,sportsmanship=sportsmanship,punctuality=punctuality)
@@ -31,7 +31,7 @@ class RatingService:
 class PlayerStatisticsService:
  @staticmethod
  def statistics(*,user,sport=None):
-  games=GamePlayer.objects.filter(user=user,status='confirmed',game__status=Game.Status.COMPLETED)
+  games=GamePlayer.objects.filter(user=user,status='confirmed',attendance='attended',game__status=Game.Status.COMPLETED)
   if sport: games=games.filter(game__sport=sport)
   completed=games.count()
   events=EventParticipant.objects.filter(user=user,status=EventParticipant.Status.REGISTERED,event__status='completed')

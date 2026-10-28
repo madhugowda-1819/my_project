@@ -563,12 +563,18 @@ class MatchParticipation(TimestampedPublicModel):
         LEFT = 'left', 'Left'
         REMOVED = 'removed', 'Removed'
 
+    class Attendance(models.TextChoices):
+        PENDING = 'pending', 'Attendance pending'
+        ATTENDED = 'attended', 'Attended'
+        NO_SHOW = 'no_show', 'No-show'
+
     match = models.ForeignKey(Match, on_delete=models.CASCADE, related_name='participation_history')
     user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='match_participation_history')
     status = models.CharField(max_length=10, choices=Status.choices, default=Status.JOINED, db_index=True)
     joined_at = models.DateTimeField(default=timezone.now)
     ended_at = models.DateTimeField(null=True, blank=True)
     reason = models.CharField(max_length=500, blank=True)
+    attendance = models.CharField(max_length=12, choices=Attendance.choices, default=Attendance.PENDING, db_index=True)
 
     class Meta:
         constraints = [models.UniqueConstraint(fields=['match', 'user'], condition=models.Q(status='joined'), name='unique_active_match_participation')]
@@ -725,11 +731,17 @@ class GamePlayer(TimestampedPublicModel):
         LEFT = 'left', 'Left'
         REMOVED = 'removed', 'Removed'
 
+    class Attendance(models.TextChoices):
+        PENDING = 'pending', 'Attendance pending'
+        ATTENDED = 'attended', 'Attended'
+        NO_SHOW = 'no_show', 'No-show'
+
     game = models.ForeignKey(Game, on_delete=models.CASCADE, related_name='game_players')
     user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='game_participations')
     status = models.CharField(max_length=12, choices=Status.choices, default=Status.CONFIRMED, db_index=True)
     joined_at = models.DateTimeField(auto_now_add=True)
     left_at = models.DateTimeField(null=True, blank=True)
+    attendance = models.CharField(max_length=12, choices=Attendance.choices, default=Attendance.PENDING, db_index=True)
 
     class Meta:
         constraints = [

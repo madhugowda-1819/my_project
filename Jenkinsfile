@@ -62,12 +62,20 @@ pipeline {
             }
         }
 
-        stage('Run Django Checks and Tests') {
+        stage('Run Django Checks') {
             steps {
                 sh '''
                     set -eu
                     .ci_venv/bin/python manage.py check
                     .ci_venv/bin/python manage.py makemigrations --check --dry-run
+                '''
+            }
+        }
+
+        stage('Run Django Tests') {
+            steps {
+                sh '''
+                    set -eu
                     .ci_venv/bin/python manage.py test --verbosity=2
                 '''
             }

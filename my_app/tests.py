@@ -1317,6 +1317,12 @@ class PlayerProfileApiTests(APITestCase):
             total_players=2, status='completed',
         )
         match.joined_players.add(self.user)
+        MatchParticipation.objects.create(
+            match=match,
+            user=self.user,
+            status=MatchParticipation.Status.JOINED,
+            attendance=MatchParticipation.Attendance.ATTENDED,
+        )
 
         response = self.client.get('/api/v1/users/me/sports/')
 

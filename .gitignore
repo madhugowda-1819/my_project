@@ -13,5 +13,3 @@ staticfiles/
 .idea/
 .vscode/
 .env.example
-\deployment\windows\cleanup_expired_sports_grounds.ps1
-\deployment\windows\register_ground_cache_cleanup_task.ps1

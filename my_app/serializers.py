@@ -1,14 +1,14 @@
 from rest_framework import serializers
 from decimal import Decimal
 from django.contrib.auth import get_user_model
-from django.db.models import Q
+from django.db.models import Avg, Q
 from django.utils import timezone
 from datetime import timedelta
 from django.core.validators import RegexValidator
 from django.core.files.images import get_image_dimensions
 from .models import (
     Sport, SportFormat, PlayerProfile, AvailabilitySlot,
-    Match, Message, Notification, Ground, Game, GamePlayer, Conversation, ConversationMember,
+    Match, MatchParticipation, Message, Notification, Ground, Game, GamePlayer, Conversation, ConversationMember,
     Community, CommunityMember, CommunityPost, CommunityComment, CommunityPostLike,
     Event, EventParticipant, EventReminder, Tournament, TournamentTeam, TournamentTeamMember, TournamentMatch,
     College, CollegeMembership, CollegeChallenge, CollegeResultDispute,
@@ -372,10 +372,13 @@ class UserSportSerializer(serializers.ModelSerializer):
     matches_played = serializers.SerializerMethodField()
     wins = serializers.SerializerMethodField()
     losses = serializers.SerializerMethodField()
+    win_rate = serializers.SerializerMethodField()
+    average_rating = serializers.SerializerMethodField()
+    strike_rate = serializers.SerializerMethodField()
 
     class Meta:
         model = UserSport
-        fields = ['public_id', 'sport', 'skill_level', 'rating', 'matches_played', 'wins', 'losses', 'preferred']
+        fields = ['public_id', 'sport', 'skill_level', 'rating', 'matches_played', 'wins', 'losses', 'win_rate', 'average_rating', 'strike_rate', 'preferred']
         read_only_fields = ['public_id', 'matches_played', 'wins', 'losses']
 
     def _completed_tournament_matches(self, obj):
@@ -395,11 +398,15 @@ class UserSportSerializer(serializers.ModelSerializer):
             game__sport=obj.sport,
             game__status=Game.Status.COMPLETED,
         ).values('game_id').distinct().count()
-        legacy_matches = Match.objects.filter(
-            status='completed',
-            sport=obj.sport,
-        ).filter(Q(organizer=obj.user) | Q(joined_players=obj.user)).distinct().count()
+        legacy_matches = MatchParticipation.objects.filter(
+            user=obj.user, status=MatchParticipation.Status.JOINED,
+            attendance=MatchParticipation.Attendance.ATTENDED,
+            match__status='completed', match__sport=obj.sport,
+        ).values('match_id').distinct().count()
         return games + legacy_matches + self._completed_tournament_matches(obj).count()
+
+    def _played_count(self, obj):
+        return self.get_matches_played(obj)
 
     def get_wins(self, obj):
         return self._completed_tournament_matches(obj).filter(
@@ -413,6 +420,23 @@ class UserSportSerializer(serializers.ModelSerializer):
             winner__members__user=obj.user,
             winner__members__status=TournamentTeamMember.Status.ACTIVE,
         ).distinct().count()
+
+    def get_win_rate(self, obj):
+        played = self._played_count(obj)
+        wins = self.get_wins(obj)
+        return round((wins / played) * 100, 1) if played else 0
+
+    def get_average_rating(self, obj):
+        value = PlayerRating.objects.filter(
+            player=obj.user, deleted_at__isnull=True,
+            game__sport=obj.sport,
+        ).aggregate(average=Avg('rating'))['average']
+        return round(float(value), 2) if value is not None else 0
+
+    def get_strike_rate(self, obj):
+        # Match/Game currently stores no attempts or scoring events. Do not
+        # fabricate a strike rate; the client displays this as unavailable.
+        return None
 
 
 class UserSportWriteSerializer(serializers.Serializer):

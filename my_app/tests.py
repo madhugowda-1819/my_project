@@ -2414,8 +2414,11 @@ class PlayerRatingApiTests(APITestCase):
         court = Court.objects.create(venue=venue, sport=sport, name='Rating Court', capacity=4, price_per_hour=500)
         start = timezone.now() - timedelta(hours=2)
         self.game = Game.objects.create(game_reference='GM-RATING', host=self.reviewer, sport=sport, venue=venue, court=court, game_date=start.date(), start_time=start.time(), end_time=(start + timedelta(hours=1)).time(), starts_at=start, ends_at=start + timedelta(hours=1), min_players=2, max_players=4, status=Game.Status.COMPLETED)
-        GamePlayer.objects.create(game=self.game, user=self.reviewer)
-        GamePlayer.objects.create(game=self.game, user=self.player)
+        # These fixtures represent players who actually attended the completed
+        # game.  Confirmed membership alone is intentionally not sufficient
+        # for rating eligibility or played-match statistics.
+        GamePlayer.objects.create(game=self.game, user=self.reviewer, attendance=GamePlayer.Attendance.ATTENDED)
+        GamePlayer.objects.create(game=self.game, user=self.player, attendance=GamePlayer.Attendance.ATTENDED)
         self.client.force_authenticate(self.reviewer)
 
     def payload(self, **changes):

@@ -249,7 +249,30 @@ class AccessManagementView(APIView):
     allowed_roles = {'SportMate Venue Owners', 'SportMate Moderators', 'SportMate Admins', 'SportMate Support'}
 
     def get(self, request):
-        users = User.objects.prefetch_related('groups').order_by('username')[:200]
+        queryset = User.objects.prefetch_related('groups').order_by('username')
+        search = request.query_params.get('search', request.query_params.get('q', '')).strip()
+        role = request.query_params.get('role', '').strip()
+        status = request.query_params.get('status', '').strip()
+        if search:
+            queryset = queryset.filter(Q(username__icontains=search) | Q(email__icontains=search) | Q(full_name__icontains=search))
+        if role and role.lower() not in {'all', 'player'}:
+            queryset = queryset.filter(groups__name=role)
+        if status:
+            queryset = queryset.filter(account_status=status)
+        queryset = queryset.distinct()
+        page = request.query_params.get('page')
+        try:
+            requested_page_size = int(request.query_params.get('page_size', 20))
+        except (TypeError, ValueError):
+            requested_page_size = 20
+        page_size = min(max(requested_page_size, 1), 100)
+        if page:
+            from django.core.paginator import Paginator
+            paginator = Paginator(queryset, page_size)
+            page_obj = paginator.get_page(page)
+            users = page_obj.object_list
+        else:
+            users = queryset[:200]
         data = []
         for user in users:
             roles = list(user.groups.values_list('name', flat=True))
@@ -263,6 +286,8 @@ class AccessManagementView(APIView):
                 'account_status': user.account_status,
                 'roles': roles,
             })
+        if page:
+            return Response({'success': True, 'count': paginator.count, 'next': page_obj.next_page_number() if page_obj.has_next() else None, 'previous': page_obj.previous_page_number() if page_obj.has_previous() else None, 'data': data, 'results': data})
         return Response({'success': True, 'data': data})
 
     def patch(self, request, public_id):
@@ -392,6 +417,15 @@ class AdminDashboardView(APIView):
     permission_classes = [IsPlatformAdmin]
 
     def get(self, request):
+        recent_audits = RoleAuditLog.objects.select_related('actor', 'target_user').order_by('-created_at')[:8]
+        recent_activity = [{
+            'type': 'role_change',
+            'title': f"{audit.role} {audit.action}",
+            'detail': f"{audit.target_user.username if audit.target_user_id else 'Removed user'} · by {audit.actor.username if audit.actor_id else 'Admin'}",
+            'timestamp': audit.created_at,
+        } for audit in recent_audits]
+        reports_total = Report.objects.count()
+        colleges_total = College.objects.count()
         return Response({'success': True, 'data': {
             'active_users': User.objects.filter(is_active=True, account_status=User.AccountStatus.ACTIVE).count(),
             'players': PlayerProfile.objects.count(),
@@ -404,9 +438,13 @@ class AdminDashboardView(APIView):
             'reports_under_review': Report.objects.filter(status=Report.Status.UNDER_REVIEW).count(),
             'suspended_users': User.objects.filter(account_status__in=[User.AccountStatus.SUSPENDED, User.AccountStatus.DEACTIVATED]).count(),
             'venues': Venue.objects.count(), 'active_venues': Venue.objects.filter(active=True).count(),
+            'reports': reports_total, 'colleges': colleges_total,
             'pending_venues': Venue.objects.filter(active=False).count(),
             'pending_college_verifications': College.objects.filter(verification_status=College.VerificationStatus.PENDING).count(),
             'open_college_result_disputes': CollegeResultDispute.objects.filter(status=CollegeResultDispute.Status.OPEN).count(),
+            'summary': {'players': PlayerProfile.objects.count(), 'venue_owners': User.objects.filter(groups__name=VENUE_OWNER_GROUP).distinct().count(), 'pending_venue_requests': VenueOwnerApplication.objects.filter(status=VenueOwnerApplication.Status.PENDING).count()},
+            'insights': {'total_venues': Venue.objects.count(), 'total_reports': reports_total, 'total_colleges': colleges_total},
+            'recent_activity': recent_activity,
         }})
 
 

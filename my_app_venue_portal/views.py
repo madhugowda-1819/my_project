@@ -2,7 +2,7 @@
 from datetime import date, timedelta
 
 from django.db import transaction
-from django.db.models import Count
+from django.db.models import Count, Q, Sum
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
 from rest_framework.exceptions import ValidationError
@@ -57,8 +57,23 @@ class VenueOwnerApplicationView(APIView):
 class VenueOwnerDashboardView(APIView):
     permission_classes = [IsApprovedVenueOwner]
     def get(self, request):
-        venues = Venue.objects.filter(owner=request.user); venue_ids = venues.values('pk'); bookings = CourtBooking.objects.filter(venue_id__in=venue_ids)
-        return Response({'success': True, 'data': {'venues': venues.count(), 'active_venues': venues.filter(active=True).count(), 'pending_venues': venues.filter(active=False).count(), 'courts': Court.objects.filter(venue__in=venue_ids).count(), 'active_courts': Court.objects.filter(venue__in=venue_ids, active=True).count(), 'upcoming_bookings': bookings.filter(status__in=[CourtBooking.Status.PENDING, CourtBooking.Status.CONFIRMED], ends_at__gt=timezone.now()).count(), 'bookings_total': bookings.count()}})
+        venues = Venue.objects.filter(owner=request.user)
+        venue_ids = venues.values('pk')
+        bookings = CourtBooking.objects.filter(venue_id__in=venue_ids)
+        now = timezone.now()
+        upcoming = bookings.filter(status__in=[CourtBooking.Status.PENDING, CourtBooking.Status.CONFIRMED], ends_at__gt=now)
+        collected = bookings.filter(status__in=[CourtBooking.Status.CONFIRMED, CourtBooking.Status.COMPLETED]).aggregate(total=Sum('final_amount'))['total'] or 0
+        recent = bookings.select_related('venue', 'court').order_by('-created_at')[:8]
+        activity = [{'type': 'booking', 'title': 'Booking received', 'detail': f'{item.venue.name} · {item.court.name}', 'status': item.status, 'timestamp': item.created_at} for item in recent]
+        return Response({'success': True, 'data': {
+            'venues': venues.count(), 'active_venues': venues.filter(active=True).count(), 'pending_venues': venues.filter(active=False).count(),
+            'courts': Court.objects.filter(venue__in=venue_ids).count(), 'active_courts': Court.objects.filter(venue__in=venue_ids, active=True).count(),
+            'upcoming_bookings': upcoming.count(), 'bookings_total': bookings.count(),
+            'completed_bookings': bookings.filter(status=CourtBooking.Status.COMPLETED).count(), 'cancelled_bookings': bookings.filter(status=CourtBooking.Status.CANCELLED).count(),
+            'collected_revenue': str(collected), 'recent_activity': activity,
+            'summary': {'total_venues': venues.count(), 'active_courts': Court.objects.filter(venue__in=venue_ids, active=True).count(), 'upcoming_bookings': upcoming.count(), 'pending_venues': venues.filter(active=False).count()},
+            'business_insights': {'total_bookings': bookings.count(), 'completed_bookings': bookings.filter(status=CourtBooking.Status.COMPLETED).count(), 'cancelled_bookings': bookings.filter(status=CourtBooking.Status.CANCELLED).count(), 'collected_revenue': str(collected)},
+        }})
 
 
 class VenueOwnerReportsView(APIView):
@@ -172,12 +187,15 @@ class VenueOwnerCourtDetailView(APIView):
 class VenueOwnerBookingsView(APIView):
     permission_classes = [IsApprovedVenueOwner]
     def get(self, request):
-        queryset = CourtBooking.objects.filter(venue__owner=request.user).select_related('venue', 'court', 'court__sport', 'user').order_by('-starts_at'); status = request.query_params.get('status')
+        queryset = CourtBooking.objects.filter(venue__owner=request.user).select_related('venue', 'court', 'court__sport', 'user').order_by('-starts_at', '-pk'); status = request.query_params.get('status')
         if status:
             if status not in CourtBooking.Status.values: raise ValidationError({'status': 'Choose a valid booking status.'})
             queryset = queryset.filter(status=status)
         if request.query_params.get('venue'): queryset = queryset.filter(venue__public_id=request.query_params['venue'])
         if request.query_params.get('court'): queryset = queryset.filter(court__public_id=request.query_params['court'])
+        search = request.query_params.get('search', '').strip()
+        if search:
+            queryset = queryset.filter(Q(booking_reference__icontains=search) | Q(user__username__icontains=search))
         for parameter, lookup in (('from', 'booking_date__gte'), ('to', 'booking_date__lte')):
             value = request.query_params.get(parameter)
             if value:
@@ -185,7 +203,18 @@ class VenueOwnerBookingsView(APIView):
                     queryset = queryset.filter(**{lookup: date.fromisoformat(value)})
                 except ValueError:
                     raise ValidationError({parameter: 'Use an ISO date: YYYY-MM-DD.'})
-        return Response({'success': True, 'data': [{'public_id': str(x.public_id), 'booking_reference': x.booking_reference, 'venue_id': str(x.venue.public_id), 'venue_name': x.venue.name, 'court_name': x.court.name, 'sport': x.court.sport.name, 'customer': x.user.username, 'booking_date': x.booking_date, 'start_time': x.start_time, 'end_time': x.end_time, 'starts_at': x.starts_at, 'ends_at': x.ends_at, 'status': x.status, 'amount': x.final_amount} for x in queryset[:200]]})
+        try:
+            page_size = min(max(int(request.query_params.get('page_size', 20)), 1), 100)
+        except (TypeError, ValueError):
+            page_size = 20
+        page = request.query_params.get('page')
+        def serialize(items):
+            return [{'public_id': str(x.public_id), 'booking_reference': x.booking_reference, 'venue_id': str(x.venue.public_id), 'venue_name': x.venue.name, 'court_name': x.court.name, 'sport': x.court.sport.name, 'customer': x.user.username, 'booking_date': x.booking_date, 'start_time': x.start_time, 'end_time': x.end_time, 'starts_at': x.starts_at, 'ends_at': x.ends_at, 'status': x.status, 'amount': x.final_amount} for x in items]
+        if page:
+            from django.core.paginator import Paginator
+            paginator = Paginator(queryset, page_size); page_obj = paginator.get_page(page); data = serialize(page_obj.object_list)
+            return Response({'success': True, 'count': paginator.count, 'next': page_obj.next_page_number() if page_obj.has_next() else None, 'previous': page_obj.previous_page_number() if page_obj.has_previous() else None, 'data': data, 'results': data})
+        return Response({'success': True, 'data': serialize(queryset[:200])})
 
 
 class VenueOwnerBlockedPeriodsView(APIView):

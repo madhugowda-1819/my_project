@@ -6,6 +6,8 @@ from django.utils import timezone
 from datetime import timedelta
 from django.core.validators import RegexValidator
 from django.core.files.images import get_image_dimensions
+from django.urls import reverse
+from urllib.parse import urlencode
 from .models import (
     Sport, SportFormat, PlayerProfile, AvailabilitySlot,
     Match, MatchParticipation, Message, Notification, Ground, Game, GamePlayer, Conversation, ConversationMember,
@@ -85,6 +87,7 @@ class SportFormatSerializer(serializers.ModelSerializer):
 # ------------------------------------------------------------------
 class GroundSerializer(serializers.ModelSerializer):
     distanceKm = serializers.SerializerMethodField()
+    image_url = serializers.SerializerMethodField()
     sports = SportSerializer(many=True, read_only=True)
 
     class Meta:
@@ -104,6 +107,7 @@ class GroundSerializer(serializers.ModelSerializer):
             'sports',
             'address',
             'maps_place_id',
+            'image_url',
             'source',
             'distanceKm'
         ]
@@ -111,6 +115,13 @@ class GroundSerializer(serializers.ModelSerializer):
     def get_distanceKm(self, obj):
         distance = getattr(obj, 'distance_km', None)
         return round(distance, 2) if distance is not None else None
+
+    def get_image_url(self, obj):
+        if not obj.google_photo_name:
+            return None
+        request = self.context.get('request')
+        path = reverse('ground-provider-photo') + '?' + urlencode({'name': obj.google_photo_name})
+        return request.build_absolute_uri(path) if request else path
 
 
 class GroundDiscoverySerializer(serializers.Serializer):
@@ -479,7 +490,7 @@ class PublicPlayerSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = User
-        fields = ['public_id', 'name', 'username', 'location', 'avatar', 'distance_km', 'availability', 'bio', 'sports', 'rating_summary']
+        fields = ['public_id', 'player_id', 'name', 'username', 'location', 'avatar', 'distance_km', 'availability', 'bio', 'sports', 'rating_summary']
 
     def get_avatar(self, obj):
         if not obj.avatar:
@@ -642,11 +653,11 @@ class CurrentUserSerializer(serializers.ModelSerializer):
     class Meta:
         model = User
         fields = [
-            'public_id', 'name', 'username', 'email', 'phone', 'avatar', 'city',
+            'public_id', 'player_id', 'venue_owner_id', 'name', 'username', 'email', 'phone', 'avatar', 'city',
             'latitude', 'longitude', 'bio', 'date_joined', 'is_active', 'account_status', 'roles', 'is_player',
             'matching_mood', 'preferred_distance', 'preferred_play_times',
         ]
-        read_only_fields = ['public_id', 'username', 'email', 'date_joined', 'is_active', 'account_status']
+        read_only_fields = ['public_id', 'player_id', 'venue_owner_id', 'username', 'email', 'date_joined', 'is_active', 'account_status']
 
     def get_roles(self, obj):
         roles = list(obj.groups.values_list('name', flat=True))
@@ -1606,7 +1617,17 @@ class TournamentSerializer(serializers.ModelSerializer):
     def get_registration_eligible(self,obj):
         return self.get_eligibility_reason(obj) is None
 class TournamentTeamSerializer(serializers.ModelSerializer):
-    class Meta: model=TournamentTeam; fields=['public_id','name','captain','seed','status']
+    player_count = serializers.SerializerMethodField()
+    player_capacity = serializers.SerializerMethodField()
+    available_slots = serializers.SerializerMethodField()
+    captain_name = serializers.SerializerMethodField()
+    class Meta: model=TournamentTeam; fields=['public_id','name','logo_url','description','captain','captain_name','seed','status','player_count','player_capacity','available_slots']
+    def get_player_count(self,obj): return obj.members.filter(status='active').count()
+    def get_player_capacity(self,obj):
+        configured = obj.tournament.sport.formats.filter(is_active=True).order_by('id').first()
+        return configured.default_capacity if configured else 11
+    def get_available_slots(self,obj): return max(0, self.get_player_capacity(obj) - self.get_player_count(obj))
+    def get_captain_name(self,obj): return (obj.captain.full_name or obj.captain.username) if obj.captain else None
 class TournamentMatchSerializer(serializers.ModelSerializer):
     team_a_name=serializers.CharField(source='team_a.name',read_only=True); team_b_name=serializers.CharField(source='team_b.name',read_only=True); winner_name=serializers.CharField(source='winner.name',read_only=True)
     class Meta: model=TournamentMatch; fields=['public_id','round_number','match_number','team_a','team_a_name','team_b','team_b_name','score_a','score_b','winner','winner_name','status']

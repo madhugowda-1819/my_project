@@ -50,6 +50,11 @@ class CommunityService:
     @classmethod
     @transaction.atomic
     def create(cls, *, owner, name, description='', sport=None, city='', latitude=None, longitude=None, visibility='public', is_club=False, membership_open=True, avatar=None, cover_image=None):
+        # Discovery uses coordinates for nearby results. Use the creator's
+        # saved location when the form does not provide one, otherwise a newly
+        # created club is persisted but immediately filtered out.
+        if latitude is None and longitude is None:
+            latitude, longitude = owner.latitude, owner.longitude
         base = slugify(name)[:160] or 'community'
         slug = base
         suffix = 2
@@ -304,7 +309,19 @@ class CommunityDiscoveryService:
             recent_posts=Count('posts', distinct=True),
         )
         if latitude is not None:
-            communities = nearby_queryset(communities, latitude=latitude, longitude=longitude, radius=radius, latitude_field='latitude', longitude_field='longitude')
+            nearby = nearby_queryset(
+                communities,
+                latitude=latitude,
+                longitude=longitude,
+                radius=radius,
+                latitude_field='latitude',
+                longitude_field='longitude',
+            ).values('pk')
+            # A creator must always be able to see their own newly created
+            # club, even when the older record has no stored coordinates.
+            communities = communities.filter(
+                models.Q(pk__in=nearby) | models.Q(owner=user),
+            )
         sports = {item.sport_id: item for item in user.user_sports.all()}
         output = []
         for community in communities[:500]:

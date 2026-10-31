@@ -135,14 +135,16 @@ class EventCancellationService:
 class TournamentService:
  @classmethod
  @transaction.atomic
- def create_team(cls,*,tournament,creator,name):
+ def create_team(cls,*,tournament,creator,name,logo_url='',description='',captain=None):
   if tournament.organizer_id!=creator.id and not creator.is_staff: raise PermissionDenied('Only organizer can create teams.')
   tournament=Tournament.objects.select_for_update().get(pk=tournament.pk)
   if tournament.status not in (Tournament.Status.OPEN,Tournament.Status.FULL) or tournament.registration_deadline<=timezone.now(): raise EventError('Tournament registration is closed.')
   active_count=tournament.teams.filter(status=TournamentTeam.Status.ACTIVE).count()
-  if active_count>=tournament.maximum_teams: raise EventError('Tournament team capacity is full.')
-  team=TournamentTeam.objects.create(tournament=tournament,name=name.strip(),captain=creator,created_by=creator,seed=active_count+1)
-  TournamentTeamMember.objects.create(team=team,user=creator,role=TournamentTeamMember.Role.CAPTAIN); return team
+  team_limit=min(tournament.maximum_teams, 8)
+  if active_count>=team_limit: raise EventError(f'Tournament team capacity is full ({team_limit} teams maximum).')
+  captain = captain or creator
+  team=TournamentTeam.objects.create(tournament=tournament,name=name.strip(),logo_url=logo_url or '',description=description or '',captain=captain,created_by=creator,seed=active_count+1)
+  TournamentTeamMember.objects.create(team=team,user=captain,role=TournamentTeamMember.Role.CAPTAIN); return team
 
  @classmethod
  @transaction.atomic

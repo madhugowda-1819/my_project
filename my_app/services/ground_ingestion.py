@@ -59,6 +59,7 @@ class GroundIngestionService:
             'latitude': latitude,
             'longitude': longitude,
             'source': str(place.get('source') or 'provider')[:30],
+            'google_photo_name': str(place.get('photo_name') or '')[:512],
         }
         # Box cricket facilities are compact cricket grounds.  Persist this
         # useful size distinction without needing a provider-specific field.

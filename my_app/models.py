@@ -28,6 +28,8 @@ class User(AbstractUser):
         DEACTIVATED = 'deactivated', 'Deactivated'
 
     public_id = models.UUIDField(default=uuid.uuid4, unique=True, editable=False, db_index=True)
+    player_id = models.CharField(max_length=32, unique=True, null=True, blank=True, editable=False, db_index=True)
+    venue_owner_id = models.CharField(max_length=32, unique=True, null=True, blank=True, editable=False, db_index=True)
     full_name = models.CharField(max_length=150, blank=True)
     email = models.EmailField(unique=True)
     referral_code = models.CharField(max_length=20, unique=True, null=True, blank=True, db_index=True)
@@ -80,6 +82,19 @@ class User(AbstractUser):
     # 🔥 NEW (online indicator logic)
     def is_user_online(self):
         return (timezone.now() - self.last_seen).seconds < 300
+
+
+class PublicIdCounter(models.Model):
+    class Kind(models.TextChoices):
+        PLAYER = 'player', 'Player'
+        VENUE_OWNER = 'venue_owner', 'Venue owner'
+
+    kind = models.CharField(max_length=20, choices=Kind.choices, unique=True)
+    next_value = models.PositiveIntegerField(default=1)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = 'my_app_public_id_counter'
 
 
 # ---------------------------------------------------------------------------
@@ -426,6 +441,7 @@ class Ground(models.Model):
     sports = models.ManyToManyField(Sport, related_name='grounds', blank=True)
     address = models.CharField(max_length=255, blank=True)
     maps_place_id = models.CharField(max_length=255, blank=True, unique=True, null=True)
+    google_photo_name = models.CharField(max_length=512, blank=True)
     source = models.CharField(max_length=30, default='manual')
 
     def __str__(self):
@@ -998,7 +1014,7 @@ class Tournament(TimestampedPublicModel):
 
 class TournamentTeam(TimestampedPublicModel):
     class Status(models.TextChoices): ACTIVE='active','Active'; ELIMINATED='eliminated','Eliminated'; WITHDRAWN='withdrawn','Withdrawn'; CHAMPION='champion','Champion'
-    tournament=models.ForeignKey(Tournament,on_delete=models.CASCADE,related_name='teams'); college=models.ForeignKey('College',null=True,blank=True,on_delete=models.PROTECT,related_name='tournament_teams'); name=models.CharField(max_length=120); captain=models.ForeignKey(settings.AUTH_USER_MODEL,on_delete=models.PROTECT,related_name='captained_tournament_teams'); created_by=models.ForeignKey(settings.AUTH_USER_MODEL,on_delete=models.PROTECT,related_name='created_tournament_teams'); seed=models.PositiveIntegerField(null=True,blank=True); status=models.CharField(max_length=12,choices=Status.choices,default=Status.ACTIVE)
+    tournament=models.ForeignKey(Tournament,on_delete=models.CASCADE,related_name='teams'); college=models.ForeignKey('College',null=True,blank=True,on_delete=models.PROTECT,related_name='tournament_teams'); name=models.CharField(max_length=120); logo_url=models.URLField(max_length=500,blank=True); description=models.TextField(blank=True); captain=models.ForeignKey(settings.AUTH_USER_MODEL,null=True,blank=True,on_delete=models.PROTECT,related_name='captained_tournament_teams'); created_by=models.ForeignKey(settings.AUTH_USER_MODEL,on_delete=models.PROTECT,related_name='created_tournament_teams'); seed=models.PositiveIntegerField(null=True,blank=True); status=models.CharField(max_length=12,choices=Status.choices,default=Status.ACTIVE)
     class Meta: constraints=[models.UniqueConstraint(fields=['tournament','name'],name='unique_tournament_team_name')]
 
 

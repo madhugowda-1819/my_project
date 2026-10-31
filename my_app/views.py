@@ -168,7 +168,10 @@ class RegisterView(APIView):
     def post(self, request):
         serializer = RegistrationRequestSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
-        user = AuthenticationService.register(data=serializer.validated_data)
+        user = AuthenticationService.register(data=serializer.validated_data, public_id_kind='player')
+        from django.db import transaction
+        from my_app.services.registration_mail import send_player_welcome
+        transaction.on_commit(lambda: send_player_welcome(user))
 
         return Response({
             'success': True,
@@ -1170,7 +1173,7 @@ class GroundListView(APIView):
         # every Ground row before filtering, which degrades sharply as the
         # catalogue grows.
         grounds = nearby_queryset(grounds, latitude=lat, longitude=lng, radius=radius)
-        serialized = GroundSerializer(grounds, many=True).data
+        serialized = GroundSerializer(grounds, many=True, context={'request': request}).data
         # Match the app's standard collection envelope; the Flutter client
         # accepts both this and the legacy bare-list response.
         return Response({'count': len(serialized), 'results': serialized})
@@ -1340,7 +1343,7 @@ class GroundDiscoveryView(APIView):
         return Response({
             'success': True,
             'created_count': created_count,
-            'data': GroundSerializer(grounds, many=True).data,
+            'data': GroundSerializer(grounds, many=True, context={'request': request}).data,
         })
 
 
@@ -2332,7 +2335,11 @@ class TournamentDetailView(generics.RetrieveUpdateDestroyAPIView):
   serializer.instance=tournament
  def destroy(self,request,*args,**kwargs):
   tournament = self.get_object()
-  TournamentService.cancel(tournament=tournament,actor=request.user)
+  if tournament.organizer_id != request.user.id and not request.user.is_staff:
+   raise PermissionDenied('Only the tournament organizer can delete it.')
+  if tournament.status == Tournament.Status.COMPLETED:
+   raise ValidationError('Completed tournaments cannot be deleted.')
+  tournament.delete()
   return Response(status=204)
 
 class TournamentRegistrationView(APIView):
@@ -2358,7 +2365,54 @@ class TournamentTeamsView(generics.ListCreateAPIView):
  def create(self,request,*args,**kwargs):
   t=get_object_or_404(Tournament,public_id=self.kwargs['public_id']);name=(request.data.get('name') or '').strip()
   if not name: raise ValidationError({'name':['Required.']})
-  return Response({'success':True,'data':TournamentTeamSerializer(TournamentService.create_team(tournament=t,creator=request.user,name=name)).data},status=201)
+  if t.organizer_id != request.user.id and not request.user.is_staff: raise PermissionDenied('Only the tournament organizer can manage teams.')
+  team = TournamentService.create_team(tournament=t,creator=request.user,name=name,logo_url=str(request.data.get('logo_url','')).strip(),description=str(request.data.get('description','')).strip())
+  return Response({'success':True,'data':TournamentTeamSerializer(team).data},status=201)
+
+class TournamentTeamDetailView(APIView):
+ permission_classes=[IsActiveAccount]
+ def get_team(self, request, public_id, team_id):
+  return get_object_or_404(TournamentTeam.objects.select_related('tournament','captain'), public_id=team_id, tournament__public_id=public_id)
+ def _authorize(self, team, user):
+  if team.tournament.organizer_id != user.id and not user.is_staff: raise PermissionDenied('Only the tournament organizer can manage teams.')
+ def patch(self, request, public_id, team_id):
+  team=self.get_team(request,public_id,team_id); self._authorize(team,request.user)
+  if team.tournament.status in (Tournament.Status.STARTED,Tournament.Status.COMPLETED): raise ValidationError('Tournament rosters are locked.')
+  for field in ('name','logo_url','description'):
+   if field in request.data: setattr(team,field,str(request.data[field]).strip())
+  team.save(update_fields=['name','logo_url','description','updated_at'])
+  return Response({'success':True,'data':TournamentTeamSerializer(team).data})
+ def delete(self, request, public_id, team_id):
+  team=self.get_team(request,public_id,team_id); self._authorize(team,request.user)
+  if team.tournament.matches.filter(team_a=team).exists() or team.tournament.matches.filter(team_b=team).exists(): raise ValidationError('Teams referenced by fixtures cannot be deleted.')
+  team.delete(); return Response(status=204)
+
+class TournamentTeamCaptainView(APIView):
+ permission_classes=[IsActiveAccount]
+ @transaction.atomic
+ def patch(self, request, public_id, team_id):
+  team=get_object_or_404(TournamentTeam.objects.select_for_update().select_related('tournament'),public_id=team_id,tournament__public_id=public_id)
+  if team.tournament.organizer_id != request.user.id and not request.user.is_staff: raise PermissionDenied('Only the tournament organizer can assign captains.')
+  if team.tournament.status in (Tournament.Status.STARTED,Tournament.Status.COMPLETED): raise ValidationError('Tournament rosters are locked.')
+  player=get_object_or_404(User,is_active=True,player_id=str(request.data.get('player_id','')).strip().upper())
+  member=get_object_or_404(TournamentTeamMember,team=team,user=player,status=TournamentTeamMember.Status.ACTIVE)
+  team.members.filter(status=TournamentTeamMember.Status.ACTIVE).update(role=TournamentTeamMember.Role.PLAYER)
+  member.role=TournamentTeamMember.Role.CAPTAIN; member.save(update_fields=['role','updated_at'])
+  team.captain=player; team.save(update_fields=['captain','updated_at'])
+  return Response({'success':True,'data':TournamentTeamSerializer(team).data})
+
+class TournamentTeamPlayerRemoveView(APIView):
+ permission_classes=[IsActiveAccount]
+ @transaction.atomic
+ def delete(self, request, public_id, team_id, player_id):
+  team=get_object_or_404(TournamentTeam.objects.select_for_update().select_related('tournament'),public_id=team_id,tournament__public_id=public_id)
+  if team.tournament.organizer_id != request.user.id and not request.user.is_staff: raise PermissionDenied('Only the tournament organizer can remove players.')
+  if team.tournament.status in (Tournament.Status.STARTED,Tournament.Status.COMPLETED): raise ValidationError('Tournament rosters are locked.')
+  member=get_object_or_404(TournamentTeamMember,team=team,user__player_id=str(player_id).strip().upper(),status=TournamentTeamMember.Status.ACTIVE)
+  member.status=TournamentTeamMember.Status.REMOVED; member.role=TournamentTeamMember.Role.PLAYER; member.save(update_fields=['status','role','updated_at'])
+  if team.captain_id == member.user_id:
+   team.captain=None; team.save(update_fields=['captain','updated_at'])
+  return Response({'success':True})
 
 class TournamentTeamRosterView(APIView):
  permission_classes=[IsActiveAccount]
@@ -2367,17 +2421,26 @@ class TournamentTeamRosterView(APIView):
  def get(self, request, team_id):
   team=self.get_team(request, team_id)
   members=team.members.filter(status=TournamentTeamMember.Status.ACTIVE).select_related('user').order_by('role','user__username')
-  return Response({'success':True,'data':[{'user_id':m.user_id,'username':m.user.username,'name':m.user.full_name or m.user.username,'role':m.role} for m in members]})
+  return Response({'success':True,'data':[{'user_id':m.user_id,'player_id':m.user.player_id,'username':m.user.username,'name':m.user.full_name or m.user.username,'role':m.role} for m in members]})
  @transaction.atomic
  def post(self, request, team_id):
   team=self.get_team(request, team_id)
+  if team.tournament.status in (Tournament.Status.STARTED,Tournament.Status.COMPLETED):
+   raise ValidationError('Tournament rosters are locked.')
   if team.tournament.organizer_id != request.user.id and team.captain_id != request.user.id and not request.user.is_staff:
    raise PermissionDenied('Only the tournament organizer or team captain can add players.')
-  user=get_object_or_404(User, pk=request.data.get('user_id'), is_active=True)
+  configured=team.tournament.sport.formats.filter(is_active=True).order_by('id').first()
+  capacity=configured.default_capacity if configured else 11
+  if team.members.filter(status=TournamentTeamMember.Status.ACTIVE).count() >= capacity:
+   raise ValidationError({'player_id':f'Team roster is full ({capacity} players maximum).'})
+  player_id = str(request.data.get('player_id', '')).strip().upper()
+  if not player_id:
+   raise ValidationError({'player_id':'A SportMate player ID is required.'})
+  user=get_object_or_404(User, player_id=player_id, is_active=True)
   if TournamentTeamMember.objects.filter(team__tournament=team.tournament,user=user,status=TournamentTeamMember.Status.ACTIVE).exists():
    raise ValidationError({'user_id':'This player is already registered in a tournament team.'})
   member=TournamentTeamMember.objects.create(team=team,user=user)
-  return Response({'success':True,'data':{'user_id':member.user_id,'username':user.username,'name':user.full_name or user.username,'role':member.role}},status=201)
+  return Response({'success':True,'data':{'user_id':member.user_id,'player_id':user.player_id,'username':user.username,'name':user.full_name or user.username,'role':member.role}},status=201)
 class TournamentMatchesView(generics.ListAPIView):
  permission_classes=[IsActiveAccount];serializer_class=TournamentMatchSerializer
  def get_queryset(self): return TournamentMatch.objects.filter(tournament__public_id=self.kwargs['public_id']).order_by('round_number','match_number')

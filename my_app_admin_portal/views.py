@@ -365,6 +365,7 @@ class VenueOwnerApplicationReviewView(APIView):
         email_body = (
             f'Hello {applicant_name},\n\n'
             f'Your SportMate venue-owner application for "{item.business_name}" has been {decision}.\n\n'
+            f'Your Venue Owner ID is {applicant.venue_owner_id}.\n\n'
             f'{default_message}\n\n'
             + (f'Message from the SportMate admin team:\n{review_note}\n\n' if review_note else '')
             + 'Thank you,\nSportMate Admin Team'

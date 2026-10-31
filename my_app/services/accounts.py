@@ -6,8 +6,9 @@ from rest_framework.exceptions import AuthenticationFailed, PermissionDenied, Va
 from rest_framework_simplejwt.exceptions import TokenError
 from rest_framework_simplejwt.tokens import RefreshToken
 
-from my_app.models import PlayerProfile, User, UserSport
+from my_app.models import PlayerProfile, PublicIdCounter, User, UserSport
 from my_app.services.referrals import ReferralService
+from my_app.services.public_ids import assign_user_public_id
 
 
 class AccountUnavailable(PermissionDenied):
@@ -17,7 +18,7 @@ class AccountUnavailable(PermissionDenied):
 
 class AuthenticationService:
     @staticmethod
-    def register(*, data, create_player_profile=True):
+    def register(*, data, create_player_profile=True, public_id_kind=None):
         email = data['email'].strip().lower()
         username = data['username'].strip()
         if User.objects.filter(email__iexact=email).exists():
@@ -47,6 +48,9 @@ class AuthenticationService:
                 if create_player_profile:
                     PlayerProfile.objects.create(user=user)
                     ReferralService.ensure_code(user)
+                    assign_user_public_id(user, kind=public_id_kind or PublicIdCounter.Kind.PLAYER)
+                elif public_id_kind:
+                    assign_user_public_id(user, kind=public_id_kind)
                 sports = data.get('sports', [])
                 if sports:
                     user.sports.set(sports)

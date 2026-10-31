@@ -11,7 +11,7 @@ from rest_framework.response import Response
 from rest_framework.throttling import ScopedRateThrottle
 from rest_framework.views import APIView
 
-from my_app.models import Court, CourtBlockedPeriod, CourtBooking, Game, Venue
+from my_app.models import Court, CourtBlockedPeriod, CourtBooking, Game, Venue, PublicIdCounter
 from .models import VenueOwnerApplication
 from my_app.permissions import IsActiveAccount
 from .permissions import IsApprovedVenueOwner
@@ -28,9 +28,12 @@ class VenueOwnerRegisterView(APIView):
     def post(self, request):
         serializer = VenueOwnerRegistrationSerializer(data=request.data); serializer.is_valid(raise_exception=True); data = serializer.validated_data
         with transaction.atomic():
-            user = AuthenticationService.register(data=data, create_player_profile=False)
+            user = AuthenticationService.register(data=data, create_player_profile=False, public_id_kind=PublicIdCounter.Kind.VENUE_OWNER)
             application = VenueOwnerApplication.objects.create(applicant=user, business_name=data['business_name'].strip(), phone=data['phone'].strip(), city=data['city'].strip(), address=data['address'].strip())
-        return Response({'success': True, 'message': 'Venue-owner account created. Your application is pending admin approval.', 'application': {'public_id': str(application.public_id), 'status': application.status}}, status=201)
+            from django.db import transaction as db_transaction
+            from my_app.services.registration_mail import send_venue_owner_registration
+            db_transaction.on_commit(lambda: send_venue_owner_registration(user))
+        return Response({'success': True, 'message': 'Venue-owner account created. Your application is pending admin approval.', 'venue_owner_id': user.venue_owner_id, 'application': {'public_id': str(application.public_id), 'status': application.status}}, status=201)
 
 
 class VenueOwnerApplicationView(APIView):

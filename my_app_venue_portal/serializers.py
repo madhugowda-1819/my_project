@@ -109,6 +109,6 @@ class VenueOwnerRegistrationSerializer(serializers.Serializer):
     email = serializers.EmailField()
     phone = serializers.CharField(max_length=20, validators=[phone_validator])
     city = serializers.CharField(max_length=100)
-    password = serializers.CharField(write_only=True, trim_whitespace=False, min_length=8)
+    password = serializers.CharField(write_only=True, trim_whitespace=False, min_length=8, max_length=16)
     business_name = serializers.CharField(max_length=200)
     address = serializers.CharField(max_length=255)

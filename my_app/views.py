@@ -18,6 +18,8 @@ from django.contrib.auth.tokens import PasswordResetTokenGenerator
 from django.utils.http import urlsafe_base64_encode, urlsafe_base64_decode
 from django.utils.encoding import force_bytes, force_str
 from django.core.mail import EmailMultiAlternatives, send_mail
+from django.http import HttpResponse
+import hashlib
 from django.conf import settings
 from django.core.cache import cache
 from django.urls import reverse
@@ -170,14 +172,41 @@ class RegisterView(APIView):
         serializer.is_valid(raise_exception=True)
         user = AuthenticationService.register(data=serializer.validated_data, public_id_kind='player')
         from django.db import transaction
-        from my_app.services.registration_mail import send_player_welcome
-        transaction.on_commit(lambda: send_player_welcome(user))
+        from my_app.services.registration_mail import issue_email_verification, send_player_welcome
+        if settings.REQUIRE_EMAIL_VERIFICATION:
+            user.is_active = False
+            user.save(update_fields=['is_active', 'updated_at'])
+            transaction.on_commit(lambda: issue_email_verification(user))
+        else:
+            transaction.on_commit(lambda: send_player_welcome(user))
 
-        return Response({
+        payload = {
             'success': True,
+            'verification_required': settings.REQUIRE_EMAIL_VERIFICATION,
             'user': CurrentUserSerializer(user).data,
-            'tokens': AuthenticationService.tokens_for(user),
-        }, status=201)
+        }
+        if not settings.REQUIRE_EMAIL_VERIFICATION:
+            payload['tokens'] = AuthenticationService.tokens_for(user)
+        return Response(payload, status=201)
+
+
+class EmailVerificationView(APIView):
+    permission_classes = [AllowAny]
+
+    def get(self, request, token):
+        digest = hashlib.sha256(token.encode()).hexdigest()
+        record = EmailVerificationToken.objects.select_related('user').filter(
+            token_hash=digest, used_at__isnull=True, expires_at__gt=timezone.now(),
+        ).first()
+        if record is None:
+            return Response({'success': False, 'detail': 'This verification link is invalid or expired.'}, status=400)
+        record.used_at = timezone.now()
+        record.user.is_active = True
+        record.user.save(update_fields=['is_active', 'updated_at'])
+        record.save(update_fields=['used_at', 'updated_at'])
+        from my_app.services.registration_mail import send_player_welcome
+        send_player_welcome(record.user)
+        return Response({'success': True, 'detail': 'Email verified. You can now sign in.'})
 
 
 
@@ -284,8 +313,11 @@ def forgot_password(request):
 @permission_classes([AllowAny])
 def reset_password(request, uidb64=None, token=None):
     new_password = request.data.get('password')
-    if not new_password or len(new_password) < 8:
-        return Response({"error": "Password must be at least 8 characters."}, status=400)
+    confirmation = request.data.get('confirm_password')
+    if confirmation is not None and new_password != confirmation:
+        return Response({"error": "Password and Confirm Password do not match."}, status=400)
+    if not new_password or len(new_password) < 8 or len(new_password) > 16:
+        return Response({"error": "Password must be 8–16 characters."}, status=400)
 
     try:
         uid = force_str(urlsafe_base64_decode(uidb64))
@@ -320,8 +352,10 @@ def change_password(request):
     if new_password != confirm_password:
         return Response({"error": "Passwords do not match"}, status=400)
 
-    user.set_password(new_password)
-    user.save()
+    try:
+        AuthenticationService.set_password(user=user, password=new_password)
+    except ValidationError as exc:
+        return Response({'error': exc.detail}, status=400)
 
     return Response({"msg": "Password changed successfully"})
 

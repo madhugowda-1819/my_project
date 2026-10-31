@@ -16,6 +16,7 @@ urlpatterns = [
     # ---------------- REPORTS & PLATFORM MODERATION ----------------
     # ---------------- AUTH ----------------
     path('auth/register/', views.RegisterView.as_view()),
+    path('auth/verify-email/<str:token>/', views.EmailVerificationView.as_view(), name='email-verification'),
     path('auth/login/', views.login_view),
     path('auth/logout/', views.LogoutView.as_view()),
     path('auth/token/refresh/', views.AccountTokenRefreshView.as_view()),

@@ -589,7 +589,7 @@ class RegistrationRequestSerializer(serializers.Serializer):
     # Saved at sign-up so discovery results can be catalogued by the player's
     # home city even before location permission is granted.
     city = serializers.CharField(max_length=100, required=False, allow_blank=True)
-    password = serializers.CharField(write_only=True, trim_whitespace=False, min_length=8)
+    password = serializers.CharField(write_only=True, trim_whitespace=False, min_length=8, max_length=16)
     referral_code = serializers.CharField(max_length=20, required=False, allow_blank=True, trim_whitespace=True)
     sport_ids = serializers.PrimaryKeyRelatedField(
         source='sports',

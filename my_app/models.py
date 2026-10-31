@@ -97,6 +97,16 @@ class PublicIdCounter(models.Model):
         db_table = 'my_app_public_id_counter'
 
 
+class EmailVerificationToken(TimestampedPublicModel):
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='email_verification_tokens')
+    token_hash = models.CharField(max_length=64, unique=True, db_index=True)
+    expires_at = models.DateTimeField(db_index=True)
+    used_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        indexes = [models.Index(fields=['user', 'expires_at'])]
+
+
 # ---------------------------------------------------------------------------
 # SPORT
 # ---------------------------------------------------------------------------

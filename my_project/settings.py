@@ -114,7 +114,7 @@ DATABASES = {
 AUTH_USER_MODEL = 'my_app.User'
 
 AUTH_PASSWORD_VALIDATORS = [
-    {'NAME': 'django.contrib.auth.password_validation.UserAttributeSimilarityValidator'},
+    {'NAME': 'my_app.validators.SportMatePasswordValidator'},
     {'NAME': 'django.contrib.auth.password_validation.MinimumLengthValidator'},
     {'NAME': 'django.contrib.auth.password_validation.CommonPasswordValidator'},
     {'NAME': 'django.contrib.auth.password_validation.NumericPasswordValidator'},
@@ -234,6 +234,9 @@ EMAIL_USE_TLS = env_bool('EMAIL_USE_TLS', True)
 EMAIL_HOST_USER = env('EMAIL_HOST_USER', '')
 EMAIL_HOST_PASSWORD = env('EMAIL_HOST_PASSWORD', '')
 DEFAULT_FROM_EMAIL = env('DEFAULT_FROM_EMAIL', 'noreply@sportmate.com')
+REQUIRE_EMAIL_VERIFICATION = env_bool('REQUIRE_EMAIL_VERIFICATION', False)
+EMAIL_VERIFICATION_TTL_HOURS = int(env('EMAIL_VERIFICATION_TTL_HOURS', '24'))
+EMAIL_VERIFICATION_URL = env('EMAIL_VERIFICATION_URL', '')
 
 # Razorpay credentials are server-only; never put either secret in Flutter.
 RAZORPAY_KEY_ID = env('RAZORPAY_KEY_ID', '')

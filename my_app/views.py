@@ -2134,7 +2134,7 @@ class TournamentRecommendationView(RecommendationBaseView):
         return Response({'success': True, 'data': [self._tournament(item) for item in RecommendationService.tournaments(request.user, self._limit(request))]})
 
 # ---------------- EVENTS & TOURNAMENTS ----------------
-def _calendar_date(value, name):
+def _event_tournament_date(value, name):
     if not value:
         return None
     try:
@@ -2143,9 +2143,9 @@ def _calendar_date(value, name):
         raise ValidationError({name: 'Use YYYY-MM-DD.'}) from exc
 
 
-def _calendar_filters(request, *, tournaments=False):
-    date_from = _calendar_date(request.query_params.get('date_from'), 'date_from')
-    date_to = _calendar_date(request.query_params.get('date_to'), 'date_to')
+def _event_tournament_filters(request, *, tournaments=False):
+    date_from = _event_tournament_date(request.query_params.get('date_from'), 'date_from')
+    date_to = _event_tournament_date(request.query_params.get('date_to'), 'date_to')
     if date_from and date_to and date_to < date_from:
         raise ValidationError({'date_to': 'Must be on or after date_from.'})
     sport_id = request.query_params.get('sport_id') or request.query_params.get('sport')
@@ -2208,7 +2208,7 @@ def _calendar_filters(request, *, tournaments=False):
 
 class EventListCreateView(generics.ListCreateAPIView):
  permission_classes=[IsActiveAccount]; serializer_class=EventSerializer
- def get_queryset(self): return _calendar_filters(self.request)
+ def get_queryset(self): return _event_tournament_filters(self.request)
  def create(self,request,*args,**kwargs):
   s=EventCreateSerializer(data=request.data);s.is_valid(raise_exception=True);d=s.validated_data
   d['venue']=get_object_or_404(Venue,public_id=d.pop('venue_id')); d['court']=get_object_or_404(Court,public_id=d.pop('court_id')) if d.get('court_id') else None; d.pop('court_id',None)
@@ -2293,6 +2293,7 @@ class EventReminderView(APIView):
   return Response({'success':True,'cancelled':bool(reminder)})
 
 
+
 class EventParticipantRemoveView(APIView):
  permission_classes=[IsActiveAccount]
  def post(self,request,public_id,user_id):
@@ -2301,7 +2302,7 @@ class EventParticipantRemoveView(APIView):
   return Response({'success':True,'data':EventParticipantSerializer(EventRegistrationService.leave(event=e,user=get_object_or_404(User,pk=user_id),removed=True)).data})
 class TournamentListCreateView(generics.ListCreateAPIView):
  permission_classes=[IsActiveAccount];serializer_class=TournamentSerializer
- def get_queryset(self): return _calendar_filters(self.request,tournaments=True)
+ def get_queryset(self): return _event_tournament_filters(self.request,tournaments=True)
  def create(self,request,*args,**kwargs):
   s=TournamentCreateSerializer(data=request.data);s.is_valid(raise_exception=True);d=s.validated_data
   if d.get('nearby_ground_id'):

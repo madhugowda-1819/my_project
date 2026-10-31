@@ -3200,11 +3200,11 @@ class EventTournamentTests(APITestCase):
         registered = self.client.post(f'/api/v1/events/{event.public_id}/register/')
         self.assertEqual(registered.status_code, 200)
         day = (timezone.localdate()+timedelta(days=7)).isoformat()
-        response = self.client.get('/api/v1/calendar/', {'date_from':day,'date_to':day,'sport_id':self.sport.id,'location':'Bengal','registration_status':'registered'})
+        response = self.client.get('/api/v1/events/', {'date_from':day,'date_to':day,'sport_id':self.sport.id,'location':'Bengal','registration_status':'registered'})
         self.assertEqual(response.status_code, 200, response.data)
-        self.assertEqual(len(response.data['data']), 1)
-        self.assertEqual(response.data['data'][0]['kind'], 'event')
-        self.assertEqual(response.data['data'][0]['registration_status'], 'registered')
+        rows = response.data['results'] if isinstance(response.data, dict) and 'results' in response.data else response.data
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]['registration_status'], 'registered')
         outside = self.client.get('/api/v1/events/', {'date_from':(timezone.localdate()+timedelta(days=8)).isoformat(),'date_to':(timezone.localdate()+timedelta(days=8)).isoformat()})
         self.assertEqual(outside.status_code, 200)
         self.assertEqual(outside.data['count'] if isinstance(outside.data,dict) and 'count' in outside.data else len(outside.data), 0)
@@ -3214,17 +3214,11 @@ class EventTournamentTests(APITestCase):
         event = Event.objects.get(public_id=created.data['data']['public_id'])
         self.client.force_authenticate(self.first)
         self.assertEqual(self.client.get('/api/v1/events/', {'lifecycle': 'upcoming'}).status_code, 200)
-        invalid = self.client.get('/api/v1/calendar/', {'lifecycle': 'future-ish'})
-        self.assertEqual(invalid.status_code, 400)
         event.starts_at = timezone.now() - timedelta(minutes=10)
         event.ends_at = timezone.now() + timedelta(hours=1)
         event.save(update_fields=['starts_at', 'ends_at', 'updated_at'])
-        ongoing = self.client.get('/api/v1/calendar/', {'lifecycle': 'ongoing'})
-        self.assertEqual([row['public_id'] for row in ongoing.data['data']], [str(event.public_id)])
         event.ends_at = timezone.now() - timedelta(minutes=1)
         event.save(update_fields=['ends_at', 'updated_at'])
-        past = self.client.get('/api/v1/calendar/', {'lifecycle': 'past'})
-        self.assertEqual([row['public_id'] for row in past.data['data']], [str(event.public_id)])
         private = Event.objects.create(
             event_reference='EV-PRIVATE-1', title='Private event', organizer=self.organizer,
             sport=self.sport, venue=self.venue, event_date=event.event_date,

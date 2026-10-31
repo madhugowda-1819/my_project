@@ -142,9 +142,10 @@ class TournamentService:
   active_count=tournament.teams.filter(status=TournamentTeam.Status.ACTIVE).count()
   team_limit=min(tournament.maximum_teams, 8)
   if active_count>=team_limit: raise EventError(f'Tournament team capacity is full ({team_limit} teams maximum).')
-  captain = captain or creator
   team=TournamentTeam.objects.create(tournament=tournament,name=name.strip(),logo_url=logo_url or '',description=description or '',captain=captain,created_by=creator,seed=active_count+1)
-  TournamentTeamMember.objects.create(team=team,user=captain,role=TournamentTeamMember.Role.CAPTAIN); return team
+  if captain is not None:
+   TournamentTeamMember.objects.create(team=team,user=captain,role=TournamentTeamMember.Role.CAPTAIN)
+  return team
 
  @classmethod
  @transaction.atomic
@@ -180,8 +181,8 @@ class TournamentRegistrationService:
   name=team_name.strip()
   if not name: name=f'{user.full_name or user.username} Team'[:120]
   active_count=tournament.teams.filter(status=TournamentTeam.Status.ACTIVE).count()
-  team=TournamentTeam.objects.create(tournament=tournament,name=name,captain=user,created_by=user,seed=active_count+1)
-  TournamentTeamMember.objects.create(team=team,user=user,role=TournamentTeamMember.Role.CAPTAIN)
+  team=TournamentTeam.objects.create(tournament=tournament,name=name,captain=None,created_by=user,seed=active_count+1)
+  TournamentTeamMember.objects.create(team=team,user=user,role=TournamentTeamMember.Role.PLAYER)
   if tournament.teams.filter(status=TournamentTeam.Status.ACTIVE).count()>=tournament.maximum_teams:
    tournament.status=Tournament.Status.FULL;tournament.save(update_fields=['status','updated_at'])
   return team,True
@@ -308,11 +309,11 @@ class TournamentMatchService:
 class TournamentStandingsService:
  @staticmethod
  def standings(tournament):
-  rows={t.id:{'team':t,'played':0,'wins':0,'losses':0,'draws':0,'points':0,'scored':0,'conceded':0} for t in tournament.teams.all()}
+  rows={t.id:{'team':t,'played':0,'wins':0,'losses':0,'draws':0,'points':0} for t in tournament.teams.all()}
   for m in tournament.matches.filter(status=TournamentMatch.Status.COMPLETED):
    if not m.team_a_id or not m.team_b_id: continue
-   a,b=rows[m.team_a_id],rows[m.team_b_id]; a['played']+=1;b['played']+=1;a['scored']+=m.score_a;b['scored']+=m.score_b;a['conceded']+=m.score_b;b['conceded']+=m.score_a
+   a,b=rows[m.team_a_id],rows[m.team_b_id]; a['played']+=1;b['played']+=1
    if m.score_a>m.score_b:a['wins']+=1;a['points']+=3;b['losses']+=1
    elif m.score_b>m.score_a:b['wins']+=1;b['points']+=3;a['losses']+=1
    else:a['draws']+=1;b['draws']+=1;a['points']+=1;b['points']+=1
-  return sorted([{**r,'difference':r['scored']-r['conceded']} for r in rows.values()],key=lambda r:(-r['points'],-r['difference'],-r['scored']))
+  return sorted(rows.values(), key=lambda r: (-r['points'], -r['wins'], -r['draws'], r['team'].name.lower()))

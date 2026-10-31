@@ -2454,7 +2454,7 @@ class TournamentResultView(APIView):
 class TournamentStandingsView(APIView):
  permission_classes=[IsActiveAccount]
  def get(self,request,public_id):
-  return Response({'success':True,'data':[{'team':r['team'].name,'played':r['played'],'wins':r['wins'],'losses':r['losses'],'draws':r['draws'],'points':r['points'],'difference':r['difference']} for r in TournamentStandingsService.standings(get_object_or_404(Tournament,public_id=public_id))]})
+  return Response({'success':True,'data':[{'rank':index,'team':r['team'].name,'played':r['played'],'wins':r['wins'],'losses':r['losses'],'draws':r['draws'],'points':r['points']} for index,r in enumerate(TournamentStandingsService.standings(get_object_or_404(Tournament,public_id=public_id)), start=1)]})
 
 
 class CollegeListCreateView(APIView):

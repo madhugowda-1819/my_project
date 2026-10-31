@@ -2293,18 +2293,6 @@ class EventReminderView(APIView):
   return Response({'success':True,'cancelled':bool(reminder)})
 
 
-class SportsCalendarView(APIView):
- permission_classes=[IsActiveAccount]
- def get(self,request):
-  events=EventSerializer(_calendar_filters(request),many=True,context={'request':request}).data
-  tournaments=TournamentSerializer(_calendar_filters(request,tournaments=True),many=True,context={'request':request}).data
-  entries=[]
-  for item in events:
-   entries.append({'kind':'event',**item})
-  for item in tournaments:
-   entries.append({'kind':'tournament',**item})
-  entries.sort(key=lambda item: item.get('starts_at') or item.get('start_date') or '')
-  return Response({'success':True,'data':entries})
 class EventParticipantRemoveView(APIView):
  permission_classes=[IsActiveAccount]
  def post(self,request,public_id,user_id):

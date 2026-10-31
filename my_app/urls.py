@@ -133,7 +133,6 @@ urlpatterns = [
     path('recommendations/events/', views.EventRecommendationView.as_view()),
     path('recommendations/tournaments/', views.TournamentRecommendationView.as_view()),
     path('events/', views.EventListCreateView.as_view()),
-    path('calendar/', views.SportsCalendarView.as_view()),
     path('events/<uuid:public_id>/', views.EventDetailView.as_view()),
     path('tournaments/<uuid:public_id>/register/', views.TournamentRegistrationView.as_view()),
     path('events/<uuid:public_id>/register/', views.EventRegistrationView.as_view()),

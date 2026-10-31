@@ -1095,6 +1095,33 @@ class SportsGroundPhotoView(APIView):
         )
 
 
+class ProviderGroundPhotoView(APIView):
+    """Proxy a Google Places photo so the API key never reaches the mobile app."""
+    permission_classes = [AllowAny]
+    authentication_classes = []
+
+    def get(self, request):
+        photo_name = request.query_params.get('name', '').strip()
+        if not photo_name.startswith('places/') or len(photo_name) > 512:
+            return HttpResponseBadRequest('Invalid photo name.')
+        api_key = settings.GOOGLE_MAPS_PLACES_API_KEY
+        if not api_key:
+            return HttpResponse(status=404)
+        try:
+            response = requests.get(
+                f'https://places.googleapis.com/v1/{photo_name}/media',
+                params={'maxWidthPx': 600, 'key': api_key},
+                timeout=(3, 12),
+                allow_redirects=True,
+            )
+            response.raise_for_status()
+        except requests.RequestException:
+            return HttpResponse(status=404)
+        content_type = response.headers.get('Content-Type', 'image/jpeg')
+        return HttpResponse(response.content, content_type=content_type,
+                            headers={'Cache-Control': 'public, max-age=86400'})
+
+
 # ---------------- GROUNDS ----------------
 class GroundListView(APIView):
     permission_classes = [AllowAny]
@@ -1198,6 +1225,11 @@ class LiveGroundListView(APIView):
                     'source': 'live_cache', 'verification_status': 'external_unverified',
                     'booking_supported': False, 'distance_km': round(float(getattr(item, 'distance_km', 0)), 2),
                 } for item in cached]
+                for result, item in zip(results, cached):
+                    if item.google_photo_name:
+                        result['image_url'] = request.build_absolute_uri(
+                            reverse('ground-provider-photo') + '?' + urlencode({'name': item.google_photo_name})
+                        )
                 return Response({'count': len(results), 'results': results,
                                  'booking_supported': False, 'verification_status': 'external_unverified',
                                  'cache': 'fresh'})
@@ -1235,9 +1267,14 @@ class LiveGroundListView(APIView):
                 'source': place.get('source'), 'maps_url': place.get('mapsUrl'),
                 'website_url': place.get('websiteUrl'),
                 'phone': place.get('phone'),
+                'photo_name': place.get('photo_name'),
                 'verification_status': 'external_unverified',
                 'booking_supported': False,
             }
+            if place.get('photo_name'):
+                normalized['image_url'] = request.build_absolute_uri(
+                    reverse('ground-provider-photo') + '?' + urlencode({'name': place['photo_name']})
+                )
             if distance is not None:
                 normalized['distance_km'] = round(distance, 2)
             results.append(normalized)
@@ -1255,6 +1292,7 @@ class LiveGroundListView(APIView):
                         'name': item['name'], 'ground_type': item.get('category') or 'sports_ground',
                         'sport': (sport or 'multi-sport'), 'latitude': item['latitude'],
                         'longitude': item['longitude'], 'expires_at': expires_at,
+                        'google_photo_name': item.get('photo_name') or '',
                     },
                 )
         return Response({

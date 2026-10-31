@@ -91,6 +91,7 @@ urlpatterns = [
     # ---------------- GROUNDS ----------------
     path('grounds/nearby/', views.UniversalGroundsView.as_view()),
     path('grounds/<int:ground_id>/photo/', views.SportsGroundPhotoView.as_view(), name='ground-photo'),
+    path('grounds/photo/', views.ProviderGroundPhotoView.as_view(), name='ground-provider-photo'),
     path('grounds/discover/', views.GroundDiscoveryView.as_view()),
     path('grounds/', views.GroundListView.as_view()),
     path('grounds/live/', views.LiveGroundListView.as_view()),

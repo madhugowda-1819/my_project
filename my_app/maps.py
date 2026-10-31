@@ -57,7 +57,7 @@ def find_live_sports_grounds(*, latitude=None, longitude=None, sport=None,
                 'X-Goog-FieldMask': (
                     'places.id,places.displayName,places.formattedAddress,'
                     'places.location,places.types,places.googleMapsUri,places.websiteUri,'
-                    'places.nationalPhoneNumber,places.internationalPhoneNumber'
+                    'places.nationalPhoneNumber,places.internationalPhoneNumber,places.photos'
                 ),
             }, method='POST',
         )
@@ -111,6 +111,7 @@ def find_live_sports_grounds(*, latitude=None, longitude=None, sport=None,
                 'types': place.get('types') or [], 'mapsUrl': place.get('googleMapsUri'),
                 'websiteUrl': place.get('websiteUri'),
                 'phone': place.get('internationalPhoneNumber') or place.get('nationalPhoneNumber'),
+                'photo_name': ((place.get('photos') or [{}])[0].get('name') if place.get('photos') else None),
                 'source': 'google_maps_live',
             })
         # Google can legally return an empty/filtered response even when the

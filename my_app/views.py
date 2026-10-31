@@ -2335,11 +2335,7 @@ class TournamentDetailView(generics.RetrieveUpdateDestroyAPIView):
   serializer.instance=tournament
  def destroy(self,request,*args,**kwargs):
   tournament = self.get_object()
-  if tournament.organizer_id != request.user.id and not request.user.is_staff:
-   raise PermissionDenied('Only the tournament organizer can delete it.')
-  if tournament.status == Tournament.Status.COMPLETED:
-   raise ValidationError('Completed tournaments cannot be deleted.')
-  tournament.delete()
+  TournamentService.cancel(tournament=tournament,actor=request.user)
   return Response(status=204)
 
 class TournamentRegistrationView(APIView):

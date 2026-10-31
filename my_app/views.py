@@ -2444,7 +2444,7 @@ class TournamentTeamCandidatesView(APIView):
   if team.tournament.organizer_id != request.user.id and team.captain_id != request.user.id and not request.user.is_staff:
    raise PermissionDenied('Only the tournament organizer or team captain can view player candidates.')
   rostered=TournamentTeamMember.objects.filter(team__tournament=team.tournament,status=TournamentTeamMember.Status.ACTIVE).values('user_id')
-  users=User.objects.filter(is_active=True,player_id__isnull=False).exclude(pk=request.user.pk).exclude(pk__in=rostered).order_by('full_name','username')
+  users=User.objects.filter(is_active=True,player_id__isnull=False).exclude(pk__in=rostered).order_by('full_name','username')
   return Response({'success':True,'data':[{'user_id':u.id,'player_id':u.player_id,'username':u.username,'name':u.full_name or u.username} for u in users]})
 class TournamentMatchesView(generics.ListAPIView):
  permission_classes=[IsActiveAccount];serializer_class=TournamentMatchSerializer

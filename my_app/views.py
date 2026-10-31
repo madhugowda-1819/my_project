@@ -742,6 +742,10 @@ class VenueListView(generics.ListAPIView):
     permission_classes = [AllowAny]
 
     def get_queryset(self):
+        if self.request.query_params.get('for_event') == 'true':
+            return Venue.objects.filter(active=True, is_demo=False).order_by('name').prefetch_related(
+                'venue_sports__sport', 'courts__sport', 'images', 'amenities',
+            )
         return VenueDiscoveryService.filter_and_rank(
             queryset=Venue.objects.all(), data={}, amenities=[],
         )
@@ -2355,6 +2359,25 @@ class TournamentTeamsView(generics.ListCreateAPIView):
   t=get_object_or_404(Tournament,public_id=self.kwargs['public_id']);name=(request.data.get('name') or '').strip()
   if not name: raise ValidationError({'name':['Required.']})
   return Response({'success':True,'data':TournamentTeamSerializer(TournamentService.create_team(tournament=t,creator=request.user,name=name)).data},status=201)
+
+class TournamentTeamRosterView(APIView):
+ permission_classes=[IsActiveAccount]
+ def get_team(self, request, team_id):
+  return get_object_or_404(TournamentTeam.objects.select_related('tournament','captain'), public_id=team_id)
+ def get(self, request, team_id):
+  team=self.get_team(request, team_id)
+  members=team.members.filter(status=TournamentTeamMember.Status.ACTIVE).select_related('user').order_by('role','user__username')
+  return Response({'success':True,'data':[{'user_id':m.user_id,'username':m.user.username,'name':m.user.full_name or m.user.username,'role':m.role} for m in members]})
+ @transaction.atomic
+ def post(self, request, team_id):
+  team=self.get_team(request, team_id)
+  if team.tournament.organizer_id != request.user.id and team.captain_id != request.user.id and not request.user.is_staff:
+   raise PermissionDenied('Only the tournament organizer or team captain can add players.')
+  user=get_object_or_404(User, pk=request.data.get('user_id'), is_active=True)
+  if TournamentTeamMember.objects.filter(team__tournament=team.tournament,user=user,status=TournamentTeamMember.Status.ACTIVE).exists():
+   raise ValidationError({'user_id':'This player is already registered in a tournament team.'})
+  member=TournamentTeamMember.objects.create(team=team,user=user)
+  return Response({'success':True,'data':{'user_id':member.user_id,'username':user.username,'name':user.full_name or user.username,'role':member.role}},status=201)
 class TournamentMatchesView(generics.ListAPIView):
  permission_classes=[IsActiveAccount];serializer_class=TournamentMatchSerializer
  def get_queryset(self): return TournamentMatch.objects.filter(tournament__public_id=self.kwargs['public_id']).order_by('round_number','match_number')

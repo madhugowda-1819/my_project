@@ -146,6 +146,7 @@ urlpatterns = [
     path('tournaments/<uuid:public_id>/', views.TournamentDetailView.as_view()),
     path('tournaments/<uuid:public_id>/cancel/', views.TournamentCancelView.as_view()),
     path('tournaments/<uuid:public_id>/teams/', views.TournamentTeamsView.as_view()),
+    path('tournament-teams/<uuid:team_id>/roster/', views.TournamentTeamRosterView.as_view()),
     path('tournaments/<uuid:public_id>/matches/', views.TournamentMatchesView.as_view()),
     path('tournaments/<uuid:public_id>/generate-bracket/', views.TournamentBracketView.as_view()),
     path('tournaments/<uuid:public_id>/matches/<uuid:match_id>/result/', views.TournamentResultView.as_view()),

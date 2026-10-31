@@ -144,6 +144,20 @@ class VenueOwnerVenueDetailView(APIView):
         serializer.is_valid(raise_exception=True); venue = serializer.save()
         return Response({'success': True, 'data': VenueSerializer(venue, context={'request': request}).data})
 
+    @transaction.atomic
+    def delete(self, request, public_id):
+        venue = get_object_or_404(Venue.objects.select_for_update(), public_id=public_id, owner=request.user)
+        if venue.active:
+            raise ValidationError({'detail': 'Approved venues cannot be deleted. Deactivate the venue first or contact an administrator.'})
+        if CourtBooking.objects.filter(
+            court__venue=venue,
+            status__in=[CourtBooking.Status.PENDING, CourtBooking.Status.CONFIRMED],
+            ends_at__gt=timezone.now(),
+        ).exists():
+            raise ValidationError({'detail': 'This venue has upcoming bookings and cannot be deleted.'})
+        venue.delete()
+        return Response({'success': True, 'detail': 'Pending venue deleted.'})
+
 
 class VenueOwnerCourtsView(APIView):
     permission_classes = [IsApprovedVenueOwner]

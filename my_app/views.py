@@ -2437,6 +2437,15 @@ class TournamentTeamRosterView(APIView):
    raise ValidationError({'user_id':'This player is already registered in a tournament team.'})
   member=TournamentTeamMember.objects.create(team=team,user=user)
   return Response({'success':True,'data':{'user_id':member.user_id,'player_id':user.player_id,'username':user.username,'name':user.full_name or user.username,'role':member.role}},status=201)
+class TournamentTeamCandidatesView(APIView):
+ permission_classes=[IsActiveAccount]
+ def get(self,request,team_id):
+  team=get_object_or_404(TournamentTeam.objects.select_related('tournament'),public_id=team_id)
+  if team.tournament.organizer_id != request.user.id and team.captain_id != request.user.id and not request.user.is_staff:
+   raise PermissionDenied('Only the tournament organizer or team captain can view player candidates.')
+  rostered=TournamentTeamMember.objects.filter(team__tournament=team.tournament,status=TournamentTeamMember.Status.ACTIVE).values('user_id')
+  users=User.objects.filter(is_active=True,player_id__isnull=False).exclude(pk=request.user.pk).exclude(pk__in=rostered).order_by('full_name','username')
+  return Response({'success':True,'data':[{'user_id':u.id,'player_id':u.player_id,'username':u.username,'name':u.full_name or u.username} for u in users]})
 class TournamentMatchesView(generics.ListAPIView):
  permission_classes=[IsActiveAccount];serializer_class=TournamentMatchSerializer
  def get_queryset(self): return TournamentMatch.objects.filter(tournament__public_id=self.kwargs['public_id']).order_by('round_number','match_number')

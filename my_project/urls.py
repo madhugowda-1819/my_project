@@ -4,9 +4,11 @@ from django.conf import settings
 from django.conf.urls.static import static
 from my_app.views import global_project_homepage
 from my_app.views import password_reset_page
+from my_app_admin_portal.urls import web_urlpatterns
 
 urlpatterns = [
     path('', global_project_homepage),
+    path('', include((web_urlpatterns, 'admin_portal'), namespace='admin_portal')),
     path('reset-password', password_reset_page),
     path('reset-password/', password_reset_page),
     path('admin/', admin.site.urls),

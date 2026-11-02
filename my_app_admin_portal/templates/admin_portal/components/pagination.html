@@ -1,0 +1,1 @@
+{% if rows.has_other_pages %}<div class="pagination">{% if rows.has_previous %}<a href="?page={{ rows.previous_page_number }}">Previous</a>{% endif %}<span>Page {{ rows.number }} of {{ rows.paginator.num_pages }}</span>{% if rows.has_next %}<a href="?page={{ rows.next_page_number }}">Next</a>{% endif %}</div>{% endif %}

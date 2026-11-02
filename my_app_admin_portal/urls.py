@@ -6,6 +6,21 @@ the project URL configuration, so existing clients keep their public URLs.
 from django.urls import path
 
 from . import views
+from . import web_views
+
+web_urlpatterns = [
+    path('admin-portal/login/', web_views.login_view, name='login'),
+    path('admin-portal/logout/', web_views.logout_view, name='logout'),
+    path('admin-portal/dashboard/', web_views.dashboard, name='dashboard'),
+    path('admin-portal/users/', web_views.users, name='users'),
+    path('admin-portal/venue-owners/', web_views.venue_owners, name='venue_owners'),
+    path('admin-portal/venues/', web_views.venues, name='venues'),
+    path('admin-portal/venues/<uuid:public_id>/toggle/', web_views.venue_toggle, name='venue_toggle'),
+    path('admin-portal/reports/', web_views.reports, name='reports'),
+    path('admin-portal/colleges/', web_views.colleges, name='colleges'),
+    path('admin-portal/disputes/', web_views.disputes, name='disputes'),
+    path('admin-portal/audit/', web_views.audit, name='audit'),
+]
 
 
 urlpatterns = [

@@ -22,6 +22,7 @@ web_urlpatterns = [
     path('admin-portal/disputes/', web_views.disputes, name='disputes'),
     path('admin-portal/disputes/<uuid:public_id>/action/', web_views.dispute_action, name='dispute_action'),
     path('admin-portal/audit/', web_views.audit, name='audit'),
+    path('admin-portal/audit/pdf/', web_views.audit_pdf, name='audit_pdf'),
 ]
 
 

@@ -74,8 +74,6 @@ class ReferralService:
         total = referrals.count()
         successful = referrals.filter(
             status=ReferralAttribution.Status.SUCCESSFUL,
-            referred_user__is_active=True,
-            referred_user__account_status=User.AccountStatus.ACTIVE,
             referred_user__profile__isnull=False,
         ).count()
         return {'referral_code': code, 'total_referrals': total, 'successful_registrations': successful}

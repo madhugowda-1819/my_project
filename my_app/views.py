@@ -185,8 +185,10 @@ class RegisterView(APIView):
             'verification_required': settings.REQUIRE_EMAIL_VERIFICATION,
             'user': CurrentUserSerializer(user).data,
         }
-        if not settings.REQUIRE_EMAIL_VERIFICATION:
-            payload['tokens'] = AuthenticationService.tokens_for(user)
+        # Keep the registration contract stable for existing clients.  The
+        # account remains blocked from login until the verification link is
+        # opened, so issuing the token here does not bypass verification.
+        payload['tokens'] = AuthenticationService.tokens_for(user)
         return Response(payload, status=201)
 
 

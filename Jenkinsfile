@@ -176,7 +176,7 @@ pipeline {
                         sh '''
                             set -eu
                             ssh -i "$SSH_KEY_FILE" -o StrictHostKeyChecking=no "$REMOTE_USER@$REMOTE_HOST" \
-                                "sudo systemctl restart '$SERVICE_NAME' && sudo systemctl is-active --quiet '$SERVICE_NAME' && sudo systemctl restart '$NGINX_SERVICE_NAME' && sudo systemctl is-active --quiet '$NGINX_SERVICE_NAME'"
+                                "sudo systemctl restart '$SERVICE_NAME' && sudo systemctl is-active --quiet '$SERVICE_NAME' && sudo systemctl reload '$NGINX_SERVICE_NAME' && sudo systemctl is-active --quiet '$NGINX_SERVICE_NAME'"
                         '''
                     }
                 }

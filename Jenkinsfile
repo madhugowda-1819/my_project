@@ -128,11 +128,19 @@ pipeline {
                                 # Do not modify Debian's system-managed pip.
                                 python3 -m venv .venv
                                 .venv/bin/python -m pip install -r requirements.txt
-                                .venv/bin/python -m pip install gunicorn mysqlclient django python-dotenv
+                                .venv/bin/python -m pip install gunicorn mysqlclient django python-dotenv whitenoise
 
-                                # Run database migrations and static collection
+                                # Run database migrations and static collection.
+                                # Fail deployment if the Admin Portal assets were
+                                # not collected; otherwise Gunicorn/Nginx can
+                                # serve raw HTML with no visual design.
                                 .venv/bin/python manage.py migrate --noinput
-                                .venv/bin/python manage.py collectstatic --noinput
+                                .venv/bin/python manage.py collectstatic --noinput --clear
+                                test -f staticfiles/admin_portal/admin.css
+                                test -f staticfiles/admin_portal/responsive.css
+                                test -f staticfiles/admin_portal/admin.js
+                                test -f staticfiles/my_app/sportmateapplogo.png
+                                echo 'Verified SportMate Admin Portal static assets.'
 
                                 # Install and enable the hourly live-ground cache cleanup.
                                 # The installer uses the deployed virtualenv and the SSH user

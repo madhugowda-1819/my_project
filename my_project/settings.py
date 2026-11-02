@@ -4,6 +4,7 @@ Django settings for SportMate backend (my_project).
 from pathlib import Path
 from datetime import timedelta
 import os
+import importlib.util
 from django.core.exceptions import ImproperlyConfigured
 
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -76,6 +77,8 @@ MIDDLEWARE = [
     'django.contrib.messages.middleware.MessageMiddleware',
     'django.middleware.clickjacking.XFrameOptionsMiddleware',
 ]
+if importlib.util.find_spec('whitenoise'):
+    MIDDLEWARE.insert(2, 'whitenoise.middleware.WhiteNoiseMiddleware')
 
 ROOT_URLCONF = 'my_project.urls'
 
@@ -127,6 +130,8 @@ USE_TZ = True
 
 STATIC_URL = '/static/'
 STATIC_ROOT = BASE_DIR / 'staticfiles'
+if importlib.util.find_spec('whitenoise'):
+    STATICFILES_STORAGE = 'whitenoise.storage.CompressedManifestStaticFilesStorage'
 # Keep media links rooted at the site, rather than relative to an /api/
 # endpoint that serialized the avatar field.
 MEDIA_URL = '/media/'

@@ -41,7 +41,7 @@ from .models import (
     Event, EventParticipant, EventReminder, Tournament, TournamentTeam, TournamentTeamMember, TournamentMatch, NotificationPreference, UserDevice, PlayerRating, Achievement, UserAchievement,
     College, CollegeMembership, CollegeChallenge, CollegeResultDispute, MatchTimePoll, MatchReflection, MatchParticipation,
     HealthActivityRecord,
-    SportChallenge, ChallengeEntry,
+    SportChallenge, ChallengeEntry, EmailVerificationToken,
 )
 from .serializers import (
     RegistrationRequestSerializer, LoginRequestSerializer, CurrentUserSerializer,

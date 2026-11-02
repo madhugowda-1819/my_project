@@ -2,7 +2,7 @@ from django.contrib.auth import get_user_model
 from django.contrib.auth.models import Group
 from django.db.models import Q, Count, F, Avg, Prefetch, Case, When, IntegerField
 from django.db import connection, transaction, IntegrityError
-from django.shortcuts import get_object_or_404
+from django.shortcuts import get_object_or_404, render
 from django.utils import timezone
 from django.http import HttpResponse, HttpResponseBadRequest, JsonResponse
 from rest_framework import generics
@@ -194,18 +194,43 @@ class EmailVerificationView(APIView):
     permission_classes = [AllowAny]
 
     def get(self, request, token):
+        wants_json = 'application/json' in request.headers.get('Accept', '')
         digest = hashlib.sha256(token.encode()).hexdigest()
         record = EmailVerificationToken.objects.select_related('user').filter(
             token_hash=digest, used_at__isnull=True, expires_at__gt=timezone.now(),
         ).first()
         if record is None:
+            if not wants_json:
+                return render(request, 'email_verification.html', {'verified': False}, status=400)
             return Response({'success': False, 'detail': 'This verification link is invalid or expired.'}, status=400)
-        record.used_at = timezone.now()
-        record.user.is_active = True
-        record.user.save(update_fields=['is_active', 'updated_at'])
-        record.save(update_fields=['used_at', 'updated_at'])
-        from my_app.services.registration_mail import send_player_welcome
-        send_player_welcome(record.user)
+        now = timezone.now()
+        # Activate and consume the token first. Email delivery must never turn
+        # a successful verification into a 500 response.
+        with transaction.atomic():
+            record = EmailVerificationToken.objects.select_for_update().select_related('user').get(pk=record.pk)
+            if record.used_at is not None or record.expires_at <= now:
+                return Response({'success': False, 'detail': 'This verification link is invalid or expired.'}, status=400)
+            record.used_at = now
+            record.user.is_active = True
+            if hasattr(record.user, 'account_status'):
+                record.user.account_status = record.user.AccountStatus.ACTIVE
+                record.user.save(update_fields=['is_active', 'account_status', 'updated_at'])
+            else:
+                record.user.save(update_fields=['is_active', 'updated_at'])
+            record.save(update_fields=['used_at', 'updated_at'])
+            if record.user.venue_owner_id:
+                from django.contrib.auth.models import Group
+                from my_app.permissions import VENUE_OWNER_GROUP
+                group, _ = Group.objects.get_or_create(name=VENUE_OWNER_GROUP)
+                record.user.groups.add(group)
+        try:
+            from my_app.services.registration_mail import send_player_welcome
+            send_player_welcome(record.user)
+        except Exception:
+            # Verification is complete even when SMTP is unavailable.
+            pass
+        if not wants_json:
+            return render(request, 'email_verification.html', {'verified': True, 'user': record.user})
         return Response({'success': True, 'detail': 'Email verified. You can now sign in.'})
 
 

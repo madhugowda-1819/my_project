@@ -31,9 +31,11 @@ class VenueOwnerRegisterView(APIView):
             user = AuthenticationService.register(data=data, create_player_profile=False, public_id_kind=PublicIdCounter.Kind.VENUE_OWNER)
             application = VenueOwnerApplication.objects.create(applicant=user, business_name=data['business_name'].strip(), phone=data['phone'].strip(), city=data['city'].strip(), address=data['address'].strip())
             from django.db import transaction as db_transaction
-            from my_app.services.registration_mail import send_venue_owner_registration
-            db_transaction.on_commit(lambda: send_venue_owner_registration(user))
-        return Response({'success': True, 'message': 'Venue-owner account created. Your application is pending admin approval.', 'venue_owner_id': user.venue_owner_id, 'application': {'public_id': str(application.public_id), 'status': application.status}}, status=201)
+            user.is_active = False
+            user.save(update_fields=['is_active', 'updated_at'])
+            from my_app.services.registration_mail import issue_venue_owner_verification
+            db_transaction.on_commit(lambda: issue_venue_owner_verification(user))
+        return Response({'success': True, 'message': 'Venue-owner account created. Check your email to verify and activate it.', 'verification_required': True, 'venue_owner_id': user.venue_owner_id, 'application': {'public_id': str(application.public_id), 'status': application.status}}, status=201)
 
 
 class VenueOwnerApplicationView(APIView):

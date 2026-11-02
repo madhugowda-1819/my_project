@@ -48,3 +48,11 @@ def send_venue_owner_registration(user):
     if not user.email or not user.venue_owner_id:
         return False
     return _email('SportMate – Venue Owner Registration Received', user.email, 'Welcome to SportMate, Venue Owner!', f'Hello {user.full_name or user.username},\n\nYour venue-owner registration was received successfully. Your application is pending administrator approval.', [('Venue Owner ID', user.venue_owner_id), ('Registered email', user.email), ('Status', 'Pending review')])
+def issue_venue_owner_verification(user):
+    EmailVerificationToken.objects.filter(user=user, used_at__isnull=True).update(used_at=timezone.now())
+    raw = secrets.token_urlsafe(32)
+    EmailVerificationToken.objects.create(user=user, token_hash=hashlib.sha256(raw.encode()).hexdigest(), expires_at=timezone.now() + timedelta(hours=settings.EMAIL_VERIFICATION_TTL_HOURS))
+    base = settings.EMAIL_VERIFICATION_URL.rstrip('/')
+    link = f'{base}{reverse("email-verification", kwargs={"token": raw})}' if base else reverse('email-verification', kwargs={'token': raw})
+    name = user.full_name or user.username
+    return _email('SportMate - Verify Your Venue Owner Account', user.email, 'Welcome to SportMate, Venue Owner!', f'Hello {name},\n\nVerify your email address to activate your venue-owner account. After verification, you can sign in to manage venues and courts. Venue and court publishing remain subject to platform review.', [('Venue Owner ID', user.venue_owner_id or '—'), ('Registered email', user.email)], 'Verify Venue Owner Account', link)

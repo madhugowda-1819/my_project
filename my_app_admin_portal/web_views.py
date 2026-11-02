@@ -82,15 +82,21 @@ def venues(request):
     qs = Venue.objects.select_related('owner').prefetch_related('courts').order_by('-created_at')
     q = request.GET.get('q', '').strip()
     if q: qs = qs.filter(Q(name__icontains=q) | Q(city__icontains=q) | Q(owner__email__icontains=q))
-    return page(request, 'admin_portal/venues/list.html', rows=Paginator(qs, 20).get_page(request.GET.get('page')), q=q, portal_section='venues')
+    owners = User.objects.filter(groups__name=VENUE_OWNER_GROUP, is_active=True, account_status=User.AccountStatus.ACTIVE).order_by('email')
+    return page(request, 'admin_portal/venues/list.html', rows=Paginator(qs, 20).get_page(request.GET.get('page')), owners=owners, q=q, portal_section='venues')
 
 @admin_required
 @require_POST
 def venue_toggle(request, public_id):
     venue = get_object_or_404(Venue, public_id=public_id)
     active = request.POST.get('active') == '1'
-    venue.active = active; venue.save(update_fields=['active', 'updated_at'])
-    RoleAuditLog.objects.create(actor=request.user, target_user=venue.owner, role='venue_management', action='approve' if active else 'reject', reason=request.POST.get('reason','Web admin action')[:500])
+    owner_id = request.POST.get('owner_id', '').strip()
+    owner = get_object_or_404(User, public_id=owner_id, is_active=True, account_status=User.AccountStatus.ACTIVE) if owner_id else None
+    previous_owner = venue.owner
+    venue.owner = owner
+    venue.active = active
+    venue.save(update_fields=['owner', 'active', 'updated_at'])
+    RoleAuditLog.objects.create(actor=request.user, target_user=owner or previous_owner, role='venue_management', action='assign' if owner_id else ('approve' if active else 'reject'), reason=request.POST.get('reason','Web admin action')[:500])
     messages.success(request, 'Venue status updated.')
     return redirect('admin_portal:venues')
 

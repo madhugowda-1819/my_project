@@ -10,6 +10,8 @@ from my_app.models import User, Venue, Court, College, CollegeResultDispute, Pla
 from my_app.permissions import ADMIN_GROUPS, VENUE_OWNER_GROUP
 from my_app_admin_portal.models import Report, RoleAuditLog, ModerationAction
 from my_app_venue_portal.models import VenueOwnerApplication
+from my_app_admin_portal.services.moderation import ModerationService
+from my_app.services.colleges import CollegeService
 
 def is_admin(user):
     return user.is_authenticated and user.is_active and (user.is_superuser or user.groups.filter(name__in=ADMIN_GROUPS).exists())
@@ -99,6 +101,19 @@ def reports(request):
     return page(request, 'admin_portal/reports/list.html', rows=Paginator(qs, 20).get_page(request.GET.get('page')), portal_section='reports')
 
 @admin_required
+@require_POST
+def report_action(request, public_id):
+    report = get_object_or_404(Report, public_id=public_id)
+    status = request.POST.get('status', report.status)
+    resolution = request.POST.get('resolution', '').strip()
+    action = request.POST.get('action', '').strip()
+    if action:
+        ModerationService.apply_action(moderator=request.user, report=report, target_type=report.target_type, target_public_id=report.target_public_id, action=action, reason=request.POST.get('action_reason', '').strip())
+    ModerationService.update_report(report=report, moderator=request.user, status=status, resolution=resolution or report.resolution, assigned_moderator=request.user)
+    messages.success(request, 'Report updated and recorded in moderation history.')
+    return redirect('admin_portal:reports')
+
+@admin_required
 def colleges(request):
     qs = College.objects.select_related('submitted_by','reviewed_by').order_by('-created_at')
     return page(request, 'admin_portal/colleges/list.html', rows=Paginator(qs, 20).get_page(request.GET.get('page')), portal_section='colleges')
@@ -109,6 +124,21 @@ def disputes(request):
     return page(request, 'admin_portal/disputes/list.html', rows=Paginator(qs, 20).get_page(request.GET.get('page')), portal_section='disputes')
 
 @admin_required
+@require_POST
+def dispute_action(request, public_id):
+    dispute = get_object_or_404(CollegeResultDispute, public_id=public_id)
+    resolution = request.POST.get('resolution', '').strip()
+    if not resolution:
+        messages.error(request, 'A resolution note is required.')
+        return redirect('admin_portal:disputes')
+    dismiss = request.POST.get('decision') == 'dismiss'
+    CollegeService.resolve_dispute(dispute=dispute, actor=request.user, resolution=resolution, dismiss=dismiss)
+    RoleAuditLog.objects.create(actor=request.user, target_user=dispute.raised_by, role='college_result_dispute', action=dispute.status, reason=resolution[:500])
+    messages.success(request, 'Dispute decision saved and audited.')
+    return redirect('admin_portal:disputes')
+
+@admin_required
 def audit(request):
     qs = RoleAuditLog.objects.select_related('actor','target_user').order_by('-created_at')
-    return page(request, 'admin_portal/audit.html', rows=Paginator(qs, 30).get_page(request.GET.get('page')), portal_section='audit')
+    moderation = ModerationAction.objects.select_related('moderator','report').order_by('-created_at')[:50]
+    return page(request, 'admin_portal/audit.html', rows=Paginator(qs, 30).get_page(request.GET.get('page')), moderation=moderation, portal_section='audit')

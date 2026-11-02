@@ -25,6 +25,13 @@ def login_view(request):
         identity = request.POST.get('identity', '').strip()
         password = request.POST.get('password', '')
         user = authenticate(request, username=identity, password=password)
+        # SportMate uses email as USERNAME_FIELD, but older administrator
+        # accounts may still remember their username. Resolve that username
+        # to the canonical email before authenticating.
+        if user is None and identity:
+            account = User.objects.filter(username__iexact=identity).first()
+            if account:
+                user = authenticate(request, username=account.email, password=password)
         if user and is_admin(user):
             login(request, user)
             return redirect(request.GET.get('next') or 'admin_portal:dashboard')
